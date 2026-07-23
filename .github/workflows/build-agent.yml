@@ -1,0 +1,65 @@
+name: Build agent
+
+# Builds the Windows agent so you get a ready-made ntlm-agent.exe without
+# needing a local Rust toolchain. The binary appears under the workflow run's
+# "Artifacts" section; on a tag it is also attached to the GitHub release.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths:
+      - 'ntlm-agent-rs/**'
+      - '.github/workflows/build-agent.yml'
+  pull_request:
+    paths:
+      - 'ntlm-agent-rs/**'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: ntlm-agent-rs
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable, MSVC)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry and build output
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ntlm-agent-rs/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('ntlm-agent-rs/Cargo.toml') }}
+
+      - name: Check formatting
+        run: cargo fmt --check
+        continue-on-error: true
+
+      - name: Clippy
+        run: cargo clippy --release -- -D warnings
+        continue-on-error: true
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Upload ntlm-agent.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: ntlm-agent-windows-x64
+          path: ntlm-agent-rs/target/release/ntlm-agent.exe
+          if-no-files-found: error
+
+      - name: Attach binary to release (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ntlm-agent-rs/target/release/ntlm-agent.exe
