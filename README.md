@@ -8,7 +8,8 @@ The collector is a single Python file with no external dependencies; the agent i
 
 ---
 
-[!NOTE] Built with AI assistance. Most of the code and documentation in this repository was written by Claude (Anthropic) in a pair-programming workflow: I defined the requirements, reviewed the results, and tested and deployed everything in a real Active Directory environment. As with any code you did not write yourself, review it before running it in production.
+> [!NOTE]
+> **Built with AI assistance.** Most of the code and documentation in this repository was written by Claude (Anthropic) in a pair-programming workflow: I defined the requirements, reviewed the results, and tested and deployed everything in a real Active Directory environment. As with any code you did not write yourself, review it before running it in production.
 
 ## Contents
 
