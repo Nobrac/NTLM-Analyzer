@@ -1,7 +1,5 @@
 # NTLM-Analyzer
 
-**Find out who still uses NTLM in your Active Directory — a Windows agent plus a central collector with a web dashboard, so you can retire NTLM in favor of Kerberos.**
-
 NTLM-Analyzer answers the question you have to answer before you can turn NTLM off: *who is still using it?* A lightweight Windows service on your domain controllers and member machines collects the relevant security events and pushes them to a central collector. Its web dashboard shows which users, computers and applications still authenticate over NTLM, which of them fell back from Kerberos (and can therefore be fixed), what already runs securely over Kerberos, and whether NTLM usage is trending toward zero.
 
 The collector is a single Python file with no external dependencies; the agent is a single, self-installing executable.
