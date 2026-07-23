@@ -1,0 +1,36 @@
+# --- Rust build output ---
+target/
+**/target/
+*.pdb
+# Note: Cargo.lock IS committed on purpose — this is a binary crate, so a pinned
+# dependency set means reproducible builds.
+
+# --- Local runtime data (never commit) ---
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+ntlm.db
+agent.log
+state.json
+config.json
+
+# --- Secrets / certificates ---
+*.pem
+*.key
+*.crt
+*.pfx
+*.env
+.env
+
+# --- Archives / build artifacts ---
+*.zip
+*.exe
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
