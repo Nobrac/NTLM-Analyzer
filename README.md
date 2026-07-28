@@ -1,8 +1,28 @@
+<div align="center">
+
 # NTLM-Analyzer
+
+### Find out who still uses NTLM in your Active Directory — so you can retire it for Kerberos.
+
+A Windows agent plus a central collector with a web dashboard that shows exactly **who still authenticates over NTLM**, what already runs securely over Kerberos, and whether usage is trending toward zero.
+
+![Collector: Python 3.7+](https://img.shields.io/badge/collector-Python%203.7%2B-3776AB?logo=python&logoColor=white)
+&nbsp;
+![Agent: Rust](https://img.shields.io/badge/agent-Rust-CE422B?logo=rust&logoColor=white)
+&nbsp;
+![Platform: Windows + Linux](https://img.shields.io/badge/platform-Windows%20%2B%20Linux-0078D6)
+&nbsp;
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+
+[Features](#features) · [Screenshots](#screenshots) · [Quick start](#quick-start) · [Troubleshooting](#troubleshooting)
+
+</div>
+
+---
 
 NTLM-Analyzer answers the question you have to answer before you can turn NTLM off: *who is still using it?* A lightweight Windows service on your domain controllers and member machines collects the relevant security events and pushes them to a central collector. Its web dashboard shows which users, computers and applications still authenticate over NTLM, which of them fell back from Kerberos (and can therefore be fixed), what already runs securely over Kerberos, and whether NTLM usage is trending toward zero.
 
-I worked in the IT services industry for many years and identified many of these issues manually or using scripts at client sites. We handled numerous AD security projects for clients with critical infrastructure. We disabled NTLM/NTLMv2 wherever possible and migrated everything to Kerberos. After earning my OSCP and OSEP certifications, I finally wanted a tool that would significantly help with this work, since far too many companies still rely on NTLM and NTLMv2.
+I worked in the IT services industry for many years and identified many of these issues manually or using scripts at client sites. We handled numerous AD security projects for clients with critical infrastructure. We disabled NTLMv1/NTLMv2 wherever possible and migrated everything to Kerberos. After earning my OSCP and OSEP certifications, I finally wanted a tool that would significantly help with this work, since far too many companies still rely on NTLMv1 and NTLMv2.
 
 The collector is a single Python file with no external dependencies; the agent is a single, self-installing executable.
 
