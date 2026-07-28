@@ -96,6 +96,10 @@ Watermarks are tracked per source and purpose, so only new events are transferre
 
 *The dashboard: key metrics, the NTLM-over-time trend, and who still authenticates over NTLM.*
 
+![Machines & auditing status](screenshots/dashboard_2.png)
+
+*Agent health: which machines report in, their heartbeat, and whether the required auditing is enabled on each.*
+
 ---
 
 ## Prerequisites
