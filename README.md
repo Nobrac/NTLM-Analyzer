@@ -1,18 +1,21 @@
 # NTLM-Analyzer
 
+**Find out who still uses NTLM in your Active Directory — a Windows agent plus a central collector with a web dashboard, so you can retire NTLM in favor of Kerberos.**
+
 NTLM-Analyzer answers the question you have to answer before you can turn NTLM off: *who is still using it?* A lightweight Windows service on your domain controllers and member machines collects the relevant security events and pushes them to a central collector. Its web dashboard shows which users, computers and applications still authenticate over NTLM, which of them fell back from Kerberos (and can therefore be fixed), what already runs securely over Kerberos, and whether NTLM usage is trending toward zero.
 
 The collector is a single Python file with no external dependencies; the agent is a single, self-installing executable.
 
----
-
 > [!NOTE]
 > **Built with AI assistance.** Most of the code and documentation in this repository was written by Claude (Anthropic) in a pair-programming workflow: I defined the requirements, reviewed the results, and tested and deployed everything in a real Active Directory environment. As with any code you did not write yourself, review it before running it in production.
+
+---
 
 ## Contents
 
 - [Components](#components)
 - [Features](#features)
+- [Screenshots](#screenshots)
 - [Prerequisites](#prerequisites)
 - [Quick start](#quick-start)
 - [CLI reference](#cli-reference)
@@ -84,6 +87,14 @@ Watermarks are tracked per source and purpose, so only new events are transferre
 - **Retention**: `--retention-days N` deletes old events automatically (at startup and every 6 hours).
 - Indexes on all query columns; automatic schema migration at startup — existing databases are upgraded in place.
 - Agent: log rotation at 5 MB, atomic watermark writes, 15 s HTTP timeout, per-cycle panic safety net.
+
+---
+
+## Screenshots
+
+![NTLM-Analyzer dashboard](screenshots/dashboard_1.PNG)
+
+*The dashboard: key metrics, the NTLM-over-time trend, and who still authenticates over NTLM.*
 
 ---
 
@@ -247,6 +258,7 @@ README.md                     this file
 LICENSE                       MIT
 .gitignore                    keeps databases, logs, certificates and build output out of git
 .github/workflows/            CI: builds ntlm-agent.exe on Windows and publishes it as an artifact
+screenshots/                  images used in this README
 ntlm-collector.py             the collector (server + dashboard, single file)
 ntlm-agent-rs/                the Windows agent (Rust)
 ├── README.md                 build, install and service control
@@ -258,4 +270,4 @@ Prebuilt binaries: every push to `main` builds the agent via GitHub Actions — 
 
 ## License
 
-[MIT](LICENSE) — see the `LICENSE` file.
+[MIT](LICENSE) — see the `LICENSE` file. Replace the placeholder copyright holder with your name or organization before publishing.
