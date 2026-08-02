@@ -1,6 +1,6 @@
 <div align="center">
 
-# NTLM-Analyzer
+# 🛡️ NTLM-Analyzer
 
 ### Find out who still uses NTLM in your Active Directory — so you can retire it for Kerberos.
 
@@ -192,7 +192,13 @@ auditpol /get /subcategory:"Logon"
 
 ## Quick start
 
-**1. Start the collector** (Linux):
+**1. Install the collector** (Linux, as root — detects Debian/RHEL, asks a few questions, sets up a hardened systemd service):
+
+```bash
+sudo ./install.sh
+```
+
+The installer creates a dedicated system user, stores the dashboard password and API key in a root-only environment file (never on the command line), opens the firewall port on request and prints the finished agent install command. Prefer manual control? Start it directly instead:
 
 ```bash
 NTLM_DASHBOARD_PASSWORD='StrongPassword' python3 ntlm-collector.py \
@@ -283,6 +289,7 @@ LICENSE                       MIT
 .gitignore                    keeps databases, logs, certificates and build output out of git
 .github/workflows/            CI: builds ntlm-agent.exe on Windows and publishes it as an artifact
 screenshots/                  images used in this README
+install.sh                    interactive Linux installer (systemd service, Debian & RHEL families)
 ntlm-collector.py             the collector (server + dashboard, single file)
 ntlm-agent-rs/                the Windows agent (Rust)
 ├── README.md                 build, install and service control
@@ -294,4 +301,4 @@ Prebuilt binaries: every push to `main` builds the agent via GitHub Actions — 
 
 ## License
 
-[MIT](LICENSE) — see the `LICENSE` file.
+[MIT](LICENSE) — see the `LICENSE` file. Replace the placeholder copyright holder with your name or organization before publishing.

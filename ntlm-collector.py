@@ -293,7 +293,9 @@ class Handler(BaseHTTPRequestHandler):
             if not key or "|" not in key or status not in ("offen", "arbeit", "erledigt"):
                 self._send(400, {"error": "bad key/status"})
                 return
-            now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+            # UTC, damit der Vergleich mit den Event-Zeitstempeln der Agenten
+            # (ebenfalls UTC) fuer "wieder aktiv" ohne Zeitzonen-Versatz stimmt.
+            now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
             with DB_LOCK:
                 if status == "offen":     # offen = Standard -> Zeile entfernen
                     self.server.conn.execute("DELETE FROM item_status WHERE key=?", (key,))
@@ -734,6 +736,20 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     padding:12px 18px;border-left:2px solid var(--accent);border-radius:0}
   tr.hintrow b{color:var(--ink);font-weight:600}
 
+  tr.evrow{cursor:pointer}
+  tr.evrow:hover td{background:rgba(255,255,255,.018)}
+  tr.evrow .chev{display:inline-block;width:14px;color:var(--faint);font-size:10px;
+    transition:transform .12s}
+  tr.evrow.evopen td{border-bottom:none}
+  tr.detrow td{background:var(--panel-2);padding:14px 18px 16px;
+    border-left:2px solid var(--line-2)}
+  .dhead{font-family:var(--mono);font-size:11px;font-weight:600;color:var(--soft);
+    text-transform:uppercase;letter-spacing:.05em;margin-bottom:10px}
+  .dgrid{display:grid;grid-template-columns:170px 1fr;gap:5px 16px;max-width:720px}
+  .dlab{font-family:var(--mono);font-size:11px;color:var(--faint);
+    text-transform:uppercase;letter-spacing:.04em;padding-top:1px}
+  .dval{font-family:var(--mono);font-size:12.5px;color:var(--ink);word-break:break-all}
+
   footer{margin-top:24px;text-align:center;color:var(--faint);font-size:12px;font-family:var(--mono)}
 
   @media(max-width:880px){.stats{grid-template-columns:repeat(3,1fr)}}
@@ -955,6 +971,12 @@ de: {
   empty_krba:'Noch keine Kerberos-Konten erfasst – sobald Konten Servicetickets ziehen, erscheinen sie hier.',
   empty_agents:'Noch keine Agent-Meldungen. Der Agent meldet seinen Status bei jedem Lauf.',
   empty_events:'Keine Ereignisse für diese Auswahl.',
+  d_title:'Ereigniseigenschaften', d_log:'Protokoll', d_eid:'Ereignis-ID',
+  d_rid:'Datensatz-ID', d_time:'Protokolliert', d_comp:'Computer',
+  d_user:'Benutzer', d_dom:'Domäne', d_kind:'Art', d_ver:'NTLM-Version',
+  d_auth:'Auth-Weg', d_proc:'Prozess', d_target:'Zielserver',
+  d_ws:'Arbeitsstation', d_ip:'IP-Adresse', d_lt:'Anmeldetyp',
+  d_enc:'Verschlüsselung',
   as_of:'Stand: '
 },
 en: {
@@ -1015,6 +1037,12 @@ en: {
   empty_krba:'No Kerberos accounts recorded yet – they will appear as soon as accounts request service tickets.',
   empty_agents:'No agent reports yet. The agent reports its status on every run.',
   empty_events:'No events for this selection.',
+  d_title:'Event properties', d_log:'Log name', d_eid:'Event ID',
+  d_rid:'Record ID', d_time:'Logged', d_comp:'Computer',
+  d_user:'User', d_dom:'Domain', d_kind:'Kind', d_ver:'NTLM version',
+  d_auth:'Auth path', d_proc:'Process', d_target:'Target server',
+  d_ws:'Workstation', d_ip:'IP address', d_lt:'Logon type',
+  d_enc:'Encryption',
   as_of:'As of: '
 }};
 let LANG = 'de';
@@ -1095,6 +1123,37 @@ function bar(nm,n,max,bad){
 
 // ---- Bearbeitungsstatus & Was-tun-Hinweise ----
 const openHints = new Set();   // geoeffnete Hinweise ueberleben den Auto-Refresh
+const openEvents = new Set();  // aufgeklappte Ereigniszeilen ueberleben den Auto-Refresh
+
+// Detail-Ansicht einer Ereigniszeile im Stil der Windows-Ereignisanzeige:
+// links die Eigenschaft, rechts der Wert, alles was das Event hergibt.
+function evDetailRow(e, id){
+  if(!openEvents.has(id)) return '';
+  const rows = [
+    ['d_log',   e.log],
+    ['d_eid',   e.event_id],
+    ['d_rid',   e.record_id],
+    ['d_time',  (e.event_time||'').replace('T',' ')],
+    ['d_comp',  e.source],
+    ['d_user',  e.user],
+    ['d_dom',   e.domain],
+    ['d_kind',  e.kind],
+    ['d_ver',   e.ntlm_version],
+    ['d_auth',  e.auth_method],
+    ['d_proc',  e.process],
+    ['d_target',e.target_server],
+    ['d_ws',    e.workstation],
+    ['d_ip',    e.ip],
+    ['d_lt',    e.logon_type],
+    ['d_enc',   e.enc_type],
+  ].filter(r => r[1] !== null && r[1] !== undefined && r[1] !== '');
+  const grid = rows.map(r =>
+    '<div class="dlab">'+t(r[0])+'</div><div class="dval">'+esc(r[1])+'</div>').join('');
+  return '<tr class="detrow"><td colspan="6">'+
+    '<div class="dhead">'+t('d_title')+' — '+esc(e.log)+' / '+esc(e.event_id)+'</div>'+
+    '<div class="dgrid">'+grid+'</div></td></tr>';
+}
+
 function stSel(key, st){
   return '<select class="stsel st-'+esc(st)+'" data-key="'+esc(key)+'">'+
     ['offen','arbeit','erledigt'].map(s=>'<option value="'+s+'"'+(s===st?' selected':'')+'>'+t('st_'+s)+'</option>').join('')+
@@ -1231,14 +1290,18 @@ async function load(){
   $('#rows').innerHTML = d.events.length
     ? d.events.map(e=>{
         const fid = 'fb|'+e.source+'|'+e.record_id;
+        const eid = 'ev|'+e.source+'|'+e.log+'|'+e.record_id;
         const fb = e.auth_method==='Fallback';
-        return `<tr>
-        <td class="soft mono">${when(e.event_time)}</td>
+        const open = openEvents.has(eid);
+        return `<tr class="evrow${open?' evopen':''}" data-ev="${esc(eid)}">
+        <td class="soft mono"><span class="chev">${open?'▾':'▸'}</span>${when(e.event_time)}</td>
         <td>${artBadge(e)}${fb?hintBtn(fid):''}</td>
         <td>${esc(e.user)||dash}</td>
         <td>${esc(e.process)||dash}</td>
         <td>${esc(e.target_server||e.workstation)||dash}</td>
-        <td class="soft">${esc(e.source)}</td></tr>`+(fb?hintRow(fid,6,t('hint_fb')):'');
+        <td class="soft">${esc(e.source)}</td></tr>`
+        + evDetailRow(e, eid)
+        + (fb?hintRow(fid,6,t('hint_fb')):'');
       }).join('')
     : '<tr><td colspan="6" class="empty">'+t('empty_events')+'</td></tr>';
 
@@ -1255,7 +1318,13 @@ document.querySelectorAll('.chip').forEach(c=>c.addEventListener('click',()=>{
 // Hinweise auf-/zuklappen und Status setzen: delegiert, damit es den 5s-Refresh ueberlebt
 document.addEventListener('click', e=>{
   const h = e.target.closest('.hintbtn');
-  if(h){ const id=h.dataset.h; openHints.has(id)?openHints.delete(id):openHints.add(id); load(); }
+  if(h){ const id=h.dataset.h; openHints.has(id)?openHints.delete(id):openHints.add(id); load(); return; }
+  const row = e.target.closest('tr.evrow');
+  if(row){
+    const id = row.dataset.ev;
+    openEvents.has(id) ? openEvents.delete(id) : openEvents.add(id);
+    load();
+  }
 });
 document.addEventListener('change', e=>{
   const s = e.target.closest('.stsel');
