@@ -93,7 +93,8 @@ CREATE TABLE IF NOT EXISTS agents (
 
 FIELDS = ("record_id", "log", "event_id", "kind", "event_time", "user",
           "domain", "ntlm_version", "process", "target_server",
-          "workstation", "ip", "logon_type", "enc_type", "auth_method")
+          "workstation", "ip", "logon_type", "enc_type", "auth_method",
+          "reason")
 
 
 def init_db(path):
@@ -101,7 +102,7 @@ def init_db(path):
     conn.executescript(SCHEMA)
     # Migration: fehlende Spalten in bestehenden DBs nachziehen
     have = {r[1] for r in conn.execute("PRAGMA table_info(events)").fetchall()}
-    for col in ("enc_type", "auth_method"):
+    for col in ("enc_type", "auth_method", "reason"):
         if col not in have:
             conn.execute(f"ALTER TABLE events ADD COLUMN {col} TEXT")
     # Indizes fuer die Dashboard-Abfragen (Zeitraum-Filter, Aggregate).
@@ -379,6 +380,7 @@ class Handler(BaseHTTPRequestHandler):
                 e.get("logon_type"),
                 e.get("enc_type"),
                 e.get("auth_method"),
+                e.get("reason"),
                 now,
             ))
         if not rows:
@@ -431,7 +433,7 @@ class Handler(BaseHTTPRequestHandler):
         clause = (" WHERE " + " AND ".join(where)) if where else ""
         cols = ["event_time", "source", "kind", "event_id", "ntlm_version",
                 "auth_method", "user", "domain", "process", "target_server",
-                "workstation", "ip", "logon_type", "enc_type"]
+                "workstation", "ip", "logon_type", "enc_type", "reason"]
         with DB_LOCK:
             rows = self.server.conn.execute(
                 f"SELECT {','.join(cols)} FROM events{clause} "
@@ -446,7 +448,8 @@ class Handler(BaseHTTPRequestHandler):
         w = csv.writer(buf, delimiter=";", lineterminator="\r\n")
         w.writerow(["Zeit", "Maschine", "Art", "EventID", "NTLM-Version",
                     "Auth-Weg", "Benutzer", "Domaene", "Prozess", "Ziel",
-                    "Quelle/Workstation", "IP", "LogonType", "Verschluesselung"])
+                    "Quelle/Workstation", "IP", "LogonType", "Verschluesselung",
+                    "Grund"])
         for r in rows:
             w.writerow([cell(v) for v in r])
         body = "\ufeff" + buf.getvalue()   # BOM -> Excel erkennt UTF-8
@@ -480,12 +483,16 @@ class Handler(BaseHTTPRequestHandler):
                 "total":  c.execute(f"SELECT COUNT(*) FROM events WHERE {tf}", tp).fetchone()[0],
                 "v1":     c.execute(f"SELECT COUNT(*) FROM events WHERE ntlm_version='NTLMv1' AND {tf}", tp).fetchone()[0],
                 "v2":     c.execute(f"SELECT COUNT(*) FROM events WHERE ntlm_version='NTLMv2' AND {tf}", tp).fetchone()[0],
-                "outbound": c.execute(f"SELECT COUNT(*) FROM events WHERE event_id=8001 AND {tf}", tp).fetchone()[0],
+                "outbound": c.execute(f"SELECT COUNT(*) FROM events WHERE event_id IN (8001,4020,4021) AND {tf}", tp).fetchone()[0],
                 "sources": c.execute(f"SELECT COUNT(DISTINCT source) FROM events WHERE {tf}", tp).fetchone()[0],
                 "procs":   c.execute(f"SELECT COUNT(DISTINCT process) FROM events "
                                      f"WHERE process IS NOT NULL AND process NOT LIKE '(%' AND {tf}", tp).fetchone()[0],
                 "krb":     c.execute(f"SELECT COUNT(DISTINCT target_server) FROM events WHERE kind='kerberos' AND {tf}", tp).fetchone()[0],
                 "fallback": c.execute(f"SELECT COUNT(*) FROM events WHERE auth_method='Fallback' AND {tf}", tp).fetchone()[0],
+                # Erweiterte Audits (Server 2025): NTLMv1-abgeleitete SSO-Credentials.
+                # Ab Oktober 2026 blockiert Windows das von sich aus (BlockNtlmv1SSO).
+                "v1sso": c.execute(f"SELECT COUNT(*) FROM events WHERE kind='ntlmv1sso' AND {tf}", tp).fetchone()[0],
+                "downgrade": c.execute(f"SELECT COUNT(*) FROM events WHERE auth_method='Downgrade' AND {tf}", tp).fetchone()[0],
             }
             # Verlauf: NTLM-Vorgaenge je Zeit-Bucket (24h -> stundenweise, sonst taeglich).
             # Buckets per substr auf dem ISO-String; kerberos separat nur zur Einordnung.
@@ -514,15 +521,24 @@ class Handler(BaseHTTPRequestHandler):
                 f"SELECT COALESCE(process,'(unbekannt)'), COALESCE(target_server,'(unbekannt)'), "
                 f"COUNT(*), COUNT(DISTINCT user), COUNT(DISTINCT source), MAX(event_time), "
                 f"GROUP_CONCAT(DISTINCT user) "
-                f"FROM events WHERE event_id=8001 AND {tf} "
+                f"FROM events WHERE event_id IN (8001,4020,4021) AND {tf} "
                 f"GROUP BY process, target_server ORDER BY COUNT(*) DESC LIMIT 50", tp).fetchall()]
+            # NTLMv1-SSO (4024/4025): eigener Blocker mit harter Deadline Oktober 2026
+            v1sso = [with_status("v1sso", r[0], r[1],
+                          dict(user=r[0], target=r[1], n=r[2], sources=r[3],
+                               last_seen=r[4], blocked=bool(r[5]))) for r in c.execute(
+                f"SELECT COALESCE(user,'(unbekannt)'), COALESCE(target_server,'(unbekannt)'), "
+                f"COUNT(*), COUNT(DISTINCT source), MAX(event_time), "
+                f"MAX(CASE WHEN event_id=4025 THEN 1 ELSE 0 END) "
+                f"FROM events WHERE kind='ntlmv1sso' AND {tf} "
+                f"GROUP BY user, target_server ORDER BY COUNT(*) DESC LIMIT 50", tp).fetchall()]
             # NTLM in der Domain (8004, vom DC): zuverlaessigste Quelle->Ziel-Sicht
             domain = [with_status("dom", r[0], r[1],
                            dict(workstation=r[0], target=r[1], users=r[2],
                            n=r[3], last_seen=r[4], who=r[5])) for r in c.execute(
                 f"SELECT COALESCE(workstation,'(unbekannt)'), COALESCE(target_server,'(unbekannt)'), "
                 f"COUNT(DISTINCT user), COUNT(*), MAX(event_time), GROUP_CONCAT(DISTINCT user) "
-                f"FROM events WHERE event_id=8004 AND {tf} "
+                f"FROM events WHERE event_id IN (8004,4022,4023,4030,4031,4032,4033) AND {tf} "
                 f"GROUP BY workstation, target_server ORDER BY COUNT(*) DESC LIMIT 50", tp).fetchall()]
             # Kerberos (nur Info): welche Dienste/SPNs laufen schon ueber Kerberos
             kerberos = [dict(service=r[0], accounts=r[1], n=r[2],
@@ -558,7 +574,7 @@ class Handler(BaseHTTPRequestHandler):
                 params + [limit]).fetchall()
             events = [dict(zip(cols2, r)) for r in rows]
 
-        return {"stats": stats, "trend": trend, "trend_bucket": ("hour" if rng == "24h" else "day"),
+        return {"stats": stats, "v1sso": v1sso, "trend": trend, "trend_bucket": ("hour" if rng == "24h" else "day"),
                 "top_proc": top_proc, "v1_users": v1_users,
                 "blockers": blockers, "domain": domain, "kerberos": kerberos,
                 "kerberos_accounts": kerberos_accounts,
@@ -805,6 +821,20 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <div class="trend" id="trend"></div>
   </section>
 
+  <!-- NTLMv1-SSO: harte Deadline Oktober 2026 (Server 2025 / Win11 24H2) -->
+  <section id="sec-v1sso" style="display:none">
+    <div class="head">
+      <h2><span class="badge b-bad"><span class="d"></span><span data-i18n="b_deadline">Deadline</span></span> <span data-i18n="v1sso_h">NTLMv1-SSO – funktioniert ab Oktober 2026 nicht mehr</span></h2>
+      <p data-i18n="v1sso_p">Windows meldet hier die Nutzung NTLMv1-abgeleiteter Anmeldedaten. Microsoft stellt im Oktober 2026 automatisch auf Blockieren um – diese Zugriffe brechen dann von selbst, unabhängig von euren eigenen Richtlinien.</p>
+    </div>
+    <div class="scroll">
+      <table>
+        <thead><tr><th data-i18n="th_user4">Benutzer</th><th data-i18n="th_target4">Ziel</th><th data-i18n="th_count4">Anzahl</th><th data-i18n="th_state4">Zustand</th><th data-i18n="th_status4">Status</th><th data-i18n="th_last5">Zuletzt</th></tr></thead>
+        <tbody id="v1sso"></tbody>
+      </table>
+    </div>
+  </section>
+
   <!-- Programme, die NTLM nutzen -->
   <section id="sec-programs">
     <div class="head">
@@ -971,6 +1001,13 @@ de: {
   empty_krba:'Noch keine Kerberos-Konten erfasst – sobald Konten Servicetickets ziehen, erscheinen sie hier.',
   empty_agents:'Noch keine Agent-Meldungen. Der Agent meldet seinen Status bei jedem Lauf.',
   empty_events:'Keine Ereignisse für diese Auswahl.',
+  b_deadline:'Deadline', v1sso_h:'NTLMv1-SSO – funktioniert ab Oktober 2026 nicht mehr',
+  v1sso_p:'Windows meldet hier die Nutzung NTLMv1-abgeleiteter Anmeldedaten. Microsoft stellt im Oktober 2026 automatisch auf Blockieren um – diese Zugriffe brechen dann von selbst, unabhängig von euren eigenen Richtlinien.',
+  th_user4:'Benutzer', th_target4:'Ziel', th_count4:'Anzahl', th_state4:'Zustand',
+  th_status4:'Status', th_last5:'Zuletzt',
+  st_used:'wird genutzt', st_blocked:'bereits blockiert',
+  lab_v1sso:'NTLMv1-SSO', sub_v1sso:'bricht im Okt. 2026', tt_v1sso:'Zu den NTLMv1-SSO-Funden springen',
+  b_down:'Downgrade · unsicher', d_reason:'Grund',
   d_title:'Ereigniseigenschaften', d_log:'Protokoll', d_eid:'Ereignis-ID',
   d_rid:'Datensatz-ID', d_time:'Protokolliert', d_comp:'Computer',
   d_user:'Benutzer', d_dom:'Domäne', d_kind:'Art', d_ver:'NTLM-Version',
@@ -1037,6 +1074,13 @@ en: {
   empty_krba:'No Kerberos accounts recorded yet – they will appear as soon as accounts request service tickets.',
   empty_agents:'No agent reports yet. The agent reports its status on every run.',
   empty_events:'No events for this selection.',
+  b_deadline:'Deadline', v1sso_h:'NTLMv1 SSO – stops working in October 2026',
+  v1sso_p:'Windows reports the use of NTLMv1-derived credentials here. In October 2026 Microsoft switches the default to blocking – these will then break on their own, regardless of your own policies.',
+  th_user4:'User', th_target4:'Target', th_count4:'Count', th_state4:'State',
+  th_status4:'Status', th_last5:'Last seen',
+  st_used:'in use', st_blocked:'already blocked',
+  lab_v1sso:'NTLMv1 SSO', sub_v1sso:'breaks Oct 2026', tt_v1sso:'Jump to the NTLMv1 SSO findings',
+  b_down:'downgrade · insecure', d_reason:'Reason',
   d_title:'Event properties', d_log:'Log name', d_eid:'Event ID',
   d_rid:'Record ID', d_time:'Logged', d_comp:'Computer',
   d_user:'User', d_dom:'Domain', d_kind:'Kind', d_ver:'NTLM version',
@@ -1083,6 +1127,7 @@ function userList(who){
 
 function artBadge(e){
   let fb = (e.auth_method=="Fallback") ? ' <span class="badge b-old"><span class="d"></span>'+t('b_fb')+'</span>' : '';
+  if(e.auth_method=="Downgrade") fb = ' <span class="badge b-bad"><span class="d"></span>'+t('b_down')+'</span>';
   if(e.ntlm_version=="NTLMv1") return '<span class="badge b-bad"><span class="d"></span>'+t('b_v1')+'</span>'+fb;
   if(e.ntlm_version=="NTLMv2") return '<span class="badge b-old"><span class="d"></span>'+t('b_v2')+'</span>'+fb;
   if(e.kind=="kerberos")       return '<span class="badge b-good"><span class="d"></span>'+t('b_krb')+'</span>';
@@ -1146,6 +1191,7 @@ function evDetailRow(e, id){
     ['d_ip',    e.ip],
     ['d_lt',    e.logon_type],
     ['d_enc',   e.enc_type],
+    ['d_reason',e.reason],
   ].filter(r => r[1] !== null && r[1] !== undefined && r[1] !== '');
   const grid = rows.map(r =>
     '<div class="dlab">'+t(r[0])+'</div><div class="dval">'+esc(r[1])+'</div>').join('');
@@ -1230,6 +1276,21 @@ async function load(){
   $('#s-src').textContent = d.stats.sources;
   $('#s-proc').textContent = d.stats.procs;
   renderTrend(d.trend, d.trend_bucket);
+
+  // NTLMv1-SSO: Sektion nur einblenden, wenn es tatsaechlich Funde gibt
+  const v1s = d.v1sso || [];
+  document.getElementById('sec-v1sso').style.display = v1s.length ? '' : 'none';
+  if (v1s.length) {
+    $('#v1sso').innerHTML = v1s.map(x=>`<tr class="${x.st==='erledigt'?'row-done':''}">
+        <td class="strong">${esc(x.user)}</td>
+        <td>${esc(x.target)}</td>
+        <td class="num-cell">${x.n}</td>
+        <td>${x.blocked
+              ? '<span class="badge b-neut"><span class="d"></span>'+t('st_blocked')+'</span>'
+              : '<span class="badge b-bad"><span class="d"></span>'+t('st_used')+'</span>'}</td>
+        <td>${stSel(x.key,x.st)}${againBadge(x)}</td>
+        <td class="soft mono">${when(x.last_seen)}</td></tr>`).join('');
+  }
 
   $('#blockers').innerHTML = (d.blockers&&d.blockers.length)
     ? d.blockers.map(b=>`<tr class="${b.st==='erledigt'?'row-done':''}">

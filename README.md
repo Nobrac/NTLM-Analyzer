@@ -79,7 +79,13 @@ One agent runs per machine — on domain controllers and member machines alike.
 | **8001** | all machines | **Outgoing** NTLM including the originating process — the "shutdown blocker" list. Kernel-redirector SMB access is labeled `(SMB/Kernel)`. |
 | **8004** | DCs | NTLM authentication inside the domain (source → target → user). |
 | **4769** | DCs *(optional)* | Kerberos service tickets — the "safe side": services and accounts already on Kerberos, including encryption (AES green, RC4 amber). |
+| **4020/4021** | Win11 24H2 / Server 2025 | **Enhanced client auditing** (KB5064479): outgoing NTLM with process, **NTLM version and the reason** Kerberos was not used (e.g. "target name contains an IP address"). Odd IDs flag a downgrade. |
+| **4022/4023** | Win11 24H2 / Server 2025 | **Enhanced server auditing**: incoming NTLM with source machine, client IP, target SPN and version — feeds the domain view. |
+| **4030–4033** | Server 2025 DCs | **Enhanced domain-wide auditing**: the NTLM version straight from the DC log — no longer requires collecting 4624 from every machine. |
+| **4024/4025** | Win11 24H2 / Server 2025 | **NTLMv1-derived SSO credentials** used (4024) or already blocked (4025). Microsoft flips the default to *enforce* in **October 2026** — these logons will then break on their own. |
 | `/status` | all machines | Heartbeat plus the machine's auditing state, read from the registry. |
+
+On systems older than Windows 11 24H2 / Server 2025 the enhanced queries simply return nothing — the agent handles both worlds with the same binary. The enhanced events also arrive via a **controlled feature rollout** (clients since Sep 2025, Server 2025 since Nov 2025), so a fully patched system may still need a current cumulative update before they appear.
 
 Watermarks are tracked per source and purpose, so only new events are transferred; the collector deduplicates on `(source, log, record_id)`.
 
@@ -90,6 +96,8 @@ Watermarks are tracked per source and purpose, so only new events are transferre
 - **Time-range filter** (24 h / 7 days / 30 days / all), applied server-side to every metric, table and the event list.
 - **Trend chart**: NTLM activity per day (per hour in the 24 h view), stacked by v1 / v2 / unversioned — the curve that has to reach zero.
 - **Work lists with status**: blocker and domain entries can be set to *open / in progress / done* (persisted). If a "done" entry produces new events, a red **"active again"** badge appears automatically.
+- **NTLMv1 SSO deadline panel**: appears automatically (with a red *Deadline* badge) as soon as 4024/4025 events show up — listing who still uses NTLMv1-derived credentials that will stop working in October 2026, with the same open/in-progress/done workflow.
+- **Reason display**: for enhanced events, the expandable event detail shows *why* NTLM was used (e.g. "target name contains an IP address") and failed-logon status messages.
 - **What-to-do hints** per finding: the IP-instead-of-hostname classic for SMB, SPN checks (`setspn`), the fallback checklist (SPN / DNS / clock skew), switching RC4 tickets to AES (`msDS-SupportedEncryptionTypes`).
 - **CSV export** of the current selection (UTF-8 BOM, semicolon delimiter, formula-injection protection).
 - Clickable metrics, free-text search, filter chips, auto-refresh, and a machine panel with heartbeat and audit traffic lights.
@@ -164,6 +172,8 @@ The agent only reads events that Windows actually writes. Enable the following v
 gpupdate /force
 auditpol /get /subcategory:"Logon"
 ```
+
+The enhanced 40xx auditing (Windows 11 24H2 / Server 2025) is **enabled by default** — no additional GPO is required. If it has been disabled centrally, the switches live under `Computer Configuration → Policies → Administrative Templates → System → NTLM → NTLM Enhanced Logging` (clients/servers) and `… → System → Netlogon → Log Enhanced Domain-wide NTLM Logs` (domain controllers). Both require the current ADMX templates in your central store.
 
 `auditpol` must report **Success** for the Logon subcategory. In the dashboard, the **Machines & auditing status** panel turns its audit badges green as soon as each agent reports in — use it to confirm the policy actually landed on every machine.
 
@@ -301,4 +311,4 @@ Prebuilt binaries: every push to `main` builds the agent via GitHub Actions — 
 
 ## License
 
-[MIT](LICENSE) — see the `LICENSE` file.
+[MIT](LICENSE) — see the `LICENSE` file. Replace the placeholder copyright holder with your name or organization before publishing.
