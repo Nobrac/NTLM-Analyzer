@@ -11,6 +11,10 @@ pub struct RawEvent {
     pub time: String, // ISO, auf Sekunden gekuerzt (YYYY-MM-DDTHH:MM:SS)
     pub named: HashMap<String, String>,
     pub positional: Vec<String>,
+    /// Gerenderter Meldungstext (nur bei /f:RenderedXml gefuellt). Wird fuer die
+    /// erweiterten 40xx-Events genutzt, deren XML-Feldnamen nicht dokumentiert
+    /// sind - dort sind die Beschriftungen im Text die zuverlaessigere Quelle.
+    pub message: Option<String>,
 }
 
 /// Sammelt alle neuen Events eines Logs (mit interner "Drain"-Schleife, damit
@@ -22,6 +26,7 @@ pub fn collect(
     data_clause: &str,
     first_window_ms: i64,
     last: Option<i64>,
+    rendered: bool,
 ) -> Result<(Vec<RawEvent>, i64), String> {
     const CAP: u32 = 500;
     let mut all: Vec<RawEvent> = Vec::new();
@@ -30,7 +35,7 @@ pub fn collect(
 
     loop {
         let xpath = build_xpath(id_clause, data_clause, first_window_ms, cursor);
-        let raw = run_wevtutil(log, &xpath, CAP)?;
+        let raw = run_wevtutil(log, &xpath, CAP, rendered)?;
         let batch = parse_events(&raw)?;
         if batch.is_empty() {
             break;
@@ -67,12 +72,12 @@ fn build_xpath(id_clause: &str, data_clause: &str, first_window_ms: i64, last: O
     xp
 }
 
-fn run_wevtutil(log: &str, xpath: &str, count: u32) -> Result<String, String> {
+fn run_wevtutil(log: &str, xpath: &str, count: u32, rendered: bool) -> Result<String, String> {
     let output = std::process::Command::new(crate::config::system32("wevtutil.exe"))
         .arg("qe")
         .arg(log)
         .arg(format!("/q:{xpath}"))
-        .arg("/f:xml")
+        .arg(if rendered { "/f:RenderedXml" } else { "/f:xml" })
         .arg(format!("/c:{count}"))
         .arg("/rd:false")
         .arg("/e:Events")
@@ -180,12 +185,19 @@ pub fn parse_events(xml: &str) -> Result<Vec<RawEvent>, String> {
             }
         }
 
+        // Bei /f:RenderedXml haengt der gerenderte Text unter RenderingInfo/Message.
+        let message = child_node(&ev, "RenderingInfo")
+            .and_then(|ri| child_text(&ri, "Message"))
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty());
+
         out.push(RawEvent {
             record_id,
             event_id,
             time,
             named,
             positional,
+            message,
         });
     }
     Ok(out)

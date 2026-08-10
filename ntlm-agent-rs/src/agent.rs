@@ -32,6 +32,9 @@ pub struct Event {
     pub logon_type: Option<String>,
     pub enc_type: Option<String>,
     pub auth_method: Option<String>,
+    /// Nur bei den erweiterten 40xx-Events (Server 2025 / Win11 24H2):
+    /// Klartext-Grund, warum NTLM statt Kerberos verwendet wurde.
+    pub reason: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -90,22 +93,38 @@ pub fn run_cycle(cfg: &Config) -> Result<(), String> {
     if dc {
         gather(
             "Security", "Security#4624", "EventID=4624", DATA_4624, window_ms,
-            &state, &me, map_4624, &mut collected, &mut new_seen,
+            &state, &me, map_4624, &mut collected, &mut new_seen, false,
         );
         if !cfg.skip_kerberos {
             gather(
                 "Security", "Security#4769", "EventID=4769", "", window_ms,
-                &state, &me, map_4769, &mut collected, &mut new_seen,
+                &state, &me, map_4769, &mut collected, &mut new_seen, false,
             );
         }
         gather(
             "Microsoft-Windows-NTLM/Operational", "NTLM#8004", "EventID=8004", "", window_ms,
-            &state, &me, map_8004, &mut collected, &mut new_seen,
+            &state, &me, map_8004, &mut collected, &mut new_seen, false,
+        );
+        // Erweiterte DC-Audits (Server 2025): liefern die NTLM-Version direkt
+        // aus dem DC-Log - auf aelteren Systemen liefert die Abfrage schlicht nichts.
+        gather(
+            "Microsoft-Windows-NTLM/Operational", "NTLM#40dc",
+            "(EventID=4030 or EventID=4031 or EventID=4032 or EventID=4033)", "", window_ms,
+            &state, &me, map_enhanced, &mut collected, &mut new_seen, true,
         );
     }
     gather(
         "Microsoft-Windows-NTLM/Operational", "NTLM#8001", "EventID=8001", "", window_ms,
-        &state, &me, map_8001, &mut collected, &mut new_seen,
+        &state, &me, map_8001, &mut collected, &mut new_seen, false,
+    );
+    // Erweiterte Client-/Server-Audits + NTLMv1-SSO (Server 2025 / Win11 24H2).
+    // 4024/4025 sind der zeitkritische Teil: NTLMv1-abgeleitete Credentials
+    // funktionieren ab Oktober 2026 nicht mehr (BlockNtlmv1SSO -> Enforce).
+    gather(
+        "Microsoft-Windows-NTLM/Operational", "NTLM#40cs",
+        "(EventID=4020 or EventID=4021 or EventID=4022 or EventID=4023 or EventID=4024 or EventID=4025)",
+        "", window_ms,
+        &state, &me, map_enhanced, &mut collected, &mut new_seen, true,
     );
 
     // 3) Nichts zu senden: Wasserzeichen trotzdem fortschreiben (Rauschen nicht neu lesen)
@@ -161,9 +180,10 @@ fn gather(
     mapper: fn(&RawEvent) -> Option<Event>,
     collected: &mut Vec<Event>,
     new_seen: &mut HashMap<String, i64>,
+    rendered: bool,
 ) {
     let last = state.get(key).copied();
-    match eventlog::collect(log, id_clause, data_clause, window_ms, last) {
+    match eventlog::collect(log, id_clause, data_clause, window_ms, last, rendered) {
         Ok((raw, seen)) => {
             new_seen.insert(key.to_string(), seen);
             for e in &raw {
@@ -312,6 +332,263 @@ fn map_8001(e: &RawEvent) -> Option<Event> {
         domain,
         process: process_val,
         target_server: target,
+        ..Default::default()
+    })
+}
+
+// ------------------- Erweiterte NTLM-Audits (Server 2025 / Win11 24H2) -------------------
+// Dokumentiert in KB5064479. Jedes Log existiert doppelt: gerade ID = Information
+// (Standard-NTLM, i.d.R. NTLMv2), ungerade ID = Warning (Downgrade, z.B. NTLMv1,
+// fehlende EPA oder fehlender MIC). Die genauen XML-Feldnamen dokumentiert
+// Microsoft NICHT, deshalb wird hier tolerant gesucht: erst per Namensfragment,
+// danach per Wertmuster. Was nicht gefunden wird, bleibt schlicht leer - das
+// Event geht dadurch nie verloren.
+
+/// Reason-IDs des Client-Logs (4020/4021) laut KB5064479.
+fn reason_text(id: &str) -> Option<String> {
+    let t = match id.trim() {
+        "0" => "Unbekannter Grund",
+        "1" => "NTLM direkt von der Anwendung aufgerufen",
+        "2" => "Anmeldung eines lokalen Kontos",
+        "4" => "Anmeldung eines Cloud-Kontos",
+        "5" => "Zielname fehlte oder war leer",
+        "6" => "Zielname per Kerberos nicht aufloesbar",
+        "7" => "Zielname enthaelt eine IP-Adresse",
+        "8" => "Zielname in Active Directory doppelt vorhanden",
+        "9" => "Keine Verbindung zu einem Domaenencontroller",
+        "10" => "NTLM ueber Loopback aufgerufen",
+        "11" => "NTLM mit Null-Session aufgerufen",
+        _ => return None,
+    };
+    Some(t.to_string())
+}
+
+/// Sucht einen Wert, dessen Feldname alle angegebenen Fragmente enthaelt
+/// (case-insensitive, z.B. ["target","ip"] -> "TargetIp"/"Target_IP"/...).
+fn find_named(e: &RawEvent, parts: &[&str]) -> Option<String> {
+    for (k, v) in &e.named {
+        let lk = k.to_lowercase();
+        if parts.iter().all(|p| lk.contains(p)) {
+            let v = v.trim();
+            if !v.is_empty() && v != "-" {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Wie find_named, aber mit EXAKTEM Feldnamen. Noetig z.B. fuer "Status":
+/// eine Teilstringsuche wuerde sonst auch "SessionKeyStatus" oder
+/// "ChannelBindingStatus" treffen.
+fn find_named_exact(e: &RawEvent, name: &str) -> Option<String> {
+    for (k, v) in &e.named {
+        if k.trim().eq_ignore_ascii_case(name) {
+            let v = v.trim();
+            if !v.is_empty() && v != "-" {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Durchsucht ALLE Werte (benannt + positionsbasiert) nach einem Muster.
+fn find_value<F: Fn(&str) -> bool>(e: &RawEvent, pred: F) -> Option<String> {
+    e.named
+        .values()
+        .chain(e.positional.iter())
+        .map(|s| s.trim())
+        .find(|s| !s.is_empty() && *s != "-" && pred(s))
+        .map(|s| s.to_string())
+}
+
+fn looks_like_ip(s: &str) -> bool {
+    let core = s.trim_start_matches("::ffff:");
+    (core.split('.').count() == 4
+        && core.split('.').all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())))
+        || (s.contains(':') && s.chars().all(|c| c.is_ascii_hexdigit() || c == ':'))
+}
+
+/// Version aus einem beliebigen Feldwert lesen: "NTLMv1"/"NTLM V1"/"NTLMv2"...
+fn sniff_version(e: &RawEvent) -> Option<String> {
+    let v = find_value(e, |s| {
+        let l = s.to_lowercase().replace(' ', "");
+        l.starts_with("ntlmv1") || l.starts_with("ntlmv2") || l == "v1" || l == "v2"
+    })?;
+    let l = v.to_lowercase().replace(' ', "");
+    if l.contains("v1") {
+        Some("NTLMv1".to_string())
+    } else {
+        Some("NTLMv2".to_string())
+    }
+}
+
+/// Liest einen Wert aus dem gerenderten Meldungstext anhand seiner Beschriftung.
+/// Die Beschriftungen stammen aus KB5064479; da der Text lokalisiert ist, werden
+/// englische UND deutsche Varianten probiert. Format je Zeile: "Label: Wert".
+fn from_message(e: &RawEvent, labels: &[&str]) -> Option<String> {
+    let msg = e.message.as_deref()?;
+    for line in msg.lines() {
+        let line = line.trim();
+        let (lab, val) = match line.split_once(':') {
+            Some(x) => x,
+            None => continue,
+        };
+        let lab_norm = lab.trim().to_lowercase();
+        if labels.iter().any(|l| lab_norm == l.to_lowercase()) {
+            let v = val.trim();
+            // Platzhalter und Leerwerte ignorieren
+            if !v.is_empty() && v != "-" && !(v.starts_with('<') && v.ends_with('>')) {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+// Beschriftungen laut KB5064479 (en) + gaengige deutsche Entsprechungen.
+const L_PROCESS: &[&str] = &["Process Name", "Prozessname", "Name des Prozesses"];
+const L_USER: &[&str] = &["Username", "User Name", "Benutzername", "Client Name", "Clientname"];
+const L_DOMAIN: &[&str] = &["Domain", "Domäne", "Domaene", "Client Domain", "Clientdomäne"];
+const L_TARGET_RES: &[&str] = &["Target Resource", "Zielressource", "Service Binding"];
+const L_TARGET_MACHINE: &[&str] = &["Target Machine", "Zielcomputer", "Server Name", "Servername"];
+// Bei ausgehenden Events (4020/4021) ist "Target IP" die Gegenstelle, bei
+// server-/DC-seitigen Events (4022+) ist es die Client-IP der Quelle.
+const L_IP_OUT: &[&str] = &["Target IP", "Ziel-IP"];
+const L_IP_IN: &[&str] = &["Client IP", "Client-IP", "Server IP"];
+const L_CLIENT_MACHINE: &[&str] = &["Client Machine", "Clientcomputer", "Hostname"];
+const L_VERSION: &[&str] = &["NTLM Version", "NTLM-Version"];
+const L_REASON: &[&str] = &["Reason", "Grund"];
+const L_REASON_ID: &[&str] = &["Reason ID", "Grund-ID"];
+
+fn map_enhanced(e: &RawEvent) -> Option<Event> {
+    let id = e.event_id;
+    // gerade = Information, ungerade = Warning (Downgrade/unsicher)
+    let downgrade = matches!(id, 4021 | 4023 | 4031 | 4033);
+
+    let kind = match id {
+        4020 | 4021 => "outgoing", // Client: ausgehender NTLM inkl. Prozess
+        // Server-seitig: enthaelt Quelle (Client-Maschine + IP), Ziel-SPN und
+        // Version - inhaltlich dieselbe Aussage wie 8004, daher "domain".
+        4022 | 4023 => "domain",
+        4030 | 4031 | 4032 | 4033 => "domain", // DC-Sicht
+        4024 | 4025 => "ntlmv1sso", // NTLMv1-abgeleitete SSO-Credentials
+        _ => return None,
+    };
+
+    // Version: 1) gerenderter Text (dokumentierte Beschriftung, zuverlaessigste
+    // Quelle), 2) Wertmuster im XML, 3) Semantik der Event-ID.
+    let version = from_message(e, L_VERSION)
+        .map(|v| {
+            if v.to_lowercase().replace(' ', "").contains("v1") {
+                "NTLMv1".to_string()
+            } else {
+                "NTLMv2".to_string()
+            }
+        })
+        .or_else(|| sniff_version(e))
+        .or_else(|| match id {
+            // 4024/4025 sind per Definition NTLMv1-abgeleitet.
+            4024 | 4025 => Some("NTLMv1".to_string()),
+            _ => None,
+        });
+
+    // Grund (nur Client-Log 4020/4021): 1) Klartext aus dem gerenderten Text,
+    // 2) Reason-ID aus dem Text uebersetzen, 3) XML-Feld "reason".
+    let mut reason = from_message(e, L_REASON)
+        .or_else(|| from_message(e, L_REASON_ID).and_then(|id| reason_text(&id)))
+        .or_else(|| {
+            find_named(e, &["reason"]).and_then(|v| {
+                if v.chars().all(|c| c.is_ascii_digit()) {
+                    reason_text(&v)
+                } else {
+                    Some(v)
+                }
+            })
+        });
+    if reason.is_none() && downgrade {
+        reason = Some("Herabstufung erkannt (NTLMv1, fehlende EPA oder fehlender MIC)".into());
+    }
+    if reason.is_none() && id == 4024 {
+        reason = Some("NTLMv1-abgeleitete SSO-Credentials - ab Oktober 2026 blockiert".into());
+    }
+    if reason.is_none() && id == 4025 {
+        reason = Some("NTLMv1-abgeleitete SSO-Credentials wurden bereits blockiert".into());
+    }
+
+    // Fehlgeschlagene Anmeldung sichtbar machen: das Statusfeld ist 0x0 bei
+    // Erfolg. Beispiel aus der Praxis: 0xc000006d = falscher Benutzername
+    // oder falsche Anmeldeinformationen.
+    let status = find_named_exact(e, "Status").unwrap_or_default();
+    let failed = !status.is_empty()
+        && status != "0x0"
+        && status != "0"
+        && !status.eq_ignore_ascii_case("STATUS_SUCCESS");
+    if failed {
+        let detail = from_message(e, &["Status Message", "Statusmeldung"])
+            .filter(|m| !m.eq_ignore_ascii_case("STATUS_SUCCESS") && m != "0")
+            .unwrap_or_else(|| format!("Status {status}"));
+        reason = Some(match reason {
+            Some(r) => format!("{r} | Anmeldung fehlgeschlagen: {detail}"),
+            None => format!("Anmeldung fehlgeschlagen: {detail}"),
+        });
+    }
+
+    // Jeweils: gerenderter Text -> XML-Feldname -> Wertmuster.
+    let process = from_message(e, L_PROCESS)
+        .or_else(|| find_named(e, &["process"]))
+        .or_else(|| find_named(e, &["image"]))
+        .or_else(|| find_value(e, |s| s.to_lowercase().ends_with(".exe")));
+
+    // Ziel: Ein SPN ist am aussagekraeftigsten (z.B. "TERMSRV/192.0.2.10"
+    // zeigt sofort: RDP per IP-Adresse -> deshalb NTLM statt Kerberos).
+    // Microsoft legt den SPN je nach Event mal in "Target Resource", mal in
+    // "Target Domain" ab, deshalb zusaetzlich die Suche nach dem Muster.
+    let spn = find_value(e, |v| {
+        v.contains('/') && !v.contains(' ') && !v.starts_with("http") && v.len() < 256
+    });
+    let target = spn
+        .or_else(|| from_message(e, L_TARGET_RES))
+        .or_else(|| from_message(e, L_TARGET_MACHINE))
+        .or_else(|| find_named(e, &["target", "resource"]))
+        .or_else(|| find_named(e, &["target", "machine"]))
+        .or_else(|| find_named(e, &["server", "name"]))
+        .or_else(|| find_named(e, &["target"]));
+
+    let workstation = from_message(e, L_CLIENT_MACHINE)
+        .or_else(|| find_named(e, &["client", "machine"]))
+        .or_else(|| find_named(e, &["hostname"]))
+        .or_else(|| find_named(e, &["workstation"]));
+
+    let ip = from_message(e, if matches!(id, 4020 | 4021) { L_IP_OUT } else { L_IP_IN })
+        .or_else(|| find_named(e, &["client", "ip"]))
+        .or_else(|| find_named(e, &["ip"]))
+        .or_else(|| find_value(e, looks_like_ip));
+
+    Some(Event {
+        record_id: e.record_id,
+        log: "NTLM/Operational".into(),
+        event_id: id,
+        kind: kind.into(),
+        event_time: e.time.clone(),
+        user: from_message(e, L_USER)
+            .or_else(|| find_named(e, &["user"]))
+            .or_else(|| find_named(e, &["client", "name"])),
+        domain: from_message(e, L_DOMAIN).or_else(|| find_named(e, &["domain"])),
+        ntlm_version: version,
+        process,
+        target_server: target,
+        workstation,
+        ip,
+        logon_type: None,
+        enc_type: None,
+        auth_method: if downgrade {
+            Some("Downgrade".into())
+        } else {
+            Some("Direct".into())
+        },
+        reason,
         ..Default::default()
     })
 }
