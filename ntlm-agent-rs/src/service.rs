@@ -11,10 +11,10 @@
 const SERVICE_NAME: &str = "NtlmAgent";
 const DISPLAY_NAME: &str = "NTLM-Analyzer Agent";
 
-#[cfg(windows)]
-pub use windows_impl::{install, run, uninstall};
 #[cfg(not(windows))]
 pub use stub_impl::{install, run, uninstall};
+#[cfg(windows)]
+pub use windows_impl::{install, run, uninstall};
 
 #[cfg(windows)]
 mod windows_impl {
@@ -119,9 +119,9 @@ mod windows_impl {
 
             // Bis zum naechsten Intervall warten ODER sofort aufwachen, wenn Stop kam.
             match rx.recv_timeout(interval) {
-                Ok(()) => break,                                        // Stop/Shutdown
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,       // naechster Zyklus
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,     // Sender weg
+                Ok(()) => break,                                    // Stop/Shutdown
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,   // naechster Zyklus
+                Err(mpsc::RecvTimeoutError::Disconnected) => break, // Sender weg
             }
         }
 
