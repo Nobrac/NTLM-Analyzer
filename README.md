@@ -312,4 +312,4 @@ Prebuilt binaries: every push to `main` builds the agent via GitHub Actions — 
 
 ## License
 
-[MIT](LICENSE) — see the `LICENSE` file. Replace the placeholder copyright holder with your name or organization before publishing.
+[MIT](LICENSE) — see the `LICENSE` file.
