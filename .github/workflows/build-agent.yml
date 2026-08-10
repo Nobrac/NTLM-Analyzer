@@ -4,20 +4,20 @@ name: Build agent
 # needing a local Rust toolchain. The binary appears under the workflow run's
 # "Artifacts" section; on a tag it is also attached to the GitHub release.
 on:
+  # Kein "paths"-Filter: der wuerde auch fuer Tag-Pushes gelten, und dann
+  # entstuende bei einem Versions-Tag kein Lauf - und damit kein Release.
   push:
     branches: [main]
     tags: ['v*']
-    paths:
-      - 'ntlm-agent-rs/**'
-      - '.github/workflows/build-agent.yml'
   pull_request:
-    paths:
-      - 'ntlm-agent-rs/**'
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: windows-latest
+    # Ohne Schreibrecht kann der Release-Schritt kein Release anlegen (HTTP 403).
+    permissions:
+      contents: write
     defaults:
       run:
         working-directory: ntlm-agent-rs
