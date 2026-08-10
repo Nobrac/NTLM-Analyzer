@@ -87,7 +87,10 @@ impl Config {
             match args[i].as_str() {
                 "--collector-url" => {
                     i += 1;
-                    c.collector_url = args.get(i).cloned().ok_or("--collector-url braucht einen Wert")?;
+                    c.collector_url = args
+                        .get(i)
+                        .cloned()
+                        .ok_or("--collector-url braucht einen Wert")?;
                 }
                 "--api-key" => {
                     i += 1;
