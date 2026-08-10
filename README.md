@@ -301,7 +301,6 @@ LICENSE                       MIT
 screenshots/                  images used in this README
 install.sh                    interactive Linux installer (systemd service, Debian & RHEL families)
 ntlm-collector.py             the collector (server + dashboard, single file)
-Compiled                      Already compiled Agent .exe
 ntlm-agent-rs/                the Windows agent (Rust)
 ├── README.md                 build, install and service control
 ├── Cargo.toml
@@ -312,4 +311,4 @@ Prebuilt binaries: every push to `main` builds the agent via GitHub Actions — 
 
 ## License
 
-[MIT](LICENSE) — see the `LICENSE` file.
+[MIT](LICENSE) — see the `LICENSE` file. Replace the placeholder copyright holder with your name or organization before publishing.

@@ -48,7 +48,7 @@ pub fn collect(
         all.extend(batch);
 
         // Schutz gegen Endlosschleife: wenn die RecordID nicht steigt, abbrechen.
-        if cursor.map_or(false, |c| bmax <= c) {
+        if cursor.is_some_and(|c| bmax <= c) {
             break;
         }
         cursor = Some(bmax);
