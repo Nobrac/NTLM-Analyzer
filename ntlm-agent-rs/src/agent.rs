@@ -290,7 +290,7 @@ fn map_8004(e: &RawEvent) -> Option<Event> {
         event_time: e.time.clone(),
         user: Some(u),
         domain: p.get(2).cloned(),
-        target_server: p.get(0).cloned(), // Secure Channel = Zielserver
+        target_server: p.first().cloned(), // Secure Channel = Zielserver
         workstation: p.get(3).cloned(),   // Quelle (Client)
         ..Default::default()
     })
@@ -309,7 +309,7 @@ fn map_8001(e: &RawEvent) -> Option<Event> {
     let process_val = match pname {
         Some(n) => {
             let base = n
-                .rsplit(|c| c == '\\' || c == '/')
+                .rsplit(['\\', '/'])
                 .next()
                 .unwrap_or(n.as_str())
                 .to_string();
@@ -472,7 +472,7 @@ fn map_enhanced(e: &RawEvent) -> Option<Event> {
         // Server-seitig: enthaelt Quelle (Client-Maschine + IP), Ziel-SPN und
         // Version - inhaltlich dieselbe Aussage wie 8004, daher "domain".
         4022 | 4023 => "domain",
-        4030 | 4031 | 4032 | 4033 => "domain", // DC-Sicht
+        4030..=4033 => "domain", // DC-Sicht
         4024 | 4025 => "ntlmv1sso", // NTLMv1-abgeleitete SSO-Credentials
         _ => return None,
     };
@@ -589,7 +589,6 @@ fn map_enhanced(e: &RawEvent) -> Option<Event> {
             Some("Direct".into())
         },
         reason,
-        ..Default::default()
     })
 }
 

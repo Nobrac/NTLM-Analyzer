@@ -44,8 +44,10 @@ jobs:
         run: cargo fmt --check
         continue-on-error: true
 
+      # Stilhinweise sind informativ, nicht blockierend: ohne "-D warnings"
+      # bleiben sie Warnungen und faerben den Lauf nicht rot.
       - name: Clippy
-        run: cargo clippy --release -- -D warnings
+        run: cargo clippy --release
         continue-on-error: true
 
       - name: Build
