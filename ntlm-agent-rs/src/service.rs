@@ -277,8 +277,9 @@ mod windows_impl {
 
     /// Dienst stoppen (falls noch laufend) und entfernen.
     pub fn uninstall() -> R {
-        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
-            .map_err(|e| format!("Verbindung zum Dienst-Manager fehlgeschlagen: {e:?}"))?;
+        let manager =
+            ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+                .map_err(|e| format!("Verbindung zum Dienst-Manager fehlgeschlagen: {e:?}"))?;
         let service = manager
             .open_service(
                 SERVICE_NAME,

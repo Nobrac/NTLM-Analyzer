@@ -59,7 +59,12 @@ pub fn collect(
     Ok((all, max_seen))
 }
 
-fn build_xpath(id_clause: &str, data_clause: &str, first_window_ms: i64, last: Option<i64>) -> String {
+fn build_xpath(
+    id_clause: &str,
+    data_clause: &str,
+    first_window_ms: i64,
+    last: Option<i64>,
+) -> String {
     let time_or_rec = match last {
         Some(l) => format!("EventRecordID > {l}"),
         None => format!("TimeCreated[timediff(@SystemTime) <= {first_window_ms}]"),
