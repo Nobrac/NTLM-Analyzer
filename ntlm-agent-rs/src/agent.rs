@@ -14,8 +14,9 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! Ein Sammelzyklus: Status pushen (Heartbeat + Audit), Event-Logs lesen,
-//! mappen und an den Collector pushen. Watermark pro Zweck (4624/4769/8001/8004).
+//! One collection cycle: push status (heartbeat + audit state), read the event
+//! logs, map them and push them to the collector. Watermarks are kept per
+//! purpose (4624/4769/8001/8004 and the enhanced 40xx queries).
 
 use serde::Serialize;
 use std::collections::HashMap;
@@ -48,8 +49,8 @@ pub struct Event {
     pub logon_type: Option<String>,
     pub enc_type: Option<String>,
     pub auth_method: Option<String>,
-    /// Nur bei den erweiterten 40xx-Events (Server 2025 / Win11 24H2):
-    /// Klartext-Grund, warum NTLM statt Kerberos verwendet wurde.
+    /// Only for the enhanced 40xx events (Server 2025 / Win11 24H2): plain-text
+    /// reason why NTLM was used instead of Kerberos.
     pub reason: Option<String>,
 }
 
@@ -75,7 +76,7 @@ pub fn run_cycle(cfg: &Config) -> Result<(), String> {
     if cfg.enable_outgoing_audit {
         if let Err(e) = enable_outgoing_audit() {
             config::log(&format!(
-                "Ausgehendes Audit nicht gesetzt (Adminrechte?): {e}"
+                "Could not enable outgoing audit (admin rights?): {e}"
             ));
         }
     }
@@ -83,7 +84,7 @@ pub fn run_cycle(cfg: &Config) -> Result<(), String> {
     let me = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "unknown".to_string());
     let dc = is_dc();
 
-    // 1) Status/Heartbeat (unabhaengig von Events, jeder Lauf)
+    // 1) Status/heartbeat (independent of events, on every run)
     let status = AgentStatus {
         source: me.clone(),
         is_dc: dc,
@@ -96,10 +97,10 @@ pub fn run_cycle(cfg: &Config) -> Result<(), String> {
     match serde_json::to_string(&status) {
         Ok(body) => {
             if let Err(e) = post_json(&status_url, &cfg.api_key, &body) {
-                config::log(&format!("[{me}] Status-Push fehlgeschlagen: {e}"));
+                config::log(&format!("[{me}] status push failed: {e}"));
             }
         }
-        Err(e) => config::log(&format!("[{me}] Status-JSON: {e}")),
+        Err(e) => config::log(&format!("[{me}] status JSON: {e}")),
     }
 
     // 2) Events sammeln
@@ -150,8 +151,8 @@ pub fn run_cycle(cfg: &Config) -> Result<(), String> {
             &mut new_seen,
             false,
         );
-        // Erweiterte DC-Audits (Server 2025): liefern die NTLM-Version direkt
-        // aus dem DC-Log - auf aelteren Systemen liefert die Abfrage schlicht nichts.
+        // Enhanced DC audits (Server 2025): they carry the NTLM version straight
+        // from the DC log - on older systems the query simply returns nothing.
         gather(
             "Microsoft-Windows-NTLM/Operational",
             "NTLM#40dc",
@@ -180,8 +181,8 @@ pub fn run_cycle(cfg: &Config) -> Result<(), String> {
         false,
     );
     // Erweiterte Client-/Server-Audits + NTLMv1-SSO (Server 2025 / Win11 24H2).
-    // 4024/4025 sind der zeitkritische Teil: NTLMv1-abgeleitete Credentials
-    // funktionieren ab Oktober 2026 nicht mehr (BlockNtlmv1SSO -> Enforce).
+    // 4024/4025 are the time-critical part: NTLMv1-derived credentials stop
+    // working in October 2026 (BlockNtlmv1SSO switches to enforce).
     gather(
         "Microsoft-Windows-NTLM/Operational", "NTLM#40cs",
         "(EventID=4020 or EventID=4021 or EventID=4022 or EventID=4023 or EventID=4024 or EventID=4025)",
@@ -189,7 +190,7 @@ pub fn run_cycle(cfg: &Config) -> Result<(), String> {
         &state, &me, map_enhanced, &mut collected, &mut new_seen, true,
     );
 
-    // 3) Nichts zu senden: Wasserzeichen trotzdem fortschreiben (Rauschen nicht neu lesen)
+    // 3) Nothing to send: still advance the watermarks (don't re-read noise)
     if collected.is_empty() {
         merge_watermarks(&mut state, new_seen);
         config::save_state(&state)?;
@@ -197,7 +198,7 @@ pub fn run_cycle(cfg: &Config) -> Result<(), String> {
         return Ok(());
     }
 
-    // 4) In Batches pushen; nur bei Erfolg Wasserzeichen speichern
+    // 4) Push in batches; only store watermarks after a successful push
     let ingest_url = format!("{}/ingest", cfg.collector_url.trim_end_matches('/'));
     let batch_size = 500usize;
     let mut total = 0usize;
@@ -210,7 +211,7 @@ pub fn run_cycle(cfg: &Config) -> Result<(), String> {
         })
         .map_err(|e| e.to_string())?;
         post_json(&ingest_url, &cfg.api_key, &body)
-            .map_err(|e| format!("[{me}] Push fehlgeschlagen: {e}"))?;
+            .map_err(|e| format!("[{me}] push failed: {e}"))?;
         total += end - idx;
         idx = end;
     }
@@ -254,9 +255,7 @@ fn gather(
                 }
             }
         }
-        Err(e) => config::log(&format!(
-            "[{me}] Lesen aus '{log}' ({key}) fehlgeschlagen: {e}"
-        )),
+        Err(e) => config::log(&format!("[{me}] reading '{log}' ({key}) failed: {e}")),
     }
 }
 
@@ -316,7 +315,7 @@ fn map_4769(e: &RawEvent) -> Option<Event> {
     if svc.is_empty() || svc == "krbtgt" || svc.starts_with("krbtgt") {
         return None;
     }
-    // Nur erfolgreiche Tickets (Status 0x0 / 0x00000000); echte Fehlercodes raus.
+    // Only successful tickets (status 0x0 / 0x00000000); drop real error codes.
     if let Some(st) = e.named.get("Status") {
         if !is_success_status(st) {
             return None;
@@ -362,8 +361,8 @@ fn map_8004(e: &RawEvent) -> Option<Event> {
         event_time: e.time.clone(),
         user: Some(u),
         domain: p.get(2).cloned(),
-        target_server: p.first().cloned(), // Secure Channel = Zielserver
-        workstation: p.get(3).cloned(),    // Quelle (Client)
+        target_server: p.first().cloned(), // secure channel = target server
+        workstation: p.get(3).cloned(),    // source (client)
         ..Default::default()
     })
 }
@@ -411,31 +410,30 @@ fn map_8001(e: &RawEvent) -> Option<Event> {
 // ------------------- Erweiterte NTLM-Audits (Server 2025 / Win11 24H2) -------------------
 // Dokumentiert in KB5064479. Jedes Log existiert doppelt: gerade ID = Information
 // (Standard-NTLM, i.d.R. NTLMv2), ungerade ID = Warning (Downgrade, z.B. NTLMv1,
-// fehlende EPA oder fehlender MIC). Die genauen XML-Feldnamen dokumentiert
-// Microsoft NICHT, deshalb wird hier tolerant gesucht: erst per Namensfragment,
-// danach per Wertmuster. Was nicht gefunden wird, bleibt schlicht leer - das
-// Event geht dadurch nie verloren.
+// missing EPA or a missing MIC). Microsoft does NOT document the exact XML field
+// names, so lookups here are tolerant: first by name fragment, then by value
+// pattern. Whatever is not found simply stays empty - the event is never lost.
 
 /// Reason-IDs des Client-Logs (4020/4021) laut KB5064479.
 fn reason_text(id: &str) -> Option<String> {
     let t = match id.trim() {
-        "0" => "Unbekannter Grund",
-        "1" => "NTLM direkt von der Anwendung aufgerufen",
-        "2" => "Anmeldung eines lokalen Kontos",
-        "4" => "Anmeldung eines Cloud-Kontos",
-        "5" => "Zielname fehlte oder war leer",
-        "6" => "Zielname per Kerberos nicht aufloesbar",
-        "7" => "Zielname enthaelt eine IP-Adresse",
-        "8" => "Zielname in Active Directory doppelt vorhanden",
+        "0" => "Unknown reason",
+        "1" => "NTLM called directly by the application",
+        "2" => "Local account logon",
+        "4" => "Cloud account logon",
+        "5" => "Target name was missing or empty",
+        "6" => "Target name could not be resolved by Kerberos",
+        "7" => "Target name contains an IP address",
+        "8" => "Target name is duplicated in Active Directory",
         "9" => "Keine Verbindung zu einem Domaenencontroller",
-        "10" => "NTLM ueber Loopback aufgerufen",
-        "11" => "NTLM mit Null-Session aufgerufen",
+        "10" => "NTLM called over loopback",
+        "11" => "NTLM called with a null session",
         _ => return None,
     };
     Some(t.to_string())
 }
 
-/// Sucht einen Wert, dessen Feldname alle angegebenen Fragmente enthaelt
+/// Finds a value whose field name contains all given fragments
 /// (case-insensitive, z.B. ["target","ip"] -> "TargetIp"/"Target_IP"/...).
 fn find_named(e: &RawEvent, parts: &[&str]) -> Option<String> {
     for (k, v) in &e.named {
@@ -450,9 +448,9 @@ fn find_named(e: &RawEvent, parts: &[&str]) -> Option<String> {
     None
 }
 
-/// Wie find_named, aber mit EXAKTEM Feldnamen. Noetig z.B. fuer "Status":
-/// eine Teilstringsuche wuerde sonst auch "SessionKeyStatus" oder
-/// "ChannelBindingStatus" treffen.
+/// Like find_named, but with an EXACT field name. Needed e.g. for "Status": a
+/// substring search would otherwise also match "SessionKeyStatus" or
+/// "ChannelBindingStatus".
 fn find_named_exact(e: &RawEvent, name: &str) -> Option<String> {
     for (k, v) in &e.named {
         if k.trim().eq_ignore_ascii_case(name) {
@@ -465,7 +463,7 @@ fn find_named_exact(e: &RawEvent, name: &str) -> Option<String> {
     None
 }
 
-/// Durchsucht ALLE Werte (benannt + positionsbasiert) nach einem Muster.
+/// Searches ALL values (named + positional) for a pattern.
 fn find_value<F: Fn(&str) -> bool>(e: &RawEvent, pred: F) -> Option<String> {
     e.named
         .values()
@@ -498,9 +496,9 @@ fn sniff_version(e: &RawEvent) -> Option<String> {
     }
 }
 
-/// Liest einen Wert aus dem gerenderten Meldungstext anhand seiner Beschriftung.
-/// Die Beschriftungen stammen aus KB5064479; da der Text lokalisiert ist, werden
-/// englische UND deutsche Varianten probiert. Format je Zeile: "Label: Wert".
+/// Reads a value from the rendered message text by its label. The labels come
+/// from KB5064479; since the text is localized, English AND German variants are
+/// tried. Line format: "Label: value".
 fn from_message(e: &RawEvent, labels: &[&str]) -> Option<String> {
     let msg = e.message.as_deref()?;
     for line in msg.lines() {
@@ -512,7 +510,7 @@ fn from_message(e: &RawEvent, labels: &[&str]) -> Option<String> {
         let lab_norm = lab.trim().to_lowercase();
         if labels.iter().any(|l| lab_norm == l.to_lowercase()) {
             let v = val.trim();
-            // Platzhalter und Leerwerte ignorieren
+            // Ignore placeholders and empty values
             if !v.is_empty() && v != "-" && !(v.starts_with('<') && v.ends_with('>')) {
                 return Some(v.to_string());
             }
@@ -544,8 +542,8 @@ const L_TARGET_MACHINE: &[&str] = &[
     "Server Name",
     "Servername",
 ];
-// Bei ausgehenden Events (4020/4021) ist "Target IP" die Gegenstelle, bei
-// server-/DC-seitigen Events (4022+) ist es die Client-IP der Quelle.
+// For outgoing events (4020/4021) "Target IP" is the remote end; for
+// server-/DC-side events (4022+) it is the client IP of the source.
 const L_IP_OUT: &[&str] = &["Target IP", "Ziel-IP"];
 const L_IP_IN: &[&str] = &["Client IP", "Client-IP", "Server IP"];
 const L_CLIENT_MACHINE: &[&str] = &["Client Machine", "Clientcomputer", "Hostname"];
@@ -559,17 +557,17 @@ fn map_enhanced(e: &RawEvent) -> Option<Event> {
     let downgrade = matches!(id, 4021 | 4023 | 4031 | 4033);
 
     let kind = match id {
-        4020 | 4021 => "outgoing", // Client: ausgehender NTLM inkl. Prozess
-        // Server-seitig: enthaelt Quelle (Client-Maschine + IP), Ziel-SPN und
-        // Version - inhaltlich dieselbe Aussage wie 8004, daher "domain".
+        4020 | 4021 => "outgoing", // client: outgoing NTLM incl. process
+        // Server side: carries the source (client machine + IP), target SPN and
+        // version - the same statement as 8004, hence "domain".
         4022 | 4023 => "domain",
         4030..=4033 => "domain",    // DC-Sicht
-        4024 | 4025 => "ntlmv1sso", // NTLMv1-abgeleitete SSO-Credentials
+        4024 | 4025 => "ntlmv1sso", // NTLMv1-derived SSO credentials
         _ => return None,
     };
 
     // Version: 1) gerenderter Text (dokumentierte Beschriftung, zuverlaessigste
-    // Quelle), 2) Wertmuster im XML, 3) Semantik der Event-ID.
+    // source), 2) value pattern in the XML, 3) semantics of the event ID.
     let version = from_message(e, L_VERSION)
         .map(|v| {
             if v.to_lowercase().replace(' ', "").contains("v1") {
@@ -580,13 +578,13 @@ fn map_enhanced(e: &RawEvent) -> Option<Event> {
         })
         .or_else(|| sniff_version(e))
         .or_else(|| match id {
-            // 4024/4025 sind per Definition NTLMv1-abgeleitet.
+            // 4024/4025 are NTLMv1-derived by definition.
             4024 | 4025 => Some("NTLMv1".to_string()),
             _ => None,
         });
 
-    // Grund (nur Client-Log 4020/4021): 1) Klartext aus dem gerenderten Text,
-    // 2) Reason-ID aus dem Text uebersetzen, 3) XML-Feld "reason".
+    // Reason (client log 4020/4021 only): 1) plain text from the rendered text,
+    // 2) translate the reason ID from the text, 3) XML field "reason".
     let mut reason = from_message(e, L_REASON)
         .or_else(|| from_message(e, L_REASON_ID).and_then(|id| reason_text(&id)))
         .or_else(|| {
@@ -599,18 +597,17 @@ fn map_enhanced(e: &RawEvent) -> Option<Event> {
             })
         });
     if reason.is_none() && downgrade {
-        reason = Some("Herabstufung erkannt (NTLMv1, fehlende EPA oder fehlender MIC)".into());
+        reason = Some("Downgrade detected (NTLMv1, missing EPA or missing MIC)".into());
     }
     if reason.is_none() && id == 4024 {
-        reason = Some("NTLMv1-abgeleitete SSO-Credentials - ab Oktober 2026 blockiert".into());
+        reason = Some("NTLMv1-derived SSO credentials - blocked from October 2026".into());
     }
     if reason.is_none() && id == 4025 {
-        reason = Some("NTLMv1-abgeleitete SSO-Credentials wurden bereits blockiert".into());
+        reason = Some("NTLMv1-derived SSO credentials were already blocked".into());
     }
 
-    // Fehlgeschlagene Anmeldung sichtbar machen: das Statusfeld ist 0x0 bei
-    // Erfolg. Beispiel aus der Praxis: 0xc000006d = falscher Benutzername
-    // oder falsche Anmeldeinformationen.
+    // Surface failed logons: the status field is 0x0 on success. Real-world
+    // example: 0xc000006d = bad user name or bad credentials.
     let status = find_named_exact(e, "Status").unwrap_or_default();
     let failed = !status.is_empty()
         && status != "0x0"
@@ -621,8 +618,8 @@ fn map_enhanced(e: &RawEvent) -> Option<Event> {
             .filter(|m| !m.eq_ignore_ascii_case("STATUS_SUCCESS") && m != "0")
             .unwrap_or_else(|| format!("Status {status}"));
         reason = Some(match reason {
-            Some(r) => format!("{r} | Anmeldung fehlgeschlagen: {detail}"),
-            None => format!("Anmeldung fehlgeschlagen: {detail}"),
+            Some(r) => format!("{r} | logon failed: {detail}"),
+            None => format!("logon failed: {detail}"),
         });
     }
 
@@ -632,10 +629,10 @@ fn map_enhanced(e: &RawEvent) -> Option<Event> {
         .or_else(|| find_named(e, &["image"]))
         .or_else(|| find_value(e, |s| s.to_lowercase().ends_with(".exe")));
 
-    // Ziel: Ein SPN ist am aussagekraeftigsten (z.B. "TERMSRV/192.0.2.10"
+    // Target: an SPN is the most informative value (e.g. "TERMSRV/192.0.2.10"
     // zeigt sofort: RDP per IP-Adresse -> deshalb NTLM statt Kerberos).
-    // Microsoft legt den SPN je nach Event mal in "Target Resource", mal in
-    // "Target Domain" ab, deshalb zusaetzlich die Suche nach dem Muster.
+    // Microsoft stores the SPN sometimes in "Target Resource", sometimes in
+    // "Target Domain", hence the additional pattern search.
     let spn = find_value(e, |v| {
         v.contains('/') && !v.contains(' ') && !v.starts_with("http") && v.len() < 256
     });
@@ -723,8 +720,8 @@ fn map_enc(code: &str) -> String {
 // ----------------------------- HTTP -----------------------------
 
 fn post_json(url: &str, api_key: &str, body: &str) -> Result<(), String> {
-    // Gesamttimeout, damit ein haengender Collector den Zyklus - und damit auch
-    // einen Dienst-Stop - nicht blockiert. Entspricht dem -TimeoutSec 15 des PS-Agents.
+    // Overall timeout so that a hanging collector cannot block the cycle - and
+    // with it a service stop.
     let mut req = ureq::post(url)
         .timeout(std::time::Duration::from_secs(15))
         .set("Content-Type", "application/json");

@@ -50,7 +50,7 @@ The collector is a single Python file with no external dependencies; the agent i
 | Component | File(s) | Platform | Description |
 | --- | --- | --- | --- |
 | **Collector** | `ntlm-collector.py` | Linux (any OS with Python 3.7+) | HTTP(S) server with ingest API, SQLite storage and an embedded web dashboard. Standard library only. |
-| **Agent** | `ntlm-agent-rs/` | Windows (server & client, x64) | Native **Windows service** written in Rust (LocalSystem, auto-start, auto-restart on crash). A single, dependency-free EXE. |
+| **Agent** | `ntlm-agent-rs/` | Windows (server & client, x64) | Native **Windows service** written in Rust (LocalSystem or a dedicated service account / gMSA, auto-start, auto-restart on crash). A single, dependency-free EXE. |
 
 One agent runs per machine — on domain controllers and member machines alike.
 

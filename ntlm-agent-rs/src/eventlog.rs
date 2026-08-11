@@ -14,27 +14,27 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! Liest Windows-Event-Logs ueber `wevtutil qe ... /f:xml /e:Events` und parst
-//! das Ergebnis mit roxmltree. Gleiche XPath-Logik wie das PowerShell-Skript:
-//! inkrementell per EventRecordID-Wasserzeichen, erster Lauf per Zeitfenster.
+//! Reads Windows event logs via `wevtutil qe ... /f:xml /e:Events` and parses
+//! the result with roxmltree. Collection is incremental via an EventRecordID
+//! watermark; the very first run uses a time window instead.
 
 use std::collections::HashMap;
 
-/// Ein roh geparstes Event: System-Felder + benannte und positionsbasierte Data-Werte.
+/// A raw parsed event: system fields plus named and positional data values.
 pub struct RawEvent {
     pub record_id: i64,
     pub event_id: i64,
     pub time: String, // ISO, auf Sekunden gekuerzt (YYYY-MM-DDTHH:MM:SS)
     pub named: HashMap<String, String>,
     pub positional: Vec<String>,
-    /// Gerenderter Meldungstext (nur bei /f:RenderedXml gefuellt). Wird fuer die
-    /// erweiterten 40xx-Events genutzt, deren XML-Feldnamen nicht dokumentiert
-    /// sind - dort sind die Beschriftungen im Text die zuverlaessigere Quelle.
+    /// Rendered message text (only populated with /f:RenderedXml). Used for the
+    /// enhanced 40xx events, whose XML field names are undocumented - there the
+    /// labels inside the message text are the more reliable source.
     pub message: Option<String>,
 }
 
-/// Sammelt alle neuen Events eines Logs (mit interner "Drain"-Schleife, damit
-/// auch grosse Rueckstaende in einem Zyklus aufgeholt werden).
+/// Collects all new events of a log (with an internal drain loop so that even
+/// large backlogs are caught up within a single cycle).
 /// Rueckgabe: (Events, hoechste tatsaechlich gelesene RecordID).
 pub fn collect(
     log: &str,
@@ -63,7 +63,7 @@ pub fn collect(
         let got = batch.len();
         all.extend(batch);
 
-        // Schutz gegen Endlosschleife: wenn die RecordID nicht steigt, abbrechen.
+        // Guard against an endless loop: stop if the record ID no longer grows.
         if cursor.is_some_and(|c| bmax <= c) {
             break;
         }
@@ -109,25 +109,25 @@ fn run_wevtutil(log: &str, xpath: &str, count: u32, rendered: bool) -> Result<St
         let err = String::from_utf8_lossy(&output.stderr);
         let msg = err.trim();
         if msg.is_empty() {
-            return Ok(String::new()); // kein Treffer ist kein Fehler
+            return Ok(String::new()); // no matches is not an error
         }
         return Err(msg.to_string());
     }
     Ok(decode_output(&output.stdout))
 }
 
-/// wevtutil liefert in der Regel UTF-8; je nach System/Locale aber auch UTF-16.
+/// wevtutil usually returns UTF-8, but depending on system/locale also UTF-16.
 /// Anhand des Byte-Order-Marks bzw. des ersten Zeichens '<' robust dekodieren,
-/// damit das Parsen nicht an der Kodierung scheitert.
+/// so that parsing does not fail because of the encoding.
 fn decode_output(bytes: &[u8]) -> String {
     if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
-        return String::from_utf8_lossy(&bytes[3..]).into_owned(); // UTF-8 mit BOM
+        return String::from_utf8_lossy(&bytes[3..]).into_owned(); // UTF-8 with BOM
     }
     if bytes.starts_with(&[0xFF, 0xFE]) {
-        return decode_utf16(&bytes[2..], true); // UTF-16LE mit BOM
+        return decode_utf16(&bytes[2..], true); // UTF-16LE with BOM
     }
     if bytes.starts_with(&[0xFE, 0xFF]) {
-        return decode_utf16(&bytes[2..], false); // UTF-16BE mit BOM
+        return decode_utf16(&bytes[2..], false); // UTF-16BE with BOM
     }
     if bytes.len() >= 2 && bytes[0] == 0x3C && bytes[1] == 0x00 {
         return decode_utf16(bytes, true); // "<\0..." = UTF-16LE ohne BOM
@@ -206,7 +206,7 @@ pub fn parse_events(xml: &str) -> Result<Vec<RawEvent>, String> {
             }
         }
 
-        // Bei /f:RenderedXml haengt der gerenderte Text unter RenderingInfo/Message.
+        // With /f:RenderedXml the rendered text lives under RenderingInfo/Message.
         let message = child_node(&ev, "RenderingInfo")
             .and_then(|ri| child_text(&ri, "Message"))
             .map(|m| m.trim().to_string())

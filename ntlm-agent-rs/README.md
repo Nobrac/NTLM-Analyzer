@@ -1,6 +1,7 @@
 # NTLM-Analyzer Agent (Rust, Windows service)
 
-The telemetry agent as a **native Windows service**: runs as `LocalSystem` with
+The telemetry agent as a **native Windows service**: runs as `LocalSystem` (or a
+dedicated service account / gMSA, see below) with
 auto-start, controllable via `services.msc` or `sc start|stop NtlmAgent`, with
 automatic restart on crash. Collects the relevant NTLM/Kerberos events on the
 machine and pushes them to the central collector (`/ingest` + `/status`).
@@ -21,11 +22,29 @@ machine and pushes them to the central collector (`/ingest` + `/status`).
   (can be disabled with `--skip-kerberos`).
 - **8004** (DC): NTLM within the domain (user + source + target).
 - **8001** (all machines): outgoing NTLM including the originating process.
-- **/status**: heartbeat + auditing state (registry) + agent version (`1.1-rs`).
+- **/status**: heartbeat + auditing state (registry) + agent version.
 
-Event logs are read via `wevtutil` (XPath-filtered) and the
-resulting XML is parsed with `roxmltree`. Watermarks are kept **per source/purpose**
-(`Security#4624`, `Security#4769`, `NTLM#8001`, `NTLM#8004`).
+**Enhanced auditing** (Windows 11 24H2 / Windows Server 2025, KB5064479) — these
+queries simply return nothing on older systems, so the same binary works everywhere:
+
+- **4020/4021** (all machines): outgoing NTLM with process, **NTLM version** and
+  the **reason** Kerberos was not used (reason IDs 0–11 are translated to plain
+  text, e.g. "target name contains an IP address"). Odd event IDs mark a
+  downgrade (NTLMv1, missing EPA or missing MIC).
+- **4022/4023** (all machines): incoming NTLM with source machine, client IP,
+  target SPN and version — feeds the same view as 8004.
+- **4030–4033** (DC): domain-wide NTLM with the version straight from the DC log.
+- **4024/4025**: NTLMv1-derived SSO credentials used (4024) or already blocked
+  (4025) — the finding that stops working when Microsoft enforces the block in
+  **October 2026**.
+
+Event logs are read via `wevtutil` (XPath-filtered) and the resulting XML is parsed
+with `roxmltree`. The classic events use `/f:xml`; the enhanced ones use
+`/f:RenderedXml`, because their XML field names are undocumented — values are
+resolved from the rendered message labels first (English and German), then from
+named XML fields, then by value pattern, so nothing is lost if a label differs.
+Watermarks are kept **per source/purpose** (`Security#4624`, `Security#4769`,
+`NTLM#8001`, `NTLM#8004`, `NTLM#40dc`, `NTLM#40cs`).
 
 ## Building (on Windows)
 
