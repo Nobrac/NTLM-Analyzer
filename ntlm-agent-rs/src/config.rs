@@ -173,18 +173,14 @@ impl Config {
                 || acct.to_ascii_lowercase().starts_with("nt service\\")
                 || acct.to_ascii_lowercase().starts_with("nt authority\\");
             if passwordless && c.service_password.is_some() {
-                return Err(
-                    "gMSA- und virtuelle Konten haben kein Passwort - \
+                return Err("gMSA- und virtuelle Konten haben kein Passwort - \
                      bitte --service-password weglassen"
-                        .into(),
-                );
+                    .into());
             }
             if !passwordless && c.service_password.is_none() {
-                return Err(
-                    "--service-account braucht --service-password \
+                return Err("--service-account braucht --service-password \
                      (Ausnahme: gMSA mit '$' am Ende, z.B. DOM\\gmsa-ntlm$)"
-                        .into(),
-                );
+                    .into());
             }
         }
         Ok(c)

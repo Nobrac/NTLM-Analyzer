@@ -74,7 +74,9 @@ struct IngestBody<'a> {
 pub fn run_cycle(cfg: &Config) -> Result<(), String> {
     if cfg.enable_outgoing_audit {
         if let Err(e) = enable_outgoing_audit() {
-            config::log(&format!("Ausgehendes Audit nicht gesetzt (Adminrechte?): {e}"));
+            config::log(&format!(
+                "Ausgehendes Audit nicht gesetzt (Adminrechte?): {e}"
+            ));
         }
     }
 
@@ -108,30 +110,74 @@ pub fn run_cycle(cfg: &Config) -> Result<(), String> {
 
     if dc {
         gather(
-            "Security", "Security#4624", "EventID=4624", DATA_4624, window_ms,
-            &state, &me, map_4624, &mut collected, &mut new_seen, false,
+            "Security",
+            "Security#4624",
+            "EventID=4624",
+            DATA_4624,
+            window_ms,
+            &state,
+            &me,
+            map_4624,
+            &mut collected,
+            &mut new_seen,
+            false,
         );
         if !cfg.skip_kerberos {
             gather(
-                "Security", "Security#4769", "EventID=4769", "", window_ms,
-                &state, &me, map_4769, &mut collected, &mut new_seen, false,
+                "Security",
+                "Security#4769",
+                "EventID=4769",
+                "",
+                window_ms,
+                &state,
+                &me,
+                map_4769,
+                &mut collected,
+                &mut new_seen,
+                false,
             );
         }
         gather(
-            "Microsoft-Windows-NTLM/Operational", "NTLM#8004", "EventID=8004", "", window_ms,
-            &state, &me, map_8004, &mut collected, &mut new_seen, false,
+            "Microsoft-Windows-NTLM/Operational",
+            "NTLM#8004",
+            "EventID=8004",
+            "",
+            window_ms,
+            &state,
+            &me,
+            map_8004,
+            &mut collected,
+            &mut new_seen,
+            false,
         );
         // Erweiterte DC-Audits (Server 2025): liefern die NTLM-Version direkt
         // aus dem DC-Log - auf aelteren Systemen liefert die Abfrage schlicht nichts.
         gather(
-            "Microsoft-Windows-NTLM/Operational", "NTLM#40dc",
-            "(EventID=4030 or EventID=4031 or EventID=4032 or EventID=4033)", "", window_ms,
-            &state, &me, map_enhanced, &mut collected, &mut new_seen, true,
+            "Microsoft-Windows-NTLM/Operational",
+            "NTLM#40dc",
+            "(EventID=4030 or EventID=4031 or EventID=4032 or EventID=4033)",
+            "",
+            window_ms,
+            &state,
+            &me,
+            map_enhanced,
+            &mut collected,
+            &mut new_seen,
+            true,
         );
     }
     gather(
-        "Microsoft-Windows-NTLM/Operational", "NTLM#8001", "EventID=8001", "", window_ms,
-        &state, &me, map_8001, &mut collected, &mut new_seen, false,
+        "Microsoft-Windows-NTLM/Operational",
+        "NTLM#8001",
+        "EventID=8001",
+        "",
+        window_ms,
+        &state,
+        &me,
+        map_8001,
+        &mut collected,
+        &mut new_seen,
+        false,
     );
     // Erweiterte Client-/Server-Audits + NTLMv1-SSO (Server 2025 / Win11 24H2).
     // 4024/4025 sind der zeitkritische Teil: NTLMv1-abgeleitete Credentials
@@ -208,7 +254,9 @@ fn gather(
                 }
             }
         }
-        Err(e) => config::log(&format!("[{me}] Lesen aus '{log}' ({key}) fehlgeschlagen: {e}")),
+        Err(e) => config::log(&format!(
+            "[{me}] Lesen aus '{log}' ({key}) fehlgeschlagen: {e}"
+        )),
     }
 }
 
@@ -219,7 +267,11 @@ fn map_4624(e: &RawEvent) -> Option<Event> {
     if u.trim().is_empty() || u == "-" || u == "ANONYMOUS LOGON" {
         return None;
     }
-    let lm = e.named.get("LmPackageName").map(|s| s.as_str()).unwrap_or("");
+    let lm = e
+        .named
+        .get("LmPackageName")
+        .map(|s| s.as_str())
+        .unwrap_or("");
     let ver = if lm.contains("V1") {
         "NTLMv1"
     } else if lm.contains("V2") {
@@ -232,7 +284,11 @@ fn map_4624(e: &RawEvent) -> Option<Event> {
         .get("AuthenticationPackageName")
         .map(|s| s.as_str())
         .unwrap_or("");
-    let auth_method = if apkg == "Negotiate" { "Fallback" } else { "Direct" };
+    let auth_method = if apkg == "Negotiate" {
+        "Fallback"
+    } else {
+        "Direct"
+    };
 
     Some(Event {
         record_id: e.record_id,
@@ -307,7 +363,7 @@ fn map_8004(e: &RawEvent) -> Option<Event> {
         user: Some(u),
         domain: p.get(2).cloned(),
         target_server: p.first().cloned(), // Secure Channel = Zielserver
-        workstation: p.get(3).cloned(), // Quelle (Client)
+        workstation: p.get(3).cloned(),    // Quelle (Client)
         ..Default::default()
     })
 }
@@ -422,7 +478,9 @@ fn find_value<F: Fn(&str) -> bool>(e: &RawEvent, pred: F) -> Option<String> {
 fn looks_like_ip(s: &str) -> bool {
     let core = s.trim_start_matches("::ffff:");
     (core.split('.').count() == 4
-        && core.split('.').all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())))
+        && core
+            .split('.')
+            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())))
         || (s.contains(':') && s.chars().all(|c| c.is_ascii_hexdigit() || c == ':'))
 }
 
@@ -465,10 +523,27 @@ fn from_message(e: &RawEvent, labels: &[&str]) -> Option<String> {
 
 // Beschriftungen laut KB5064479 (en) + gaengige deutsche Entsprechungen.
 const L_PROCESS: &[&str] = &["Process Name", "Prozessname", "Name des Prozesses"];
-const L_USER: &[&str] = &["Username", "User Name", "Benutzername", "Client Name", "Clientname"];
-const L_DOMAIN: &[&str] = &["Domain", "Domäne", "Domaene", "Client Domain", "Clientdomäne"];
+const L_USER: &[&str] = &[
+    "Username",
+    "User Name",
+    "Benutzername",
+    "Client Name",
+    "Clientname",
+];
+const L_DOMAIN: &[&str] = &[
+    "Domain",
+    "Domäne",
+    "Domaene",
+    "Client Domain",
+    "Clientdomäne",
+];
 const L_TARGET_RES: &[&str] = &["Target Resource", "Zielressource", "Service Binding"];
-const L_TARGET_MACHINE: &[&str] = &["Target Machine", "Zielcomputer", "Server Name", "Servername"];
+const L_TARGET_MACHINE: &[&str] = &[
+    "Target Machine",
+    "Zielcomputer",
+    "Server Name",
+    "Servername",
+];
 // Bei ausgehenden Events (4020/4021) ist "Target IP" die Gegenstelle, bei
 // server-/DC-seitigen Events (4022+) ist es die Client-IP der Quelle.
 const L_IP_OUT: &[&str] = &["Target IP", "Ziel-IP"];
@@ -488,7 +563,7 @@ fn map_enhanced(e: &RawEvent) -> Option<Event> {
         // Server-seitig: enthaelt Quelle (Client-Maschine + IP), Ziel-SPN und
         // Version - inhaltlich dieselbe Aussage wie 8004, daher "domain".
         4022 | 4023 => "domain",
-        4030..=4033 => "domain", // DC-Sicht
+        4030..=4033 => "domain",    // DC-Sicht
         4024 | 4025 => "ntlmv1sso", // NTLMv1-abgeleitete SSO-Credentials
         _ => return None,
     };
@@ -577,10 +652,17 @@ fn map_enhanced(e: &RawEvent) -> Option<Event> {
         .or_else(|| find_named(e, &["hostname"]))
         .or_else(|| find_named(e, &["workstation"]));
 
-    let ip = from_message(e, if matches!(id, 4020 | 4021) { L_IP_OUT } else { L_IP_IN })
-        .or_else(|| find_named(e, &["client", "ip"]))
-        .or_else(|| find_named(e, &["ip"]))
-        .or_else(|| find_value(e, looks_like_ip));
+    let ip = from_message(
+        e,
+        if matches!(id, 4020 | 4021) {
+            L_IP_OUT
+        } else {
+            L_IP_IN
+        },
+    )
+    .or_else(|| find_named(e, &["client", "ip"]))
+    .or_else(|| find_named(e, &["ip"]))
+    .or_else(|| find_value(e, looks_like_ip));
 
     Some(Event {
         record_id: e.record_id,
