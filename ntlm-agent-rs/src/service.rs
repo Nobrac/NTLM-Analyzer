@@ -135,8 +135,8 @@ mod windows_impl {
 
             // Bis zum naechsten Intervall warten ODER sofort aufwachen, wenn Stop kam.
             match rx.recv_timeout(interval) {
-                Ok(()) => break, // Stop/Shutdown
-                Err(mpsc::RecvTimeoutError::Timeout) => continue, // naechster Zyklus
+                Ok(()) => break,                                    // Stop/Shutdown
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,   // naechster Zyklus
                 Err(mpsc::RecvTimeoutError::Disconnected) => break, // Sender weg
             }
         }
@@ -176,7 +176,7 @@ mod windows_impl {
             .args([
                 "/inheritance:r",
                 "/grant:r",
-                "*S-1-5-18:(OI)(CI)F", // SYSTEM
+                "*S-1-5-18:(OI)(CI)F",     // SYSTEM
                 "*S-1-5-32-544:(OI)(CI)F", // BUILTIN\Administratoren
             ])
             .status();
@@ -270,8 +270,7 @@ mod windows_impl {
                 OsString::from(format!(".\\{a}"))
             }
         });
-        let account_password: Option<OsString> =
-            cfg.service_password.as_ref().map(OsString::from);
+        let account_password: Option<OsString> = cfg.service_password.as_ref().map(OsString::from);
 
         let info = ServiceInfo {
             name: OsString::from(SERVICE_NAME),
