@@ -20,6 +20,15 @@ pub struct Config {
     pub skip_kerberos: bool,
     #[serde(default)]
     pub enable_outgoing_audit: bool,
+    /// Dienstkonto fuer die Installation (z.B. "DOM\\svc-ntlm" oder gMSA
+    /// "DOM\\gmsa-ntlm$"). Wird NICHT in config.json gespeichert - die
+    /// Zugangsdaten verwaltet der Windows-Dienst-Manager selbst.
+    #[serde(skip)]
+    pub service_account: Option<String>,
+    /// Passwort zum Dienstkonto. Bei gMSA/virtuellen Konten entfaellt es.
+    /// Wird NICHT in config.json gespeichert.
+    #[serde(skip)]
+    pub service_password: Option<String>,
 }
 
 fn def_interval() -> u32 {
@@ -38,6 +47,8 @@ impl Default for Config {
             days_back: 1,
             skip_kerberos: false,
             enable_outgoing_audit: false,
+            service_account: None,
+            service_password: None,
         }
     }
 }
@@ -114,12 +125,47 @@ impl Config {
                 }
                 "--skip-kerberos" => c.skip_kerberos = true,
                 "--enable-outgoing-audit" => c.enable_outgoing_audit = true,
+                "--service-account" => {
+                    i += 1;
+                    c.service_account = Some(
+                        args.get(i)
+                            .cloned()
+                            .ok_or("--service-account braucht einen Wert")?,
+                    );
+                }
+                "--service-password" => {
+                    i += 1;
+                    c.service_password = Some(
+                        args.get(i)
+                            .cloned()
+                            .ok_or("--service-password braucht einen Wert")?,
+                    );
+                }
                 other => return Err(format!("unbekanntes Argument: {other}")),
             }
             i += 1;
         }
         if c.collector_url.trim().is_empty() {
             return Err("--collector-url ist erforderlich".into());
+        }
+        // Dienstkonto-Plausibilitaet frueh pruefen, nicht erst beim SCM-Aufruf.
+        if c.service_password.is_some() && c.service_account.is_none() {
+            return Err("--service-password ohne --service-account ergibt keinen Sinn".into());
+        }
+        if let Some(acct) = &c.service_account {
+            let passwordless = acct.trim_end().ends_with('$')
+                || acct.to_ascii_lowercase().starts_with("nt service\\")
+                || acct.to_ascii_lowercase().starts_with("nt authority\\");
+            if passwordless && c.service_password.is_some() {
+                return Err("gMSA- und virtuelle Konten haben kein Passwort - \
+                     bitte --service-password weglassen"
+                    .into());
+            }
+            if !passwordless && c.service_password.is_none() {
+                return Err("--service-account braucht --service-password \
+                     (Ausnahme: gMSA mit '$' am Ende, z.B. DOM\\gmsa-ntlm$)"
+                    .into());
+            }
         }
         Ok(c)
     }
