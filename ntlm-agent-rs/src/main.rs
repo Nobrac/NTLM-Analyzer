@@ -49,9 +49,31 @@ fn main() {
                     exit(1);
                 }
                 match service::install(&cfg) {
-                    Ok(()) => println!(
-                        "Dienst 'NtlmAgent' installiert und gestartet. Steuerung ueber services.msc."
-                    ),
+                    Ok(()) => {
+                        println!(
+                            "Dienst 'NtlmAgent' installiert und gestartet. Steuerung ueber services.msc."
+                        );
+                        if let Some(acct) = &cfg.service_account {
+                            println!();
+                            println!("Dienstkonto: {acct} - bitte sicherstellen:");
+                            println!(
+                                "  1. 'Anmelden als Dienst' fuer das Konto (GPO: Zuweisen von Benutzerrechten)."
+                            );
+                            println!(
+                                "  2. Mitglied in 'Ereignisprotokollleser' (Event Log Readers) - \
+                                 sonst kein Zugriff auf das Security-Log (4624/4769 fehlen dann)."
+                            );
+                            println!(
+                                "  3. Bei gMSA: Das COMPUTERKONTO dieser Maschine muss in \
+                                 PrincipalsAllowedToRetrieveManagedPassword stehen \
+                                 (pruefbar mit Test-ADServiceAccount)."
+                            );
+                            println!(
+                                "  4. --enable-outgoing-audit wirkt unter einem Dienstkonto nicht \
+                                 (Registry-Schreibrecht fehlt) - das Audit per GPO setzen."
+                            );
+                        }
+                    }
                     Err(e) => {
                         eprintln!("Installation fehlgeschlagen: {e}");
                         exit(1);
@@ -96,8 +118,13 @@ Verwendung:
   ntlm-agent.exe install --collector-url <URL> [--api-key <KEY>]
                          [--interval <MIN>] [--days-back <N>]
                          [--skip-kerberos] [--enable-outgoing-audit]
+                         [--service-account <KONTO> [--service-password <PW>]]
         Schreibt die Konfiguration (C:\\ProgramData\\NtlmAgent\\config.json)
-        und richtet den Dienst ein (Autostart, LocalSystem) und startet ihn.
+        und richtet den Dienst ein (Autostart) und startet ihn.
+        Ohne --service-account laeuft der Dienst als LocalSystem.
+        Mit --service-account laeuft er unter dem angegebenen Konto;
+        eine gMSA wird am '$' am Ende erkannt und braucht kein Passwort
+        (z.B. --service-account \"DOM\\gmsa-ntlm$\").
 
   ntlm-agent.exe uninstall      Dienst stoppen und entfernen.
   ntlm-agent.exe run [args]     Einmaliger Lauf in der Konsole (zum Testen).

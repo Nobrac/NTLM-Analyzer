@@ -12,7 +12,7 @@ A Windows agent plus a central collector with a web dashboard that shows exactly
 &nbsp;
 ![Platform: Windows + Linux](https://img.shields.io/badge/platform-Windows%20%2B%20Linux-0078D6)
 &nbsp;
-[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![License: GPL v3](https://img.shields.io/badge/license-GPLv3-blue.svg)](LICENSE)
 
 [Features](#features) · [Screenshots](#screenshots) · [Quick start](#quick-start) · [Troubleshooting](#troubleshooting)
 
@@ -187,7 +187,8 @@ The enhanced 40xx auditing (Windows 11 24H2 / Server 2025) is **enabled by defau
 ### Agent (each monitored Windows machine)
 
 - Windows Server or client, x64.
-- **Administrator rights for installation**; the service itself then runs as `LocalSystem`, which grants the Security-log access needed on domain controllers.
+- **Administrator rights for installation.** By default the service then runs as `LocalSystem`, which grants the Security-log access needed on domain controllers.
+- **Optional, least privilege:** the service can run under a dedicated account or a **gMSA** instead — `--service-account "DOM\gmsa-ntlm$"` (a trailing `$` means no password; Windows retrieves it from AD). Such an account needs *Log on as a service* and membership in **Event Log Readers** (without the latter, 4624/4769 collection silently yields nothing), and for a gMSA the machine's computer account must be listed in `PrincipalsAllowedToRetrieveManagedPassword`. Details and examples: [agent README](ntlm-agent-rs/README.md).
 - Network access to the collector's port, and name resolution for the collector host.
 - The agent's URL scheme and port must match how the collector was started (`http://` vs `https://`).
 
@@ -232,7 +233,7 @@ cargo build --release
 ntlm-agent.exe install --collector-url https://collector.example.local:8443 --api-key AgentSecret
 ```
 
-One command does everything: copies the EXE to `C:\Program Files\NtlmAgent\`, hardens the ACLs, creates the service (auto-start, auto-restart) and starts it. Control it via `services.msc` or `sc start|stop NtlmAgent`; test without the service using `ntlm-agent.exe run`; remove it with `ntlm-agent.exe uninstall`.
+One command does everything: copies the EXE to `C:\Program Files\NtlmAgent\`, hardens the ACLs, creates the service (auto-start, auto-restart) and starts it. Add `--service-account` to run it under a dedicated account or gMSA instead of `LocalSystem`. Control it via `services.msc` or `sc start|stop NtlmAgent`; test without the service using `ntlm-agent.exe run`; remove it with `ntlm-agent.exe uninstall`.
 
 **4. Open the dashboard:** `https://collector.example.local:8443/` → sign in → confirm in the **Machines & auditing status** panel that every agent reports with a green heartbeat and green audit badges.
 
@@ -255,7 +256,7 @@ One command does everything: copies the EXE to `C:\Program Files\NtlmAgent\`, ha
 
 | Command | Purpose |
 | --- | --- |
-| `install --collector-url <URL> [--api-key K] [--interval MIN] [--days-back N] [--skip-kerberos] [--enable-outgoing-audit]` | Writes the config, installs and starts the service |
+| `install --collector-url <URL> [--api-key K] [--interval MIN] [--days-back N] [--skip-kerberos] [--enable-outgoing-audit] [--service-account A [--service-password P]]` | Writes the config, installs and starts the service. Default account: LocalSystem; a trailing `$` marks a gMSA (no password). See the agent README for the required rights. |
 | `uninstall` | Stops and removes the service |
 | `run` | One-off collect/push cycle in the console (for testing) |
 | `service` | Internal — invoked by the service control manager |
@@ -295,7 +296,7 @@ Expected: only event 4624 carries `LmPackageName`, i.e. the NTLMv1/v2 informatio
 
 ```
 README.md                     this file
-LICENSE                       MIT
+LICENSE                       GNU General Public License v3.0
 .gitignore                    keeps databases, logs, certificates and build output out of git
 .github/workflows/            CI: builds ntlm-agent.exe on Windows and publishes it as an artifact
 screenshots/                  images used in this README
@@ -311,4 +312,6 @@ Prebuilt binaries: every push to `main` builds the agent via GitHub Actions — 
 
 ## License
 
-[MIT](LICENSE) — see the `LICENSE` file. Replace the placeholder copyright holder with your name or organization before publishing.
+This project is licensed under the **GNU General Public License v3.0** — see the [LICENSE](LICENSE) file.
+
+In short: you may use, study, modify and redistribute this software, but any distributed derivative work must also be released under the GPLv3 and its source code made available. The software comes with no warranty.

@@ -106,3 +106,54 @@ service the agent runs as `LocalSystem` and has them automatically.
 | `src/eventlog.rs` | Reading event logs via `wevtutil` + XML parsing |
 | `src/agent.rs` | One collect/push cycle (4624/4769/8004/8001 + status) |
 | `src/service.rs` | Windows service: dispatcher, control handler, install/uninstall |
+
+## Running under a service account or gMSA (least privilege)
+
+By default the service runs as **LocalSystem**. For least-privilege setups it can
+run under a dedicated account instead:
+
+```cmd
+:: classic service account
+ntlm-agent.exe install --collector-url https://collector:8443 --api-key KEY ^
+    --service-account "DOM\svc-ntlm" --service-password "..."
+
+:: group managed service account (gMSA) - no password, Windows retrieves it from AD
+ntlm-agent.exe install --collector-url https://collector:8443 --api-key KEY ^
+    --service-account "DOM\gmsa-ntlm$"
+```
+
+A trailing `$` marks the account as a gMSA (no password allowed); virtual accounts
+(`NT SERVICE\...`, `NT AUTHORITY\...`) are also accepted without a password.
+Credentials are handed to the Windows service manager and are **never** written
+to `config.json`.
+
+**The account needs, on every monitored machine:**
+
+1. **Log on as a service** — grant via GPO under *Computer Configuration →
+   Windows Settings → Security Settings → Local Policies → User Rights Assignment*.
+2. **Event Log Readers** membership — without it the account cannot read the
+   Security log, so 4624/4769 collection silently yields nothing (the
+   NTLM/Operational log still works).
+3. **gMSA only:** the machine's **computer account** must be allowed to
+   retrieve the password (`PrincipalsAllowedToRetrieveManagedPassword`) —
+   that alone is sufficient; the service manager fetches the password from AD
+   at start. `Install-ADServiceAccount` is *not* required for running a
+   service, but `Test-ADServiceAccount` is a handy check when the service
+   won't start. After changing the group membership, reboot the machine so
+   its Kerberos ticket picks up the change.
+
+The installer grants the account *Modify* on `C:\ProgramData\NtlmAgent\`
+automatically (watermarks + log). One limitation: `--enable-outgoing-audit`
+writes to HKLM and therefore does nothing under a non-admin service account —
+set the audit policy via GPO instead (see the main README).
+
+Creating a gMSA (once, on a DC):
+
+```powershell
+New-ADServiceAccount gmsa-ntlm -DNSHostName gmsa-ntlm.example.local `
+    -PrincipalsAllowedToRetrieveManagedPassword "NTLM-Agent-Servers"
+Add-ADGroupMember "Event Log Readers" gmsa-ntlm$
+```
+
+where `NTLM-Agent-Servers` is a group containing the computer accounts of all
+monitored machines.

@@ -182,6 +182,26 @@ mod windows_impl {
         // Datenordner (config.json/state.json/agent.log) gegen Manipulation durch
         // normale Benutzer absichern - laeuft hier, weil install Adminrechte hat.
         harden_data_dir();
+        // Ein eigenes Dienstkonto braucht Schreibrechte auf den Datenordner
+        // (state.json, agent.log) - SYSTEM+Administratoren reichen dann nicht.
+        if let Some(acct) = &cfg.service_account {
+            let dir = config::data_dir();
+            let status = std::process::Command::new(config::system32("icacls.exe"))
+                .arg(&dir)
+                .args(["/grant", &format!("{acct}:(OI)(CI)M")])
+                .status();
+            match status {
+                Ok(st) if st.success() => config::log(&format!(
+                    "Datenordner-ACL: Modify fuer Dienstkonto '{acct}' ergaenzt."
+                )),
+                _ => config::log(&format!(
+                    "WARNUNG: Konnte '{acct}' keine Rechte auf {} geben - \
+                     bitte manuell Modify gewaehren, sonst kann der Dienst \
+                     weder Wasserzeichen noch Log schreiben.",
+                    dir.display()
+                )),
+            }
+        }
         // EXE an den geschuetzten Ort kopieren und den Dienst von dort registrieren.
         let target_exe = install_dir().join("ntlm-agent.exe");
         let current = std::env::current_exe()?;
@@ -221,6 +241,21 @@ mod windows_impl {
             .into());
         }
 
+        // Dienstkonto: Standard bleibt LocalSystem. Mit --service-account laeuft
+        // der Dienst unter einem normalen Konto oder einer gMSA ('$' am Ende,
+        // ohne Passwort - das Passwort holt Windows selbst aus dem AD).
+        // Lokale Namen ohne Domaenenteil bekommen ".\" vorangestellt, sonst
+        // interpretiert der SCM sie nicht.
+        let account_name: Option<OsString> = cfg.service_account.as_ref().map(|a| {
+            let a = a.trim();
+            if a.contains('\\') || a.contains('@') {
+                OsString::from(a)
+            } else {
+                OsString::from(format!(".\\{a}"))
+            }
+        });
+        let account_password: Option<OsString> = cfg.service_password.as_ref().map(OsString::from);
+
         let info = ServiceInfo {
             name: OsString::from(SERVICE_NAME),
             display_name: OsString::from(DISPLAY_NAME),
@@ -230,8 +265,8 @@ mod windows_impl {
             executable_path: target_exe,
             launch_arguments: vec![OsString::from("service")],
             dependencies: vec![],
-            account_name: None, // None = LocalSystem
-            account_password: None,
+            account_name, // None = LocalSystem
+            account_password,
         };
 
         let service = manager
@@ -260,16 +295,32 @@ mod windows_impl {
             .status();
 
         let no_args: Vec<OsString> = Vec::new();
+        let acct_hint = if cfg.service_account.is_some() {
+            " Bei einem Dienstkonto sind die haeufigsten Ursachen: (1) Dem Konto \
+             fehlt das Recht 'Anmelden als Dienst' (Fehler 1069; per GPO unter \
+             Computerkonfiguration > Windows-Einstellungen > Sicherheitseinstellungen > \
+             Lokale Richtlinien > Zuweisen von Benutzerrechten vergeben). \
+             (2) gMSA: Die Maschine darf das Passwort nicht abrufen - das \
+             Computerkonto fehlt in PrincipalsAllowedToRetrieveManagedPassword \
+             (Diagnose: Test-ADServiceAccount; nach Gruppenaenderung Reboot noetig)."
+        } else {
+            ""
+        };
         service.start(&no_args).map_err(|e| {
             format!(
                 "Dienst wurde angelegt, aber das Starten schlug fehl: {e:?} - \
                  Details in C:\\ProgramData\\NtlmAgent\\agent.log bzw. der \
-                 Ereignisanzeige (System). Start manuell: 'sc start {SERVICE_NAME}'."
+                 Ereignisanzeige (System). Start manuell: 'sc start {SERVICE_NAME}'.{acct_hint}"
             )
         })?;
 
+        let acct_txt = cfg
+            .service_account
+            .clone()
+            .unwrap_or_else(|| String::from("LocalSystem"));
         config::log(&format!(
-            "Dienst '{SERVICE_NAME}' installiert und gestartet (Intervall {} min).",
+            "Dienst '{SERVICE_NAME}' installiert und gestartet \
+             (Konto: {acct_txt}, Intervall {} min).",
             cfg.interval_minutes
         ));
         Ok(())
