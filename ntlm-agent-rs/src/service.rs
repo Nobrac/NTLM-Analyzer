@@ -1,3 +1,19 @@
+// NTLM-Analyzer - find out who still uses NTLM in your Active Directory.
+// Copyright (C) 2026  Nobrac / Carbon / NoPCAP
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 //! Windows-Dienst: SCM-Dispatcher, Steuerungs-Handler und Installation/Deinstallation.
 //!
 //! Der Dienst laeuft als LocalSystem im Autostart und ist ueber services.msc bzw.
@@ -119,8 +135,8 @@ mod windows_impl {
 
             // Bis zum naechsten Intervall warten ODER sofort aufwachen, wenn Stop kam.
             match rx.recv_timeout(interval) {
-                Ok(()) => break,                                    // Stop/Shutdown
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,   // naechster Zyklus
+                Ok(()) => break, // Stop/Shutdown
+                Err(mpsc::RecvTimeoutError::Timeout) => continue, // naechster Zyklus
                 Err(mpsc::RecvTimeoutError::Disconnected) => break, // Sender weg
             }
         }
@@ -160,7 +176,7 @@ mod windows_impl {
             .args([
                 "/inheritance:r",
                 "/grant:r",
-                "*S-1-5-18:(OI)(CI)F",     // SYSTEM
+                "*S-1-5-18:(OI)(CI)F", // SYSTEM
                 "*S-1-5-32-544:(OI)(CI)F", // BUILTIN\Administratoren
             ])
             .status();
@@ -254,7 +270,8 @@ mod windows_impl {
                 OsString::from(format!(".\\{a}"))
             }
         });
-        let account_password: Option<OsString> = cfg.service_password.as_ref().map(OsString::from);
+        let account_password: Option<OsString> =
+            cfg.service_password.as_ref().map(OsString::from);
 
         let info = ServiceInfo {
             name: OsString::from(SERVICE_NAME),
