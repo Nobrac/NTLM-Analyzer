@@ -1,3 +1,19 @@
+// NTLM-Analyzer - find out who still uses NTLM in your Active Directory.
+// Copyright (C) 2026  Nobrac / Carbon / NoPCAP
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 //! Konfiguration, Statusdatei (Wasserzeichen) und einfaches Datei-Logging.
 
 use serde::{Deserialize, Serialize};
@@ -157,14 +173,18 @@ impl Config {
                 || acct.to_ascii_lowercase().starts_with("nt service\\")
                 || acct.to_ascii_lowercase().starts_with("nt authority\\");
             if passwordless && c.service_password.is_some() {
-                return Err("gMSA- und virtuelle Konten haben kein Passwort - \
+                return Err(
+                    "gMSA- und virtuelle Konten haben kein Passwort - \
                      bitte --service-password weglassen"
-                    .into());
+                        .into(),
+                );
             }
             if !passwordless && c.service_password.is_none() {
-                return Err("--service-account braucht --service-password \
+                return Err(
+                    "--service-account braucht --service-password \
                      (Ausnahme: gMSA mit '$' am Ende, z.B. DOM\\gmsa-ntlm$)"
-                    .into());
+                        .into(),
+                );
             }
         }
         Ok(c)
