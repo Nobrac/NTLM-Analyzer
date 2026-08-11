@@ -14,13 +14,13 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! Konfiguration, Statusdatei (Wasserzeichen) und einfaches Datei-Logging.
+//! Configuration, state file (watermarks) and simple file logging.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-/// Version, die beim Status-Push mitgesendet wird (Dashboard-Anzeige).
+/// Version reported with every status push (shown in the dashboard).
 pub const AGENT_VERSION: &str = "1.1-rs";
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -36,13 +36,13 @@ pub struct Config {
     pub skip_kerberos: bool,
     #[serde(default)]
     pub enable_outgoing_audit: bool,
-    /// Dienstkonto fuer die Installation (z.B. "DOM\\svc-ntlm" oder gMSA
-    /// "DOM\\gmsa-ntlm$"). Wird NICHT in config.json gespeichert - die
-    /// Zugangsdaten verwaltet der Windows-Dienst-Manager selbst.
+    /// Service account used at install time (e.g. "DOM\\svc-ntlm" or the gMSA
+    /// "DOM\\gmsa-ntlm$"). NOT stored in config.json - the credentials are
+    /// managed by the Windows service manager itself.
     #[serde(skip)]
     pub service_account: Option<String>,
-    /// Passwort zum Dienstkonto. Bei gMSA/virtuellen Konten entfaellt es.
-    /// Wird NICHT in config.json gespeichert.
+    /// Password for the service account; omitted for gMSA/virtual accounts.
+    /// NOT stored in config.json.
     #[serde(skip)]
     pub service_password: Option<String>,
 }
@@ -83,11 +83,11 @@ pub fn log_path() -> PathBuf {
     data_dir().join("agent.log")
 }
 
-/// Absoluter Pfad zu einer Windows-Systemdatei in System32. Verhindert, dass ein
-/// als LocalSystem laufender Dienst Hilfsprogramme (wevtutil, sc) ueber den Suchpfad
-/// oder das Arbeitsverzeichnis aufloest (Schutz gegen Binary-Planting).
-/// Annahme: 64-Bit-Build (Standard der MSVC-Toolchain) - dann ist System32 das echte
-/// 64-Bit-Verzeichnis ohne WOW64-Umleitung.
+/// Absolute path to a Windows system binary in System32. Prevents a service
+/// running as LocalSystem from resolving helper programs (wevtutil, sc) via the
+/// search path or the working directory (protection against binary planting).
+/// Assumes a 64-bit build (the MSVC toolchain default) - then System32 is the
+/// real 64-bit directory without WOW64 redirection.
 pub fn system32(exe: &str) -> PathBuf {
     let root = std::env::var("SystemRoot").unwrap_or_else(|_| String::from(r"C:\Windows"));
     PathBuf::from(root).join("System32").join(exe)
@@ -106,7 +106,7 @@ impl Config {
         std::fs::write(config_path(), s).map_err(|e| e.to_string())
     }
 
-    /// Konfiguration aus CLI-Argumenten bauen (fuer `install`).
+    /// Build the configuration from CLI arguments (used by `install`).
     pub fn from_args(args: &[String]) -> Result<Config, String> {
         let mut c = Config::default();
         let mut i = 0;
@@ -117,27 +117,27 @@ impl Config {
                     c.collector_url = args
                         .get(i)
                         .cloned()
-                        .ok_or("--collector-url braucht einen Wert")?;
+                        .ok_or("--collector-url requires a value")?;
                 }
                 "--api-key" => {
                     i += 1;
-                    c.api_key = args.get(i).cloned().ok_or("--api-key braucht einen Wert")?;
+                    c.api_key = args.get(i).cloned().ok_or("--api-key requires a value")?;
                 }
                 "--interval" => {
                     i += 1;
                     c.interval_minutes = args
                         .get(i)
-                        .ok_or("--interval braucht einen Wert")?
+                        .ok_or("--interval requires a value")?
                         .parse()
-                        .map_err(|_| "--interval erwartet eine Zahl")?;
+                        .map_err(|_| "--interval expects a number")?;
                 }
                 "--days-back" => {
                     i += 1;
                     c.days_back = args
                         .get(i)
-                        .ok_or("--days-back braucht einen Wert")?
+                        .ok_or("--days-back requires a value")?
                         .parse()
-                        .map_err(|_| "--days-back erwartet eine Zahl")?;
+                        .map_err(|_| "--days-back expects a number")?;
                 }
                 "--skip-kerberos" => c.skip_kerberos = true,
                 "--enable-outgoing-audit" => c.enable_outgoing_audit = true,
@@ -146,7 +146,7 @@ impl Config {
                     c.service_account = Some(
                         args.get(i)
                             .cloned()
-                            .ok_or("--service-account braucht einen Wert")?,
+                            .ok_or("--service-account requires a value")?,
                     );
                 }
                 "--service-password" => {
@@ -154,7 +154,7 @@ impl Config {
                     c.service_password = Some(
                         args.get(i)
                             .cloned()
-                            .ok_or("--service-password braucht einen Wert")?,
+                            .ok_or("--service-password requires a value")?,
                     );
                 }
                 other => return Err(format!("unbekanntes Argument: {other}")),
@@ -162,9 +162,9 @@ impl Config {
             i += 1;
         }
         if c.collector_url.trim().is_empty() {
-            return Err("--collector-url ist erforderlich".into());
+            return Err("--collector-url is required".into());
         }
-        // Dienstkonto-Plausibilitaet frueh pruefen, nicht erst beim SCM-Aufruf.
+        // Validate the service account early instead of failing at the SCM call.
         if c.service_password.is_some() && c.service_account.is_none() {
             return Err("--service-password ohne --service-account ergibt keinen Sinn".into());
         }
@@ -173,20 +173,20 @@ impl Config {
                 || acct.to_ascii_lowercase().starts_with("nt service\\")
                 || acct.to_ascii_lowercase().starts_with("nt authority\\");
             if passwordless && c.service_password.is_some() {
-                return Err("gMSA- und virtuelle Konten haben kein Passwort - \
-                     bitte --service-password weglassen"
+                return Err("gMSA and virtual accounts have no password - \
+                     please omit --service-password"
                     .into());
             }
             if !passwordless && c.service_password.is_none() {
-                return Err("--service-account braucht --service-password \
-                     (Ausnahme: gMSA mit '$' am Ende, z.B. DOM\\gmsa-ntlm$)"
+                return Err("--service-account requires --service-password \
+                     (exception: a gMSA, i.e. a trailing '$', e.g. DOM\\gmsa-ntlm$)"
                     .into());
             }
         }
         Ok(c)
     }
 
-    /// Fuer `run`: ohne Argumente die gespeicherte Konfiguration laden, sonst aus Argumenten.
+    /// For `run`: load the stored configuration when no arguments are given.
     pub fn load_or_args(args: &[String]) -> Result<Config, String> {
         if args.is_empty() {
             Config::load()
@@ -206,10 +206,10 @@ pub fn load_state() -> HashMap<String, i64> {
 pub fn save_state(s: &HashMap<String, i64>) -> Result<(), String> {
     std::fs::create_dir_all(data_dir()).map_err(|e| e.to_string())?;
     let body = serde_json::to_string(s).map_err(|e| e.to_string())?;
-    // Atomar: erst in Temp-Datei schreiben, dann umbenennen. So kann ein
-    // Stromausfall mitten im Schreiben keine halb geschriebene (und damit
-    // unlesbare) state.json hinterlassen - die Wasserzeichen blieben sonst weg
-    // und der Agent wuerde alles erneut senden.
+    // Atomic: write to a temp file first, then rename. That way a power loss
+    // in the middle of a write cannot leave a half-written (and therefore
+    // unreadable) state.json behind - the watermarks would be lost and the
+    // agent would resend everything.
     let tmp = data_dir().join("state.json.tmp");
     std::fs::write(&tmp, body).map_err(|e| e.to_string())?;
     std::fs::rename(&tmp, state_path()).map_err(|e| e.to_string())
@@ -218,9 +218,9 @@ pub fn save_state(s: &HashMap<String, i64>) -> Result<(), String> {
 /// Einfaches Logging in C:\ProgramData\NtlmAgent\agent.log (+ stderr).
 pub fn log(msg: &str) {
     let _ = std::fs::create_dir_all(data_dir());
-    // Rotation: waechst agent.log ueber ~5 MB, wird es zu agent.log.1 (eine
-    // Generation, aeltere wird ersetzt). Der Dienst laeuft dauerhaft - ohne
-    // Deckel wuerde die Datei ueber Monate beliebig gross.
+    // Rotation: once agent.log grows past ~5 MB it becomes agent.log.1 (a
+    // single generation, the older one is replaced). The service runs
+    // permanently - without a cap the file would grow without bound.
     if let Ok(md) = std::fs::metadata(log_path()) {
         if md.len() > 5 * 1024 * 1024 {
             let _ = std::fs::rename(log_path(), data_dir().join("agent.log.1"));

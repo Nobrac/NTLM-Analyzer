@@ -16,13 +16,13 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """
-NTLM-Analyzer - zentraler Sammelpunkt + Web-Dashboard fuer NTLM-Nutzung.
+NTLM-Analyzer - central collection point + web dashboard for NTLM usage.
 
 Die Windows-Agents (ntlm-agent.exe) pushen ihre Events per HTTP POST /ingest
-als JSON. Hier landen sie in einer SQLite-DB; das Dashboard unter / zeigt sie
+as JSON. They are stored in a SQLite database; the dashboard at / shows them
 in Echtzeit (auto-refresh).
 
-Nur Python-Standardbibliothek - keine Abhaengigkeiten, kein pip noetig.
+Python standard library only - no dependencies, no pip required.
 
 Start:
     python3 ntlm-collector.py --port 8080 --key GEHEIM123
@@ -51,15 +51,15 @@ from urllib.parse import urlparse, parse_qs
 
 DB_LOCK = threading.Lock()
 
-MAX_BODY = 10 * 1024 * 1024          # 10 MB Obergrenze fuer POST-Bodies (DoS-Schutz)
+MAX_BODY = 10 * 1024 * 1024          # 10 MB cap for POST bodies (DoS protection)
 
-# ---- Login-Brute-Force-Bremse (pro Quell-IP) --------------------------------
-LOGIN_FAILS = {}                      # ip -> [fehlversuche, gesperrt_bis_epoch]
+# ---- Login brute-force throttle (per source IP) -----------------------------
+LOGIN_FAILS = {}                      # ip -> [failed_attempts, locked_until_epoch]
 LOGIN_FAILS_LOCK = threading.Lock()
-LOGIN_MAX_FAILS = 10                  # nach so vielen Fehlversuchen ...
-LOGIN_LOCK_SECS = 300                 # ... 5 Minuten Sperre fuer diese IP
+LOGIN_MAX_FAILS = 10                  # after this many failed attempts ...
+LOGIN_LOCK_SECS = 300                 # ... lock this IP for 5 minutes
 
-# ---- Auth / Sessions (nur fuer die Browser-Seiten / und /api/data) ----------
+# ---- Auth / sessions (browser pages / and /api/data only) ------------------
 SESSION_COOKIE = "ntlm_session"
 SESSION_TTL = 12 * 60 * 60          # 12 Stunden
 SESSIONS_LOCK = threading.Lock()
@@ -84,7 +84,7 @@ CREATE TABLE IF NOT EXISTS events (
     domain        TEXT,
     ntlm_version  TEXT,            -- NTLMv1 | NTLMv2 (kind=auth)
     process       TEXT,            -- exe (kind=outgoing)
-    target_server TEXT,            -- SPN/Dienst (kind=kerberos) bzw. Zielserver
+    target_server TEXT,            -- SPN/service (kind=kerberos) or target server
     workstation   TEXT,
     ip            TEXT,
     logon_type    TEXT,
@@ -121,15 +121,15 @@ def init_db(path):
     for col in ("enc_type", "auth_method", "reason"):
         if col not in have:
             conn.execute(f"ALTER TABLE events ADD COLUMN {col} TEXT")
-    # Indizes fuer die Dashboard-Abfragen (Zeitraum-Filter, Aggregate).
-    # IF NOT EXISTS -> laeuft auch auf bestehenden DBs beim Start einfach durch.
+    # Indexes for the dashboard queries (time-range filter, aggregates).
+    # IF NOT EXISTS -> also runs cleanly against existing databases at startup.
     conn.executescript("""
     CREATE INDEX IF NOT EXISTS idx_ev_time   ON events(event_time);
     CREATE INDEX IF NOT EXISTS idx_ev_kind   ON events(kind, event_time);
     CREATE INDEX IF NOT EXISTS idx_ev_ver    ON events(ntlm_version, event_time);
     CREATE INDEX IF NOT EXISTS idx_ev_eid    ON events(event_id, event_time);
     CREATE INDEX IF NOT EXISTS idx_ev_source ON events(source);
-    -- Bearbeitungsstatus fuer Blocker-/Domaenen-Eintraege (offen = keine Zeile)
+    -- Work status for blocker/domain entries (open = no row)
     CREATE TABLE IF NOT EXISTS item_status (
         key        TEXT PRIMARY KEY,   -- 'proc|<prozess>|<ziel>' bzw. 'dom|<quelle>|<ziel>'
         status     TEXT NOT NULL,      -- 'arbeit' | 'erledigt'
@@ -183,7 +183,7 @@ class Handler(BaseHTTPRequestHandler):
         return False
 
     def _login_required(self):
-        # Login nur erzwingen, wenn ueberhaupt ein Passwort gesetzt ist.
+        # Only enforce login when a password is configured at all.
         return bool(self.server.pw_hash) and not self._valid_session()
 
     def _new_session(self):
@@ -222,8 +222,8 @@ class Handler(BaseHTTPRequestHandler):
         if not self.server.pw_hash:        # Login deaktiviert -> einfach durchwinken
             self._redirect("/")
             return
-        # Brute-Force-Bremse pro Quell-IP: nach LOGIN_MAX_FAILS Fehlversuchen
-        # wird die IP fuer LOGIN_LOCK_SECS gesperrt (unabhaengig von Parallelitaet).
+        # Brute-force throttle per source IP: after LOGIN_MAX_FAILS failed
+        # attempts the IP is locked for LOGIN_LOCK_SECS (regardless of concurrency).
         ip = self.client_address[0]
         now = time.time()
         with LOGIN_FAILS_LOCK:
@@ -233,7 +233,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
         try:
             length = int(self.headers.get("Content-Length", 0))
-            if length < 0 or length > 64 * 1024:   # Login-Formular ist winzig
+            if length < 0 or length > 64 * 1024:   # the login form is tiny
                 raise ValueError("bad length")
             form = parse_qs(self.rfile.read(length).decode("utf-8", "replace"))
         except Exception:
@@ -243,7 +243,7 @@ class Handler(BaseHTTPRequestHandler):
         _, got = hash_password(pw, salt)
         if hmac.compare_digest(got, want):
             with LOGIN_FAILS_LOCK:
-                LOGIN_FAILS.pop(ip, None)          # Erfolg setzt den Zaehler zurueck
+                LOGIN_FAILS.pop(ip, None)          # success resets the counter
             self._redirect("/", set_cookie=self._new_session())
         else:
             with LOGIN_FAILS_LOCK:
@@ -293,7 +293,7 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/login":          # Browser-Login, nutzt KEINEN API-Key
             self._handle_login()
             return
-        if u.path == "/item-status":    # Browser-Aktion -> Session, nicht API-Key
+        if u.path == "/item-status":    # browser action -> session, not API key
             if self._login_required():
                 self._send(401, {"error": "login required"})
                 return
@@ -310,11 +310,11 @@ class Handler(BaseHTTPRequestHandler):
             if not key or "|" not in key or status not in ("offen", "arbeit", "erledigt"):
                 self._send(400, {"error": "bad key/status"})
                 return
-            # UTC, damit der Vergleich mit den Event-Zeitstempeln der Agenten
-            # (ebenfalls UTC) fuer "wieder aktiv" ohne Zeitzonen-Versatz stimmt.
+            # UTC, so the comparison against the agents' event timestamps (also
+            # UTC) for "active again" has no timezone offset.
             now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
             with DB_LOCK:
-                if status == "offen":     # offen = Standard -> Zeile entfernen
+                if status == "offen":     # open = default -> remove the row
                     self.server.conn.execute("DELETE FROM item_status WHERE key=?", (key,))
                 else:
                     self.server.conn.execute(
@@ -411,13 +411,13 @@ class Handler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _event_filters(qs):
-        """Gemeinsamer Filteraufbau fuer /api/data und /api/export.csv."""
+        """Shared filter construction for /api/data and /api/export.csv."""
         def one(name, default=None):
             v = qs.get(name, [default])
             return v[0] if v else default
 
-        # Zeitraum-Filter: 24h / 7d / 30d / all. Cutoff als ISO-String, da
-        # event_time als ISO gespeichert ist (String-Vergleich ist dann korrekt).
+        # Time-range filter: 24h / 7d / 30d / all. Cutoff as an ISO string, since
+        # event_time is stored as ISO (so string comparison is correct).
         rng = one("range", "all")
         deltas = {"24h": timedelta(hours=24), "7d": timedelta(days=7),
                   "30d": timedelta(days=30)}
@@ -462,10 +462,10 @@ class Handler(BaseHTTPRequestHandler):
 
         buf = io.StringIO()
         w = csv.writer(buf, delimiter=";", lineterminator="\r\n")
-        w.writerow(["Zeit", "Maschine", "Art", "EventID", "NTLM-Version",
-                    "Auth-Weg", "Benutzer", "Domaene", "Prozess", "Ziel",
-                    "Quelle/Workstation", "IP", "LogonType", "Verschluesselung",
-                    "Grund"])
+        w.writerow(["Time", "Machine", "Kind", "EventID", "NTLM version",
+                    "Auth path", "User", "Domain", "Process", "Target",
+                    "Source/Workstation", "IP", "Logon type", "Encryption",
+                    "Reason"])
         for r in rows:
             w.writerow([cell(v) for v in r])
         body = "\ufeff" + buf.getvalue()   # BOM -> Excel erkennt UTF-8
@@ -487,7 +487,7 @@ class Handler(BaseHTTPRequestHandler):
 
         with DB_LOCK:
             c = self.server.conn
-            # Bearbeitungsstatus (offen/arbeit/erledigt) fuer Blocker & Domaenen-Zeilen
+            # Work status (open/in progress/done) for blocker and domain rows
             st_map = {r[0]: (r[1], r[2]) for r in
                       c.execute("SELECT key, status, updated_at FROM item_status").fetchall()}
             def with_status(prefix, a, b, row):
@@ -505,13 +505,13 @@ class Handler(BaseHTTPRequestHandler):
                                      f"WHERE process IS NOT NULL AND process NOT LIKE '(%' AND {tf}", tp).fetchone()[0],
                 "krb":     c.execute(f"SELECT COUNT(DISTINCT target_server) FROM events WHERE kind='kerberos' AND {tf}", tp).fetchone()[0],
                 "fallback": c.execute(f"SELECT COUNT(*) FROM events WHERE auth_method='Fallback' AND {tf}", tp).fetchone()[0],
-                # Erweiterte Audits (Server 2025): NTLMv1-abgeleitete SSO-Credentials.
-                # Ab Oktober 2026 blockiert Windows das von sich aus (BlockNtlmv1SSO).
+                # Enhanced audits (Server 2025): NTLMv1-derived SSO credentials.
+                # From October 2026 Windows blocks these by itself (BlockNtlmv1SSO).
                 "v1sso": c.execute(f"SELECT COUNT(*) FROM events WHERE kind='ntlmv1sso' AND {tf}", tp).fetchone()[0],
                 "downgrade": c.execute(f"SELECT COUNT(*) FROM events WHERE auth_method='Downgrade' AND {tf}", tp).fetchone()[0],
             }
-            # Verlauf: NTLM-Vorgaenge je Zeit-Bucket (24h -> stundenweise, sonst taeglich).
-            # Buckets per substr auf dem ISO-String; kerberos separat nur zur Einordnung.
+            # Trend: NTLM events per time bucket (24h -> hourly, otherwise daily).
+            # Buckets via substr on the ISO string; kerberos separate, for context only.
             bucket = "substr(event_time,1,13)" if rng == "24h" else "substr(event_time,1,10)"
             trend_rows = c.execute(
                 f"SELECT {bucket} AS b, "
@@ -530,7 +530,7 @@ class Handler(BaseHTTPRequestHandler):
             v1_users = [dict(name=r[0], n=r[1]) for r in c.execute(
                 f"SELECT user, COUNT(*) FROM events WHERE ntlm_version='NTLMv1' AND {tf} "
                 f"GROUP BY user ORDER BY COUNT(*) DESC LIMIT 15", tp).fetchall()]
-            # Abschalt-Blocker: ausgehender NTLM (8001) - bricht beim Deny der ausgehenden Policy
+            # Shutdown blockers: outgoing NTLM (8001) - breaks once the outgoing policy denies
             blockers = [with_status("proc", r[0], r[1],
                              dict(process=r[0], target=r[1], n=r[2],
                              users=r[3], sources=r[4], last_seen=r[5], who=r[6])) for r in c.execute(
@@ -539,7 +539,7 @@ class Handler(BaseHTTPRequestHandler):
                 f"GROUP_CONCAT(DISTINCT user) "
                 f"FROM events WHERE event_id IN (8001,4020,4021) AND {tf} "
                 f"GROUP BY process, target_server ORDER BY COUNT(*) DESC LIMIT 50", tp).fetchall()]
-            # NTLMv1-SSO (4024/4025): eigener Blocker mit harter Deadline Oktober 2026
+            # NTLMv1 SSO (4024/4025): its own blocker with a hard October 2026 deadline
             v1sso = [with_status("v1sso", r[0], r[1],
                           dict(user=r[0], target=r[1], n=r[2], sources=r[3],
                                last_seen=r[4], blocked=bool(r[5]))) for r in c.execute(
@@ -548,7 +548,7 @@ class Handler(BaseHTTPRequestHandler):
                 f"MAX(CASE WHEN event_id=4025 THEN 1 ELSE 0 END) "
                 f"FROM events WHERE kind='ntlmv1sso' AND {tf} "
                 f"GROUP BY user, target_server ORDER BY COUNT(*) DESC LIMIT 50", tp).fetchall()]
-            # NTLM in der Domain (8004, vom DC): zuverlaessigste Quelle->Ziel-Sicht
+            # NTLM inside the domain (8004, from the DC): most reliable source->target view
             domain = [with_status("dom", r[0], r[1],
                            dict(workstation=r[0], target=r[1], users=r[2],
                            n=r[3], last_seen=r[4], who=r[5])) for r in c.execute(
@@ -556,14 +556,14 @@ class Handler(BaseHTTPRequestHandler):
                 f"COUNT(DISTINCT user), COUNT(*), MAX(event_time), GROUP_CONCAT(DISTINCT user) "
                 f"FROM events WHERE event_id IN (8004,4022,4023,4030,4031,4032,4033) AND {tf} "
                 f"GROUP BY workstation, target_server ORDER BY COUNT(*) DESC LIMIT 50", tp).fetchall()]
-            # Kerberos (nur Info): welche Dienste/SPNs laufen schon ueber Kerberos
+            # Kerberos (informational): which services/SPNs already use Kerberos
             kerberos = [dict(service=r[0], accounts=r[1], n=r[2],
                              enc=r[3], last_seen=r[4]) for r in c.execute(
                 f"SELECT COALESCE(target_server,'(unbekannt)'), COUNT(DISTINCT user), COUNT(*), "
                 f"       GROUP_CONCAT(DISTINCT enc_type), MAX(event_time) "
                 f"FROM events WHERE kind='kerberos' AND {tf} "
                 f"GROUP BY target_server ORDER BY COUNT(*) DESC LIMIT 50", tp).fetchall()]
-            # Kerberos nach Konto: die "sichere Seite" - welche Konten laufen schon ueber Kerberos
+            # Kerberos by account: the "safe side" - which accounts already use Kerberos
             kerberos_accounts = [dict(account=r[0], services=r[1], svc_count=r[2], n=r[3],
                                       enc=r[4], last_seen=r[5]) for r in c.execute(
                 f"SELECT COALESCE(user,'(unbekannt)'), GROUP_CONCAT(DISTINCT target_server), "
@@ -574,7 +574,7 @@ class Handler(BaseHTTPRequestHandler):
             srcs = [r[0] for r in c.execute(
                 "SELECT DISTINCT source FROM events ORDER BY source").fetchall()]
             # Maschinen: Heartbeat (last_seen) + Audit-Status + Eventzahl je Quelle
-            # (bewusst OHNE Zeitfilter: zeigt den aktuellen Zustand der Agents)
+            # (deliberately WITHOUT the time filter: shows the agents' current state)
             agents = [dict(source=r[0], is_dc=bool(r[1]), agent_version=r[2],
                            outgoing_audit=r[3], incoming_audit=r[4], domain_audit=r[5],
                            last_seen=r[6], events=r[7] or 0, last_event=r[8]) for r in c.execute(
@@ -794,72 +794,72 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <header class="top">
     <div class="langbar"><span class="lchip on" data-l="de">DE</span><span class="lchip" data-l="en">EN</span></div>
     <h1 data-i18n="h1">NTLM-Analyzer</h1>
-    <p data-i18n="intro">Wer im Netzwerk verwendet noch das ältere NTLM-Anmeldeverfahren – und was läuft bereits sicher über Kerberos. Ziel ist, NTLM nach und nach abzulösen.</p>
-    <div class="live"><span class="dot"></span> <span data-i18n="live">Aktualisiert sich automatisch · zuletzt</span> <span id="updated">–</span></div>
+    <p data-i18n="intro">Who on the network still uses the legacy NTLM authentication – and what already runs securely over Kerberos. The goal is to phase NTLM out step by step.</p>
+    <div class="live"><span class="dot"></span> <span data-i18n="live">Refreshes automatically · last</span> <span id="updated">–</span></div>
   </header>
 
   <div class="legend">
-    <span class="goal" data-i18n="leg_goal">Farb­bedeutung</span>
-    <span class="key"><span class="swatch s-bad"></span> <span data-i18n="leg_bad">Rot = unsicher (NTLMv1)</span></span>
-    <span class="key"><span class="swatch s-old"></span> <span data-i18n="leg_old">Gelb = veraltet (NTLMv2)</span></span>
-    <span class="key"><span class="swatch s-good"></span> <span data-i18n="leg_good">Grün = sicher (Kerberos)</span></span>
+    <span class="goal" data-i18n="leg_goal">Color legend</span>
+    <span class="key"><span class="swatch s-bad"></span> <span data-i18n="leg_bad">Red = insecure (NTLMv1)</span></span>
+    <span class="key"><span class="swatch s-old"></span> <span data-i18n="leg_old">Yellow = outdated (NTLMv2)</span></span>
+    <span class="key"><span class="swatch s-good"></span> <span data-i18n="leg_good">Green = secure (Kerberos)</span></span>
   </div>
 
   <div class="rangebar">
-    <span class="rlabel" data-i18n="range">Zeitraum</span>
+    <span class="rlabel" data-i18n="range">Time range</span>
     <span class="rchip" data-r="24h">24 h</span>
-    <span class="rchip on" data-r="7d" data-i18n="r7d">7 Tage</span>
-    <span class="rchip" data-r="30d" data-i18n="r30d">30 Tage</span>
-    <span class="rchip" data-r="all" data-i18n="rall">Alles</span>
+    <span class="rchip on" data-r="7d" data-i18n="r7d">7 days</span>
+    <span class="rchip" data-r="30d" data-i18n="r30d">30 days</span>
+    <span class="rchip" data-r="all" data-i18n="rall">All</span>
   </div>
 
   <div class="stats">
     <div class="stat clickable" tabindex="0" data-filter="all" data-scroll="#sec-events"
-         data-i18n-title="tt_total" title="Alle Ereignisse anzeigen"><div class="num" id="s-total">–</div><div class="lab" data-i18n="lab_total">NTLM gesamt</div><div class="sub" data-i18n="sub_total">erfasste Vorgänge</div></div>
+         data-i18n-title="tt_total" title="Show all events"><div class="num" id="s-total">–</div><div class="lab" data-i18n="lab_total">NTLM total</div><div class="sub" data-i18n="sub_total">recorded events</div></div>
     <div class="stat bad clickable" tabindex="0" data-filter="v1" data-scroll="#sec-events"
-         data-i18n-title="tt_v1" title="Zu den unsicheren Anmeldungen springen"><div class="num" id="s-v1">–</div><div class="lab" data-i18n="lab_v1">Unsicher</div><div class="sub" data-i18n="sub_v1">NTLMv1 – zuerst ablösen</div></div>
+         data-i18n-title="tt_v1" title="Jump to insecure logons"><div class="num" id="s-v1">–</div><div class="lab" data-i18n="lab_v1">Insecure</div><div class="sub" data-i18n="sub_v1">NTLMv1 – replace first</div></div>
     <div class="stat old clickable" tabindex="0" data-filter="v2" data-scroll="#sec-events"
-         data-i18n-title="tt_v2" title="Zu den veralteten Anmeldungen springen"><div class="num" id="s-v2">–</div><div class="lab" data-i18n="lab_v2">Veraltet</div><div class="sub" data-i18n="sub_v2">NTLMv2 – besser, aber alt</div></div>
+         data-i18n-title="tt_v2" title="Jump to outdated logons"><div class="num" id="s-v2">–</div><div class="lab" data-i18n="lab_v2">Outdated</div><div class="sub" data-i18n="sub_v2">NTLMv2 – better, but old</div></div>
     <div class="stat good clickable" tabindex="0" data-scroll="#sec-kerberos"
-         data-i18n-title="tt_krb" title="Zur Kerberos-Übersicht springen"><div class="num" id="s-krb">–</div><div class="lab" data-i18n="lab_krb">Schon sicher</div><div class="sub" data-i18n="sub_krb">Dienste über Kerberos</div></div>
+         data-i18n-title="tt_krb" title="Jump to the Kerberos overview"><div class="num" id="s-krb">–</div><div class="lab" data-i18n="lab_krb">Already secure</div><div class="sub" data-i18n="sub_krb">services via Kerberos</div></div>
     <div class="stat clickable" tabindex="0" data-scroll="#sec-domain"
-         data-i18n-title="tt_src" title="Zur Übersicht springen"><div class="num" id="s-src">–</div><div class="lab" data-i18n="lab_src">Beteiligte Computer</div><div class="sub" data-i18n="sub_src">Quellen &amp; Server</div></div>
+         data-i18n-title="tt_src" title="Jump to the domain overview"><div class="num" id="s-src">–</div><div class="lab" data-i18n="lab_src">Computers involved</div><div class="sub" data-i18n="sub_src">sources & servers</div></div>
     <div class="stat clickable" tabindex="0" data-scroll="#sec-programs"
-         data-i18n-title="tt_proc" title="Zu den Programmen springen"><div class="num" id="s-proc">–</div><div class="lab" data-i18n="lab_proc">Erkannte Programme</div><div class="sub" data-i18n="sub_proc">die NTLM auslösen</div></div>
+         data-i18n-title="tt_proc" title="Jump to programs"><div class="num" id="s-proc">–</div><div class="lab" data-i18n="lab_proc">Programs detected</div><div class="sub" data-i18n="sub_proc">that trigger NTLM</div></div>
   </div>
 
   <!-- Verlauf: NTLM ueber Zeit -->
   <section id="sec-trend">
     <div class="head">
-      <h2 data-i18n="trend_h">Verlauf</h2>
-      <p data-i18n="trend_p">NTLM-Vorgänge im gewählten Zeitraum.</p>
+      <h2 data-i18n="trend_h">Trend</h2>
+      <p data-i18n="trend_p">NTLM activity in the selected time range – these bars should approach zero over the weeks. Red = NTLMv1, yellow = NTLMv2, gray = NTLM without version info (domain/outgoing). Kerberos is shown in the tooltip for context.</p>
     </div>
     <div class="trend" id="trend"></div>
   </section>
 
-  <!-- NTLMv1-SSO: harte Deadline Oktober 2026 (Server 2025 / Win11 24H2) -->
+  <!-- NTLMv1 SSO: hard October 2026 deadline (Server 2025 / Win11 24H2) -->
   <section id="sec-v1sso" style="display:none">
     <div class="head">
-      <h2><span class="badge b-bad"><span class="d"></span><span data-i18n="b_deadline">Deadline</span></span> <span data-i18n="v1sso_h">NTLMv1-SSO – funktioniert ab Oktober 2026 nicht mehr</span></h2>
-      <p data-i18n="v1sso_p">Windows meldet hier die Nutzung NTLMv1-abgeleiteter Anmeldedaten. Microsoft stellt im Oktober 2026 automatisch auf Blockieren um – diese Zugriffe brechen dann von selbst, unabhängig von euren eigenen Richtlinien.</p>
+      <h2><span class="badge b-bad"><span class="d"></span><span data-i18n="b_deadline">Deadline</span></span> <span data-i18n="v1sso_h">NTLMv1 SSO – stops working in October 2026</span></h2>
+      <p data-i18n="v1sso_p">Windows reports the use of NTLMv1-derived credentials here. In October 2026 Microsoft switches the default to blocking – these will then break on their own, regardless of your own policies.</p>
     </div>
     <div class="scroll">
       <table>
-        <thead><tr><th data-i18n="th_user4">Benutzer</th><th data-i18n="th_target4">Ziel</th><th data-i18n="th_count4">Anzahl</th><th data-i18n="th_state4">Zustand</th><th data-i18n="th_status4">Status</th><th data-i18n="th_last5">Zuletzt</th></tr></thead>
+        <thead><tr><th data-i18n="th_user4">User</th><th data-i18n="th_target4">Target</th><th data-i18n="th_count4">Count</th><th data-i18n="th_state4">State</th><th data-i18n="th_status4">Status</th><th data-i18n="th_last5">Last seen</th></tr></thead>
         <tbody id="v1sso"></tbody>
       </table>
     </div>
   </section>
 
-  <!-- Programme, die NTLM nutzen -->
+  <!-- Programs using NTLM -->
   <section id="sec-programs">
     <div class="head">
-      <h2><span class="badge b-bad"><span class="d"></span></span> <span data-i18n="prog_h">Programme, die noch NTLM verwenden</span></h2>
-      <p data-i18n="prog_p">Diese Programme melden sich per NTLM nach außen an.</p>
+      <h2><span class="badge b-bad"><span class="d"></span></span> <span data-i18n="prog_h">Programs still using NTLM</span></h2>
+      <p data-i18n="prog_p">These programs authenticate outward via NTLM. Before disabling NTLM they should be reviewed or reconfigured. "SMB/Kernel" means file-share access – no single program can be named there.</p>
     </div>
     <div class="scroll">
       <table>
-        <thead><tr><th data-i18n="th_prog">Programm</th><th data-i18n="th_target">Zielserver</th><th data-i18n="th_count">Anzahl</th><th data-i18n="th_users">Benutzer</th><th data-i18n="th_comps">Computer (Anz.)</th><th data-i18n="th_status">Status</th><th data-i18n="th_last">Zuletzt</th></tr></thead>
+        <thead><tr><th data-i18n="th_prog">Program</th><th data-i18n="th_target">Target server</th><th data-i18n="th_count">Count</th><th data-i18n="th_users">Users</th><th data-i18n="th_comps">Computers (no.)</th><th data-i18n="th_status">Status</th><th data-i18n="th_last">Last seen</th></tr></thead>
         <tbody id="blockers"></tbody>
       </table>
     </div>
@@ -868,22 +868,22 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <!-- Wer nutzt NTLM, wohin (8004) -->
   <section id="sec-domain">
     <div class="head">
-      <h2 data-i18n="dom_h">Wer nutzt NTLM – und wohin</h2>
-      <p data-i18n="dom_p">Vom Domänencontroller gemeldet.</p>
+      <h2 data-i18n="dom_h">Who uses NTLM – and where to</h2>
+      <p data-i18n="dom_p">Reported by the domain controller: which computer connects to which server via NTLM. The most reliable overall view – even when no program name can be determined.</p>
     </div>
     <div class="scroll">
       <table>
-        <thead><tr><th data-i18n="th_srccomp">Computer (Quelle)</th><th data-i18n="th_target2">Zielserver</th><th data-i18n="th_users2">Benutzer</th><th data-i18n="th_count2">Anzahl</th><th data-i18n="th_status2">Status</th><th data-i18n="th_last2">Zuletzt</th></tr></thead>
+        <thead><tr><th data-i18n="th_srccomp">Computer (source)</th><th data-i18n="th_target2">Target server</th><th data-i18n="th_users2">Users</th><th data-i18n="th_count2">Count</th><th data-i18n="th_status2">Status</th><th data-i18n="th_last2">Last seen</th></tr></thead>
         <tbody id="domain"></tbody>
       </table>
     </div>
   </section>
 
-  <!-- NTLMv1 nach Benutzer -->
+  <!-- NTLMv1 by user -->
   <section id="sec-v1">
     <div class="head">
-      <h2><span class="badge b-bad"><span class="d"></span><span data-i18n="b_insec">unsicher</span></span> <span data-i18n="v1_h">Unsichere Anmeldungen nach Benutzer</span></h2>
-      <p data-i18n="v1_p">NTLMv1 gilt als unsicher.</p>
+      <h2><span class="badge b-bad"><span class="d"></span><span data-i18n="b_insec">insecure</span></span> <span data-i18n="v1_h">Insecure logons by user</span></h2>
+      <p data-i18n="v1_p">NTLMv1 is considered insecure and should be replaced first. These users or accounts still logged on with it.</p>
     </div>
     <div class="bars" id="v1-users"></div>
   </section>
@@ -891,26 +891,26 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <!-- Kerberos -->
   <section id="sec-kerberos">
     <div class="head">
-      <h2><span class="badge b-good"><span class="d"></span><span data-i18n="b_sec">sicher</span></span> <span data-i18n="krb_h">Läuft bereits über Kerberos</span></h2>
-      <p data-i18n="krb_p">Diese Dienste nutzen schon Kerberos.</p>
+      <h2><span class="badge b-good"><span class="d"></span><span data-i18n="b_sec">secure</span></span> <span data-i18n="krb_h">Already running over Kerberos</span></h2>
+      <p data-i18n="krb_p">These services already use modern, secure Kerberos – all good here. For information only. "RC4/DES" would be weaker encryption, "AES" is good.</p>
     </div>
     <div class="scroll">
       <table>
-        <thead><tr><th data-i18n="th_service">Dienst</th><th data-i18n="th_accounts">Konten</th><th data-i18n="th_count3">Anzahl</th><th data-i18n="th_enc">Verschlüsselung</th><th data-i18n="th_last3">Zuletzt</th></tr></thead>
+        <thead><tr><th data-i18n="th_service">Service</th><th data-i18n="th_accounts">Accounts</th><th data-i18n="th_count3">Count</th><th data-i18n="th_enc">Encryption</th><th data-i18n="th_last3">Last seen</th></tr></thead>
         <tbody id="kerb"></tbody>
       </table>
     </div>
   </section>
 
-  <!-- Kerberos nach Konto: die sichere Seite -->
+  <!-- Kerberos by account: the safe side -->
   <section id="sec-kerberos-accounts">
     <div class="head">
-      <h2><span class="badge b-good"><span class="d"></span><span data-i18n="b_sec2">sicher</span></span> <span data-i18n="krba_h">Konten, die schon Kerberos nutzen</span></h2>
-      <p data-i18n="krba_p">Die sichere Seite.</p>
+      <h2><span class="badge b-good"><span class="d"></span><span data-i18n="b_sec2">secure</span></span> <span data-i18n="krba_h">Accounts already using Kerberos</span></h2>
+      <p data-i18n="krba_p">The "safe side": these accounts have already authenticated successfully via Kerberos – with the services they use and the encryption. "AES" is good, "RC4/DES" would be weaker. For information only.</p>
     </div>
     <div class="scroll">
       <table>
-        <thead><tr><th data-i18n="th_account">Konto</th><th data-i18n="th_services">Dienste</th><th data-i18n="th_tickets">Tickets</th><th data-i18n="th_enc2">Verschlüsselung</th><th data-i18n="th_last4">Zuletzt</th></tr></thead>
+        <thead><tr><th data-i18n="th_account">Account</th><th data-i18n="th_services">Services</th><th data-i18n="th_tickets">Tickets</th><th data-i18n="th_enc2">Encryption</th><th data-i18n="th_last4">Last seen</th></tr></thead>
         <tbody id="kerb-accounts"></tbody>
       </table>
     </div>
@@ -919,12 +919,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <!-- Maschinen / Heartbeat + Auditing-Status -->
   <section id="sec-agents">
     <div class="head">
-      <h2 data-i18n="ag_h">Maschinen &amp; Auditing-Status</h2>
-      <p data-i18n="ag_p">Welche Agents melden.</p>
+      <h2 data-i18n="ag_h">Machines & auditing status</h2>
+      <p data-i18n="ag_p">Which agents report – and whether the required auditing is enabled there. A green dot means "reported recently". Red auditing badges explain why a machine may not deliver data.</p>
     </div>
     <div class="scroll">
       <table>
-        <thead><tr><th data-i18n="th_machine">Maschine</th><th data-i18n="th_type">Typ</th><th data-i18n="th_status3">Status</th><th>Auditing</th><th>Events</th><th data-i18n="th_lastrep">Zuletzt gemeldet</th></tr></thead>
+        <thead><tr><th data-i18n="th_machine">Machine</th><th data-i18n="th_type">Type</th><th data-i18n="th_status3">Status</th><th>Auditing</th><th>Events</th><th data-i18n="th_lastrep">Last reported</th></tr></thead>
         <tbody id="agents"></tbody>
       </table>
     </div>
@@ -933,21 +933,21 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <!-- Letzte Ereignisse -->
   <section id="sec-events">
     <div class="head">
-      <h2 data-i18n="ev_h">Letzte Ereignisse</h2>
-      <p data-i18n="ev_p">Die neuesten erfassten Vorgänge.</p>
+      <h2 data-i18n="ev_h">Recent events</h2>
+      <p data-i18n="ev_p">The latest recorded activity. "Kerberos fallback" on a logon means Kerberos was attempted but failed – usually an SPN, DNS or clock-skew issue. Filter with the buttons or search above.</p>
     </div>
     <div class="filters">
-      <input id="q" data-i18n-ph="search_ph" placeholder="Suchen: Benutzer, Programm, Server, Computer …">
-      <span class="chip on" data-f="all" data-i18n="f_all">Alle</span>
-      <span class="chip" data-f="v1" data-i18n="f_v1">Nur unsicher</span>
-      <span class="chip" data-f="v2" data-i18n="f_v2">Nur veraltet</span>
-      <span class="chip" data-f="outgoing" data-i18n="f_out">Programme</span>
-      <span class="chip" data-f="domain" data-i18n="f_dom">Domäne</span>
-      <span class="rchip" id="csvbtn" data-i18n="csv" data-i18n-title="csv_t" title="Aktuelle Auswahl als CSV herunterladen">CSV-Export</span>
+      <input id="q" data-i18n-ph="search_ph" placeholder="Search: user, program, server, computer …">
+      <span class="chip on" data-f="all" data-i18n="f_all">All</span>
+      <span class="chip" data-f="v1" data-i18n="f_v1">Insecure only</span>
+      <span class="chip" data-f="v2" data-i18n="f_v2">Outdated only</span>
+      <span class="chip" data-f="outgoing" data-i18n="f_out">Programs</span>
+      <span class="chip" data-f="domain" data-i18n="f_dom">Domain</span>
+      <span class="rchip" id="csvbtn" data-i18n="csv" data-i18n-title="csv_t" title="Download the current selection as CSV">CSV-Export</span>
     </div>
     <div class="scroll">
       <table>
-        <thead><tr><th data-i18n="th_time">Zeit</th><th data-i18n="th_kind">Art</th><th data-i18n="th_users3">Benutzer</th><th data-i18n="th_prog2">Programm</th><th data-i18n="th_tgtsrc">Ziel / Quelle</th><th data-i18n="th_comp">Computer</th></tr></thead>
+        <thead><tr><th data-i18n="th_time">Time</th><th data-i18n="th_kind">Kind</th><th data-i18n="th_users3">User</th><th data-i18n="th_prog2">Program</th><th data-i18n="th_tgtsrc">Target / source</th><th data-i18n="th_comp">Computer</th></tr></thead>
         <tbody id="rows"></tbody>
       </table>
     </div>
@@ -1154,7 +1154,7 @@ function artBadge(e){
 function heartbeat(lastSeen){
   if(!lastSeen) return '<span class="soft">–</span>';
   const ageMin = (Date.now() - new Date(lastSeen).getTime())/60000;
-  const ok = ageMin < 60;   // <1h = aktiv
+  const ok = ageMin < 60;   // <1h = alive
   const col = ok ? 'var(--good)' : 'var(--still)';
   const txt = ok ? t('hb_on') : t('hb_off');
   return '<span style="display:inline-flex;align-items:center;gap:6px"><span style="width:8px;height:8px;border-radius:50%;background:'+col+'"></span>'+txt+'</span>';
@@ -1183,11 +1183,11 @@ function bar(nm,n,max,bad){
 }
 
 // ---- Bearbeitungsstatus & Was-tun-Hinweise ----
-const openHints = new Set();   // geoeffnete Hinweise ueberleben den Auto-Refresh
-const openEvents = new Set();  // aufgeklappte Ereigniszeilen ueberleben den Auto-Refresh
+const openHints = new Set();   // opened hints survive the auto-refresh
+const openEvents = new Set();  // expanded event rows survive the auto-refresh
 
-// Detail-Ansicht einer Ereigniszeile im Stil der Windows-Ereignisanzeige:
-// links die Eigenschaft, rechts der Wert, alles was das Event hergibt.
+// Detail view of an event row in the style of the Windows Event Viewer:
+// property on the left, value on the right, everything the event carries.
 function evDetailRow(e, id){
   if(!openEvents.has(id)) return '';
   const rows = [
@@ -1272,7 +1272,7 @@ function buildParams(){
 }
 
 async function load(){
-  // Nicht neu rendern, waehrend gerade ein Status-Feld bedient wird
+  // Do not re-render while a status field is being operated
   const ae = document.activeElement;
   if(ae && ae.classList && ae.classList.contains('stsel')) return;
   const p = buildParams();
@@ -1392,7 +1392,7 @@ document.querySelectorAll('.chip').forEach(c=>c.addEventListener('click',()=>{
   c.classList.add('on'); state.f=c.dataset.f; load();
 }));
 
-// Hinweise auf-/zuklappen und Status setzen: delegiert, damit es den 5s-Refresh ueberlebt
+// Toggle hints and set status: delegated so it survives the 5s refresh
 document.addEventListener('click', e=>{
   const h = e.target.closest('.hintbtn');
   if(h){ const id=h.dataset.h; openHints.has(id)?openHints.delete(id):openHints.add(id); load(); return; }
@@ -1422,7 +1422,7 @@ document.querySelectorAll('.rchip[data-r]').forEach(c=>c.addEventListener('click
   c.classList.add('on'); state.r=c.dataset.r; load();
 }));
 
-// Kennzahlen-Karten: Filter setzen (falls vorhanden) und zur passenden Sektion springen
+// Metric cards: apply the filter (if any) and jump to the matching section
 function applyFilter(f){
   state.f = f;
   document.querySelectorAll('.chip').forEach(x=>x.classList.toggle('on', x.dataset.f===f));
@@ -1448,7 +1448,7 @@ load(); setInterval(load,5000);
 LOGIN_HTML = r"""<!doctype html>
 <html lang="de"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Anmeldung - NTLM Telemetrie</title>
+<title>Sign in - NTLM-Analyzer</title>
 <style>
   :root{--paper:#f6f3ec;--card:#fff;--ink:#2c2a26;--soft:#6f6a60;--line:#e7e1d5;
         --accent:#2f6f6a;--bad:#c4453f;--bad-bg:#fbeceb;
@@ -1476,16 +1476,16 @@ LOGIN_HTML = r"""<!doctype html>
 <body>
   <div class="card">
     <h1>NTLM Telemetrie</h1>
-    <p class="sub" id="l_sub">Bitte anmelden, um das Dashboard zu sehen.</p>
-    <div class="err" id="err">Falsches Passwort. Bitte erneut versuchen.</div>
+    <p class="sub" id="l_sub">Please sign in to view the dashboard.</p>
+    <div class="err" id="err">Wrong password. Please try again.</div>
     <form method="post" action="/login">
-      <label for="pw" id="l_pw">Passwort</label>
+      <label for="pw" id="l_pw">Password</label>
       <input id="pw" name="password" type="password" autofocus autocomplete="current-password">
-      <button type="submit" id="l_btn">Anmelden</button>
+      <button type="submit" id="l_btn">Sign in</button>
     </form>
   </div>
   <script>
-    // Sprache: gleiche Einstellung wie das Dashboard (localStorage 'ntlm_lang')
+    // Language: same setting as the dashboard (localStorage 'ntlm_lang')
     var L = {
       de: {sub:'Bitte anmelden, um das Dashboard zu sehen.', pw:'Passwort', btn:'Anmelden',
            e1:'Falsches Passwort. Bitte erneut versuchen.',
@@ -1516,22 +1516,22 @@ def main():
     ap.add_argument("--key", default=os.environ.get("NTLM_API_KEY", ""),
                     help="Shared secret; Agents senden ihn als X-Api-Key")
     ap.add_argument("--password", default=os.environ.get("NTLM_DASHBOARD_PASSWORD", ""),
-                    help="Passwort fuer den Dashboard-Login. Leer = Login AUS (offen). "
+                    help="Password for the dashboard login. Empty = login OFF (open). "
                          "Besser ueber Env NTLM_DASHBOARD_PASSWORD setzen statt als Argument.")
     ap.add_argument("--secure-cookie", action="store_true",
                     help="Session-Cookie als 'Secure' markieren (nur ueber HTTPS senden). "
                          "Bei aktivem --cert/--tlskey automatisch an.")
     ap.add_argument("--cert", default="",
-                    help="Pfad zum TLS-Zertifikat (PEM). Zusammen mit --tlskey aktiviert das HTTPS.")
+                    help="Path to the TLS certificate (PEM). Together with --tlskey this enables HTTPS.")
     ap.add_argument("--tlskey", default="",
                     help="Pfad zum privaten TLS-Schluessel (PEM).")
     ap.add_argument("--retention-days", type=int, default=0,
-                    help="Events aelter als N Tage automatisch loeschen (0 = aus). "
-                         "Laeuft beim Start und danach alle 6 Stunden.")
+                    help="Automatically delete events older than N days (0 = off). "
+                         "Runs at startup and every 6 hours after that.")
     args = ap.parse_args()
 
     if bool(args.cert) != bool(args.tlskey):
-        ap.error("--cert und --tlskey muessen zusammen angegeben werden.")
+        ap.error("--cert and --tlskey must be given together.")
 
     conn = init_db(args.db)
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
@@ -1543,14 +1543,14 @@ def main():
         try:
             ctx.load_cert_chain(certfile=args.cert, keyfile=args.tlskey)
         except (ssl.SSLError, OSError) as exc:
-            raise SystemExit(f"[NTLM-Analyzer] TLS-Start fehlgeschlagen: {exc}")
+            raise SystemExit(f"[NTLM-Analyzer] TLS startup failed: {exc}")
         httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
         scheme = "https"
 
     httpd.conn = conn
     httpd.api_key = args.key
     httpd.sessions = {}
-    # Ueber HTTPS ist das Secure-Flag immer richtig -> automatisch setzen.
+    # Over HTTPS the Secure flag is always correct -> set it automatically.
     httpd.cookie_secure = args.secure_cookie or scheme == "https"
     httpd.pw_hash = hash_password(args.password) if args.password else None
 
@@ -1565,25 +1565,25 @@ def main():
                             "DELETE FROM events WHERE event_time < ?", (cutoff,))
                         conn.commit()
                     if cur.rowcount:
-                        print(f"[NTLM-Analyzer] Aufbewahrung: {cur.rowcount} Events "
-                              f"aelter als {args.retention_days} Tage entfernt")
+                        print(f"[NTLM-Analyzer] retention: deleted {cur.rowcount} events "
+                              f"older than {args.retention_days} days")
                 except Exception as exc:
-                    print(f"[NTLM-Analyzer] Aufbewahrung fehlgeschlagen: {exc}")
+                    print(f"[NTLM-Analyzer] retention cleanup failed: {exc}")
                 time.sleep(6 * 3600)
         threading.Thread(target=_retention_loop, daemon=True).start()
 
     print(f"[NTLM-Analyzer] Dashboard:  {scheme}://{args.host}:{args.port}/")
     print(f"[NTLM-Analyzer] Ingest:     POST {scheme}://{args.host}:{args.port}/ingest")
     print(f"[NTLM-Analyzer] DB:         {os.path.abspath(args.db)}")
-    print(f"[NTLM-Analyzer] API-Key:    {'gesetzt' if args.key else 'KEINER (offen!)'}")
-    print(f"[NTLM-Analyzer] Login:      {'aktiv' if args.password else 'AUS (Dashboard offen!)'}")
-    print(f"[NTLM-Analyzer] TLS:        {'aktiv (min. TLS 1.2)' if scheme == 'https' else 'AUS (Klartext!)'}")
+    print(f"[NTLM-Analyzer] API key:    {'set' if args.key else 'NONE (open!)'}")
+    print(f"[NTLM-Analyzer] Login:      {'enabled' if args.password else 'OFF (dashboard open!)'}")
+    print(f"[NTLM-Analyzer] TLS:        {'enabled (min. TLS 1.2)' if scheme == 'https' else 'OFF (clear text!)'}")
     print(f"[NTLM-Analyzer] Retention:  "
-          f"{str(args.retention_days) + ' Tage' if args.retention_days > 0 else 'aus (DB waechst unbegrenzt)'}")
+          f"{str(args.retention_days) + ' days' if args.retention_days > 0 else 'off (DB grows without bound)'}")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
-        print("\n[NTLM-Analyzer] beendet.")
+        print("\n[NTLM-Analyzer] stopped.")
 
 
 if __name__ == "__main__":
