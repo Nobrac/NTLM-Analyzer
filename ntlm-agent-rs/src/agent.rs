@@ -28,6 +28,8 @@ use crate::eventlog::{self, RawEvent};
 const DATA_4624: &str = "(*[EventData[Data[@Name='LmPackageName']='NTLM V1']] or *[EventData[Data[@Name='LmPackageName']='NTLM V2']])";
 
 const LSA: &str = r"SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0";
+const LSA_ROOT: &str = r"SYSTEM\CurrentControlSet\Control\Lsa";
+const DEVGUARD_CG: &str = r"SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\CredentialGuard";
 const NETLOGON: &str = r"SYSTEM\CurrentControlSet\Services\Netlogon\Parameters";
 
 // ----------------------------- Datenmodelle -----------------------------
@@ -62,6 +64,18 @@ struct AgentStatus {
     outgoing_audit: String,
     incoming_audit: String,
     domain_audit: String,
+    /// LmCompatibilityLevel: which NTLM versions the machine still *permits*.
+    /// Config-side evidence - a machine can show no NTLMv1 for months and still
+    /// allow it. 5 = NTLMv2 only, which is the target state.
+    lm_level: String,
+    /// BlockNtlmv1SSO: 0 = audit (default), 1 = enforce. Microsoft flips the
+    /// default to enforce in October 2026.
+    block_v1sso: String,
+    /// Credential Guard state. Machines with Credential Guard enabled are NOT
+    /// affected by the BlockNtlmv1SSO change - it already prevents NTLMv1
+    /// cryptography. Read from the registry, so this is the *configured*
+    /// value, not proof that it is actually running.
+    cred_guard: String,
 }
 
 #[derive(Serialize)]
@@ -92,6 +106,9 @@ pub fn run_cycle(cfg: &Config) -> Result<(), String> {
         outgoing_audit: outgoing_audit(),
         incoming_audit: incoming_audit(),
         domain_audit: domain_audit(),
+        lm_level: lm_level(),
+        block_v1sso: block_v1sso(),
+        cred_guard: cred_guard(),
     };
     let status_url = format!("{}/status", cfg.collector_url.trim_end_matches('/'));
     match serde_json::to_string(&status) {
@@ -141,12 +158,12 @@ pub fn run_cycle(cfg: &Config) -> Result<(), String> {
         gather(
             "Microsoft-Windows-NTLM/Operational",
             "NTLM#8004",
-            "EventID=8004",
+            "(EventID=8004 or EventID=8005 or EventID=8006)",
             "",
             window_ms,
             &state,
             &me,
-            map_8004,
+            map_dc_ntlm,
             &mut collected,
             &mut new_seen,
             false,
@@ -176,6 +193,35 @@ pub fn run_cycle(cfg: &Config) -> Result<(), String> {
         &state,
         &me,
         map_8001,
+        &mut collected,
+        &mut new_seen,
+        false,
+    );
+    // Incoming NTLM: 8002 names the local service that accepts it, 8003 the
+    // remote account that came in. Both need the "Audit Incoming NTLM Traffic"
+    // policy; without it the queries simply return nothing.
+    gather(
+        "Microsoft-Windows-NTLM/Operational",
+        "NTLM#8002",
+        "EventID=8002",
+        "",
+        window_ms,
+        &state,
+        &me,
+        map_8002,
+        &mut collected,
+        &mut new_seen,
+        false,
+    );
+    gather(
+        "Microsoft-Windows-NTLM/Operational",
+        "NTLM#8003",
+        "EventID=8003",
+        "",
+        window_ms,
+        &state,
+        &me,
+        map_8003,
         &mut collected,
         &mut new_seen,
         false,
@@ -347,22 +393,131 @@ fn map_4769(e: &RawEvent) -> Option<Event> {
     })
 }
 
-fn map_8004(e: &RawEvent) -> Option<Event> {
+/// DC-side NTLM credential validation. Microsoft splits this across three IDs,
+/// all with the same field layout - collecting only 8004 leaves two blind spots:
+///   8004  request from a domain member over the secure channel (the common case)
+///   8005  NTLM straight to the DC itself (e.g. a type 3 logon to the DC)
+///   8006  request from a *trusted domain* over the secure channel
+/// Under enforcement these turn into 4004/4005/4006 respectively.
+fn map_dc_ntlm(e: &RawEvent) -> Option<Event> {
     let p = &e.positional;
     let u = p.get(1).cloned().unwrap_or_default();
-    if u.trim().is_empty() || u.ends_with('$') {
+    if u.trim().is_empty() || u == "-" || u == "ANONYMOUS LOGON" {
         return None;
     }
+    // Machine accounts are kept on purpose: machine accounts falling back to
+    // NTLM is a finding in itself, and the dashboard can filter them out.
     Some(Event {
         record_id: e.record_id,
         log: "NTLM/Operational".to_string(),
-        event_id: 8004,
+        event_id: e.event_id,
         kind: "domain".to_string(),
         event_time: e.time.clone(),
         user: Some(u),
         domain: p.get(2).cloned(),
-        target_server: p.first().cloned(), // secure channel = target server
-        workstation: p.get(3).cloned(),    // source (client)
+        // 8005 has no secure channel (the DC itself is the target), so the
+        // field may be empty - that is fine, the source machine still tells
+        // the story.
+        target_server: p.first().cloned().filter(|s| !s.trim().is_empty()),
+        workstation: p.get(3).cloned(),
+        ..Default::default()
+    })
+}
+
+/// Splits a process path into its bare file name ("C:\\...\\w3wp.exe" -> "w3wp.exe").
+fn base_name(n: &str) -> String {
+    n.rsplit(['\\', '/']).next().unwrap_or(n).to_string()
+}
+
+/// Picks the process name out of an event: a value that looks like an
+/// executable wins, regardless of its position - the field order of the NTLM
+/// events is not officially documented.
+fn sniff_process(e: &RawEvent, fallback_idx: usize) -> Option<String> {
+    let looks_exe = |v: &str| {
+        let l = v.to_lowercase();
+        l.ends_with(".exe") || l.ends_with(".dll") || l.contains('\\')
+    };
+    e.named
+        .values()
+        .chain(e.positional.iter())
+        .map(|s| s.trim())
+        .find(|s| !s.is_empty() && *s != "-" && looks_exe(s))
+        .map(|s| base_name(s))
+        .or_else(|| {
+            e.positional
+                .get(fallback_idx)
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty() && *s != "-")
+                .map(base_name)
+        })
+}
+
+/// 8002 - incoming NTLM on this machine. The valuable part is the *calling
+/// process*: it names the local service that accepts NTLM (IIS, SQL, svchost
+/// and friends). Requires the "Audit Incoming NTLM Traffic" policy.
+/// Documented field order: PID, process name, LUID, user identity, domain.
+fn map_8002(e: &RawEvent) -> Option<Event> {
+    let p = &e.positional;
+    let nonempty = |i: usize| p.get(i).cloned().filter(|s| !s.trim().is_empty());
+    let pid = p.first().cloned().unwrap_or_default();
+
+    // The identity here is the identity of the *calling process*, not the
+    // remote user - do not present it as the authenticating account.
+    let process = sniff_process(e, 1).or_else(|| {
+        // PID 4 = kernel mode. Not only SMB: HTTP.sys also runs there, which
+        // covers WinRM, ADWS, SSRS and the Remote Desktop Gateway.
+        Some(if pid == "4" {
+            "(Kernel: SMB/HTTP.sys)".to_string()
+        } else if pid.is_empty() {
+            "(unknown)".to_string()
+        } else {
+            format!("(PID {pid})")
+        })
+    });
+
+    Some(Event {
+        record_id: e.record_id,
+        log: "NTLM/Operational".to_string(),
+        event_id: 8002,
+        kind: "incoming".to_string(),
+        event_time: e.time.clone(),
+        process,
+        user: nonempty(3),
+        domain: nonempty(4),
+        ..Default::default()
+    })
+}
+
+/// 8003 - incoming NTLM including the remote account. Complements 8002:
+/// 8002 says which local service accepted it, 8003 says who came in.
+/// Documented field order: user, domain, workstation, PID, process, logon type.
+fn map_8003(e: &RawEvent) -> Option<Event> {
+    let p = &e.positional;
+    let nonempty = |i: usize| p.get(i).cloned().filter(|s| !s.trim().is_empty());
+    let user = nonempty(0)?;
+    if user == "-" || user == "ANONYMOUS LOGON" {
+        return None;
+    }
+    let pid = p.get(3).cloned().unwrap_or_default();
+    let process = sniff_process(e, 4).or_else(|| {
+        if pid == "4" {
+            Some("(Kernel: SMB/HTTP.sys)".to_string())
+        } else {
+            None
+        }
+    });
+
+    Some(Event {
+        record_id: e.record_id,
+        log: "NTLM/Operational".to_string(),
+        event_id: 8003,
+        kind: "incoming".to_string(),
+        event_time: e.time.clone(),
+        user: Some(user),
+        domain: nonempty(1),
+        workstation: nonempty(2),
+        process,
+        logon_type: nonempty(5).filter(|s| s.chars().all(|c| c.is_ascii_digit())),
         ..Default::default()
     })
 }
@@ -387,7 +542,7 @@ fn map_8001(e: &RawEvent) -> Option<Event> {
             Some(base)
         }
         None => Some(if pid == "4" {
-            "(SMB/Kernel)".to_string()
+            "(Kernel: SMB/HTTP.sys)".to_string()
         } else {
             format!("(PID {pid})")
         }),
@@ -768,6 +923,42 @@ fn incoming_audit() -> String {
         "aus"
     }
     .to_string()
+}
+
+/// LmCompatibilityLevel as plain text. Unset behaves like level 3 on every
+/// currently supported Windows, so it is reported as such rather than as 0.
+fn lm_level() -> String {
+    match read_dword(LSA_ROOT, "LmCompatibilityLevel") {
+        Some(v @ 0..=5) => v.to_string(),
+        Some(v) => format!("{v}?"),
+        None => "unset".to_string(),
+    }
+}
+
+/// BlockNtlmv1SSO under Lsa\MSV1_0: 0 = audit (default), 1 = enforce/block.
+fn block_v1sso() -> String {
+    match read_dword(LSA, "BlockNtlmv1SSO") {
+        Some(0) => "audit".to_string(),
+        Some(1) => "enforce".to_string(),
+        Some(v) => format!("{v}?"),
+        None => "unset".to_string(),
+    }
+}
+
+/// Credential Guard, read from the registry: the DeviceGuard scenario key wins,
+/// LsaCfgFlags is the older equivalent (1 = with UEFI lock, 2 = without).
+/// Returns "unknown" when neither is present - modern Windows can enable it by
+/// default without either value being set, so absence is not proof of absence.
+fn cred_guard() -> String {
+    if let Some(v) = read_dword(DEVGUARD_CG, "Enabled") {
+        return if v >= 1 { "on" } else { "off" }.to_string();
+    }
+    match read_dword(LSA_ROOT, "LsaCfgFlags") {
+        Some(0) => "off".to_string(),
+        Some(1) | Some(2) => "on".to_string(),
+        Some(_) => "unknown".to_string(),
+        None => "unknown".to_string(),
+    }
 }
 
 fn domain_audit() -> String {
