@@ -127,13 +127,46 @@ Watermarks are tracked per source and purpose, so only new events are transferre
 
 ## Screenshots
 
-![NTLM-Analyzer dashboard](screenshots/dashboard_1.PNG)
+### Overview: metrics, trend, and the programs to fix
 
-*The dashboard: key metrics, the NTLM-over-time trend, and who still authenticates over NTLM.*
+The top of the dashboard. Global filters (time range, machine, hide-done) sit
+above a sticky section bar whose counters show at a glance where findings exist —
+greyed-out chips mean "checked, nothing there". The metric cards separate
+**insecure** (NTLMv1) from **outdated** (NTLMv2), and the *Programs still using
+NTLM* list is the actual shutdown-blocker worklist. Note the red
+**target is an IP** badge: Kerberos needs a name with an SPN, so an IP target
+can never be anything but NTLM.
 
-![Machines & auditing status](screenshots/dashboard_2.PNG)
+![Overview with metrics, trend and the outgoing programs list](screenshots/dashboard_1.png)
 
-*Agent health: which machines report in, their heartbeat, and whether the required auditing is enabled on each.*
+### Both directions: who goes out, which services accept
+
+*Who uses NTLM – and where to* comes from the domain controller and is the most
+reliable overall view, even when no program name can be determined.
+*Services accepting NTLM* is the opposite direction — the local service that
+**accepts** incoming NTLM. That section only appears once the
+*Audit Incoming NTLM Traffic* policy is active.
+
+![Domain-wide NTLM usage and the services accepting incoming NTLM](screenshots/dashboard_2.png)
+
+### The safe side, and machine readiness
+
+What already runs over Kerberos, shown for contrast rather than as a to-do.
+Below it, the machine list: heartbeat, which auditing is enabled, each machine's
+**NTLM level** (`LmCompatibilityLevel`; 5 = NTLMv2 only) and the **Oct 2026**
+column — machines with Credential Guard are exempt from the `BlockNtlmv1SSO`
+default flip. The yellow line above the table warns while fewer than 14 days of
+data exist, because an empty findings list means little that early.
+
+![Kerberos services and accounts, plus the machine and auditing status](screenshots/dashboard_3.png)
+
+### Event list with per-event detail
+
+Every collected event, filterable by kind, NTLM version, account type (people vs.
+computers) and free-text search, exportable as CSV. Expanding a row shows the raw
+field values as Windows reported them.
+
+![Recent events with an expanded event detail view](screenshots/dashboard_4.png)
 
 ---
 

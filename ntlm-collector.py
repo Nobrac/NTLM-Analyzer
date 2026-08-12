@@ -110,6 +110,24 @@ CREATE TABLE IF NOT EXISTS agents (
 );
 """
 
+def normalize_process(p):
+    """Vereinheitlicht Prozessnamen fuers Gruppieren: verschiedene Event-Quellen
+    liefern denselben Prozess mal mit, mal ohne Endung ("lsass" aus 8001,
+    "lsass.exe" aus 4020) - das ergab doppelte Zeilen in der Programmliste.
+    Konservativ: Klammer-Labels ("(Kernel: SMB/HTTP.sys)", "(PID 4)"), Werte
+    mit Punkt (haben schon eine Endung) und Platzhalter bleiben unangetastet."""
+    if not p:
+        return p
+    v = p.strip()
+    if not v or v == "-" or v.startswith("(") or "." in v:
+        return p
+    # Pseudo-Namen sind Konten, keine Programme ("SYSTEM" aus 8002-Loopback);
+    # echte Prozessnamen ohne Endung enthalten auch nie Leerzeichen.
+    if " " in v or v.lower() in ("system", "anonymous logon"):
+        return p
+    return v + ".exe"
+
+
 FIELDS = ("record_id", "log", "event_id", "kind", "event_time", "user",
           "domain", "ntlm_version", "process", "target_server",
           "workstation", "ip", "logon_type", "enc_type", "auth_method",
@@ -126,6 +144,17 @@ def init_db(path):
     for col in ("lm_level", "block_v1sso", "cred_guard"):
         if have_a and col not in have_a:
             conn.execute(f"ALTER TABLE agents ADD COLUMN {col} TEXT")
+    # Bestandsdaten: Prozessnamen ohne Endung angleichen (einmalig wirksam,
+    # danach findet das WHERE nichts mehr). Dieselben Regeln wie beim Ingest.
+    conn.execute(
+        "UPDATE events SET process = process || '.exe' "
+        "WHERE process IS NOT NULL AND TRIM(process) != '' AND process != '-' "
+        "AND process NOT LIKE '(%' AND process NOT LIKE '%.%' "
+        "AND process NOT LIKE '% %' AND LOWER(process) != 'system'")
+    # Rueckbau: eine fruehere Version dieser Migration hat den Pseudo-Namen
+    # SYSTEM faelschlich zu SYSTEM.exe gemacht - es gibt keinen solchen Prozess.
+    conn.execute("UPDATE events SET process = substr(process, 1, length(process)-4) "
+                 "WHERE LOWER(process) = 'system.exe'")
     for col in ("enc_type", "auth_method", "reason"):
         if col not in have:
             conn.execute(f"ALTER TABLE events ADD COLUMN {col} TEXT")
@@ -400,7 +429,7 @@ class Handler(BaseHTTPRequestHandler):
                 e.get("user"),
                 e.get("domain"),
                 e.get("ntlm_version"),
-                e.get("process"),
+                normalize_process(e.get("process")),
                 e.get("target_server"),
                 e.get("workstation"),
                 e.get("ip"),
@@ -762,7 +791,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .num-cell{text-align:right;font-family:var(--mono);font-variant-numeric:tabular-nums;color:var(--ink)}
   .empty{padding:30px 18px;text-align:center;color:var(--faint);font-size:13px}
 
-  .badge.b-inline{margin-left:12px;padding:3px 11px;gap:7px;vertical-align:middle}
+  .tgtwrap{display:inline-flex;align-items:center;gap:10px;white-space:nowrap}
+  .badge.b-inline{padding:3px 11px;gap:7px}
   .badge{display:inline-flex;align-items:center;gap:6px;padding:3px 9px;border-radius:6px;
     font-size:11.5px;font-weight:500;font-family:var(--mono);letter-spacing:.01em;
     white-space:nowrap;border:1px solid transparent;line-height:1.45}
@@ -1566,14 +1596,20 @@ async function load(){
   // A target given as an IP address is the single most common reason Kerberos
   // is skipped: it needs a name to look up an SPN. Works on any Windows
   // version - unlike the reason field, which only the 40xx events provide.
+  // Target + badge share a flex wrapper: side by side on one line, and when
+  // the cell is too narrow the badge wraps cleanly left-aligned underneath
+  // instead of dangling indented.
   const ipBadge = tgt => targetIsIp(tgt)
     ? '<span class="badge b-bad b-inline" title="'+esc(t('tt_ip'))+'"><span class="d"></span>'+t('b_ip')+'</span>'
     : '';
+  const tgtCell = tgt => targetIsIp(tgt)
+    ? '<span class="tgtwrap"><span>'+esc(tgt)+'</span>'+ipBadge(tgt)+'</span>'
+    : esc(tgt);
 
   $('#blockers').innerHTML = (d.blockers&&d.blockers.length)
     ? d.blockers.map(b=>`<tr class="${b.st==='erledigt'?'row-done':''}">
         <td class="strong">${esc(b.process)}${hintBtn(b.key)}</td>
-        <td>${esc(b.target)}${ipBadge(b.target)}</td>
+        <td>${tgtCell(b.target)}</td>
         <td class="num-cell">${b.n}</td>
         <td>${userList(b.who)}</td>
         <td class="soft">${b.sources}</td>
@@ -1584,7 +1620,7 @@ async function load(){
   $('#domain').innerHTML = (d.domain&&d.domain.length)
     ? d.domain.map(x=>`<tr class="${x.st==='erledigt'?'row-done':''}">
         <td class="strong">${esc(x.workstation)}${hintBtn(x.key)}</td>
-        <td>${esc(x.target)}${ipBadge(x.target)}</td>
+        <td>${tgtCell(x.target)}</td>
         <td>${userList(x.who)}</td>
         <td class="num-cell">${x.n}</td>
         <td>${stSel(x.key,x.st)}${againBadge(x)}</td>
