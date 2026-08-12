@@ -40,6 +40,7 @@ The collector is a single Python file with no external dependencies; the agent i
 - [Quick start](#quick-start)
 - [CLI reference](#cli-reference)
 - [Troubleshooting](#troubleshooting)
+- [Before you switch NTLM off](#before-you-switch-ntlm-off)
 - [Limitations & notes](#limitations--notes)
 - [Repository layout](#repository-layout)
 
@@ -76,7 +77,10 @@ One agent runs per machine — on domain controllers and member machines alike.
 | Event | Where | What it contributes |
 | --- | --- | --- |
 | **4624** | DCs (Security log) | NTLM logons with **v1/v2 distinction** via `LmPackageName` — which also catches **Negotiate→NTLM fallbacks** that a filter on `AuthenticationPackageName='NTLM'` would miss. Each event carries `auth_method = Direct \| Fallback`. |
-| **8001** | all machines | **Outgoing** NTLM including the originating process — the "shutdown blocker" list. Kernel-redirector SMB access is labeled `(SMB/Kernel)`. |
+| **8001** | all machines | **Outgoing** NTLM including the originating process — the "shutdown blocker" list. Requests handled in kernel mode (PID 4) are labeled `(Kernel: SMB/HTTP.sys)` — that covers file shares as well as WinRM, ADWS, SSRS and the Remote Desktop Gateway, none of which can be attributed to a single process. |
+| **8002** | all machines *(optional)* | **Incoming** NTLM that needs *no* domain controller to validate it — local accounts and loopback authentication. Carries the **calling process**, so it names the local service involved. |
+| **8003** | member servers *(optional)* | **Incoming** NTLM with a **domain account** (validated by a DC): remote account, client machine, logon type and the **process that was accessed** (e.g. `w3wp.exe`). Together with 8002 this answers "which service accepts NTLM". |
+| **8005/8006** | DCs | Two blind spots most setups miss: **8005** is NTLM straight *to the domain controller* (e.g. a type 3 logon to the DC), **8006** a request from a **trusted domain**. Same field layout as 8004; under enforcement they become 4005/4006. |
 | **8004** | DCs | NTLM authentication inside the domain (source → target → user). |
 | **4769** | DCs *(optional)* | Kerberos service tickets — the "safe side": services and accounts already on Kerberos, including encryption (AES green, RC4 amber). |
 | **4020/4021** | Win11 24H2 / Server 2025 | **Enhanced client auditing** (KB5064479): outgoing NTLM with process, **NTLM version and the reason** Kerberos was not used (e.g. "target name contains an IP address"). Odd IDs flag a downgrade. |
@@ -96,6 +100,9 @@ Watermarks are tracked per source and purpose, so only new events are transferre
 - **Time-range filter** (24 h / 7 days / 30 days / all), applied server-side to every metric, table and the event list.
 - **Trend chart**: NTLM activity per day (per hour in the 24 h view), stacked by v1 / v2 / unversioned — the curve that has to reach zero.
 - **Work lists with status**: blocker and domain entries can be set to *open / in progress / done* (persisted). If a "done" entry produces new events, a red **"active again"** badge appears automatically.
+- **October 2026 readiness**: the machine list flags which machines the `BlockNtlmv1SSO` switch will actually hit. Machines with **Credential Guard** enabled are exempt (it already prevents NTLMv1 cryptography), and machines already set to enforce have nothing left to come.
+- **NTLM level per machine**: the machine list shows each machine's `LmCompatibilityLevel` — which NTLM versions it still *permits*, independent of what it actually used. Level 5 (NTLMv2 only) is the target state before any blocking.
+- **Data-basis indicator**: shows how many days of events exist and warns while that is below the recommended two weeks — an empty findings list after two days means little.
 - **NTLMv1 SSO deadline panel**: appears automatically (with a red *Deadline* badge) as soon as 4024/4025 events show up — listing who still uses NTLMv1-derived credentials that will stop working in October 2026, with the same open/in-progress/done workflow.
 - **Reason display**: for enhanced events, the expandable event detail shows *why* NTLM was used (e.g. "target name contains an IP address") and failed-logon status messages.
 - **What-to-do hints** per finding: the IP-instead-of-hostname classic for SMB, SPN checks (`setspn`), the fallback checklist (SPN / DNS / clock skew), switching RC4 tickets to AES (`msDS-SupportedEncryptionTypes`).
@@ -146,7 +153,7 @@ The agent only reads events that Windows actually writes. Enable the following v
 | Setting | Value | Produces |
 | --- | --- | --- |
 | Network security: Restrict NTLM: **Outgoing NTLM traffic to remote servers** | `Audit all` | **Event 8001** — outgoing NTLM including the originating process |
-| Network security: Restrict NTLM: **Audit Incoming NTLM Traffic** *(optional)* | `Enable auditing for all accounts` | No collected events; turns the dashboard's incoming-audit badge green |
+| Network security: Restrict NTLM: **Audit Incoming NTLM Traffic** | `Enable auditing for domain accounts` | **Events 8002/8003** — which local service accepts NTLM, and which accounts come in. This is the only way to see the *receiving* process. `Enable auditing for all accounts` also works but adds a lot of loopback noise (the system authenticating to itself, typically RPC endpoint mapper). |
 
 > [!WARNING]
 > Choose **`Audit all`**, not `Deny all` — auditing only logs, it blocks nothing.
@@ -284,12 +291,59 @@ Expected: only event 4624 carries `LmPackageName`, i.e. the NTLMv1/v2 informatio
 
 ---
 
+## Before you switch NTLM off
+
+The dashboard tells you *what still uses NTLM*. These points are what teams
+typically get wrong when they act on that data:
+
+**Audit for at least two weeks of normal operation.** Weekly scheduled tasks,
+month-end batch jobs and rarely used applications only show up over time. The
+dashboard shows the current data basis above the machine list and warns while it
+is below 14 days.
+
+**Raise `LmCompatibilityLevel` to 5 first.** This is a separate question from
+"who uses NTLM": a machine can go months without a single NTLMv1 event and still
+*permit* it. The **NTLM level** column in the machine list shows the value per
+machine; level 5 means NTLMv2 only and is the target state everywhere before any
+blocking begins.
+
+**The October 2026 change does not hit everyone.** Microsoft flips `BlockNtlmv1SSO`
+(under `HKLM\SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0`) from audit to
+enforce, which breaks NTLMv1-derived logons. But the change only applies where
+**Credential Guard is disabled** — with it enabled, NTLMv1 cryptography is
+already prevented. The *Oct 2026* column in the machine list shows the state per
+machine. Note that it is read from the registry: modern Windows can enable
+Credential Guard by default without setting a value, so "unclear" means verify
+on the machine rather than assume the worst.
+
+**Mind the blind spot: MS-CHAPv2.** Solutions using CHAPv2 — RADIUS, 802.1X,
+NPS — do not perform classic NTLM authentication and therefore appear in **no**
+NTLM audit event. They still break once the domain controller blocks NTLM: the
+request is rejected with `0xc0000418` and event **4004** is logged on the DC.
+In other words, your Wi-Fi or network access control can die while this
+dashboard looks perfectly green. If MS-CHAPv2 is still in use, plan the move to
+something like EAP-TLS before restricting NTLM.
+
+**Order of the rollout:** clients and member servers first, domain controllers
+**last** — DCs handle pass-through authentication for the whole domain, so a
+mistake there is a domain-wide outage. Make sure you have console access (iLO,
+iDRAC, vSphere) to at least one DC before enforcing anything: if the change locks
+out RDP, that console is your way back.
+
+**Useful intermediate steps** instead of an all-or-nothing switch:
+`Network security: Restrict NTLM: Add remote server exceptions for NTLM
+authentication` keeps individual servers reachable while the rest is denied, and
+on Windows Server 2025 `Disable-SmbClientNtlmAuth` blocks outbound NTLM for SMB
+only — a targeted lever that leaves other protocols untouched.
+
 ## Limitations & notes
 
 - **Not retroactive:** collection starts when auditing is enabled; the first run looks back `--days-back` days (default 1).
 - The fields of events 8001/8004 are parsed **positionally** (Microsoft ships them unnamed); the order was verified against current Windows Server builds and could differ on exotic ones.
 - Timestamps: the agent records events in UTC, while the collector's time-range filter uses the server's local time — at the edges of a time window this can shift results by the timezone offset (irrelevant for daily/weekly analysis).
 - The dashboard is an analysis aid — the actual NTLM shutdown (deny policies, exception lists) is deliberately **not** performed by this tool.
+- Legacy NAS appliances (Synology, TrueNAS and similar) are a classic NTLMv1 holdout — a firmware update or an NTLMv2 setting is often needed before they survive any NTLM hardening.
+- **MS-CHAPv2 (RADIUS/802.1X/NPS) is invisible here** — it produces no NTLM audit events but still breaks when a DC blocks NTLM. See *Before you switch NTLM off*.
 - SQLite is more than sufficient here; for very large environments set `--retention-days`.
 
 ## Repository layout

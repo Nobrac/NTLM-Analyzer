@@ -103,6 +103,9 @@ CREATE TABLE IF NOT EXISTS agents (
     outgoing_audit  TEXT,          -- aus/audit/deny/unbekannt
     incoming_audit  TEXT,
     domain_audit    TEXT,          -- nur DC
+    lm_level        TEXT,          -- LmCompatibilityLevel: welche NTLM-Versionen erlaubt sind
+    block_v1sso     TEXT,          -- BlockNtlmv1SSO: audit/enforce/unset
+    cred_guard      TEXT,          -- Credential Guard: on/off/unknown (aus der Registry)
     last_seen       TEXT
 );
 """
@@ -118,6 +121,11 @@ def init_db(path):
     conn.executescript(SCHEMA)
     # Migration: fehlende Spalten in bestehenden DBs nachziehen
     have = {r[1] for r in conn.execute("PRAGMA table_info(events)").fetchall()}
+    # agents-Tabelle nachziehen (aeltere Installationen kennen lm_level nicht)
+    have_a = {r[1] for r in conn.execute("PRAGMA table_info(agents)")}
+    for col in ("lm_level", "block_v1sso", "cred_guard"):
+        if have_a and col not in have_a:
+            conn.execute(f"ALTER TABLE agents ADD COLUMN {col} TEXT")
     for col in ("enc_type", "auth_method", "reason"):
         if col not in have:
             conn.execute(f"ALTER TABLE events ADD COLUMN {col} TEXT")
@@ -363,14 +371,17 @@ class Handler(BaseHTTPRequestHandler):
         with DB_LOCK:
             self.server.conn.execute(
                 "INSERT INTO agents (source,is_dc,agent_version,outgoing_audit,"
-                "incoming_audit,domain_audit,last_seen) VALUES (?,?,?,?,?,?,?) "
+                "incoming_audit,domain_audit,lm_level,block_v1sso,cred_guard,last_seen) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(source) DO UPDATE SET is_dc=excluded.is_dc, "
                 "agent_version=excluded.agent_version, outgoing_audit=excluded.outgoing_audit, "
                 "incoming_audit=excluded.incoming_audit, domain_audit=excluded.domain_audit, "
-                "last_seen=excluded.last_seen",
+                "lm_level=excluded.lm_level, block_v1sso=excluded.block_v1sso, "
+                "cred_guard=excluded.cred_guard, last_seen=excluded.last_seen",
                 (source, 1 if p.get("is_dc") else 0, p.get("agent_version"),
                  p.get("outgoing_audit"), p.get("incoming_audit"),
-                 p.get("domain_audit"), now))
+                 p.get("domain_audit"), p.get("lm_level"), p.get("block_v1sso"),
+                 p.get("cred_guard"), now))
             self.server.conn.commit()
         return True
 
@@ -434,6 +445,15 @@ class Handler(BaseHTTPRequestHandler):
             where.append("ntlm_version = ?"); params.append(one("version"))
         if one("source"):
             where.append("source = ?"); params.append(one("source"))
+        # Account type: machine accounts end with '$' (DOM\PC01$, PC01$@DOM.TLD)
+        # and dominate the Kerberos view; 'user' hides them, 'machine' shows only
+        # them. NULL users count as neither.
+        acct = one("acct")
+        if acct == "machine":
+            where.append("(user LIKE '%$' OR user LIKE '%$@%')")
+        elif acct == "user":
+            where.append("(user IS NOT NULL AND user <> '' "
+                         "AND user NOT LIKE '%$' AND user NOT LIKE '%$@%')")
         q = one("q")
         if q:
             like = f"%{q}%"
@@ -481,8 +501,17 @@ class Handler(BaseHTTPRequestHandler):
     def _query_data(self, qs):
         one, rng, cutoff, where, params = self._event_filters(qs)
         limit = min(int(one("limit", "300") or 300), 2000)
-        tf = "event_time >= ?" if cutoff else "1=1"    # fester String, kein User-Input
-        tp = [cutoff] if cutoff else []
+        # tf/tp sind der gemeinsame Filter ALLER Aggregate. Neben dem Zeitraum
+        # wirkt hier auch die Maschinenauswahl - dadurch filtert sie global und
+        # nicht nur die Ereignisliste. Die Klausel bleibt ein fester String,
+        # Benutzereingaben gehen ausschliesslich als Parameter hinein.
+        tf_parts, tp = [], []
+        if cutoff:
+            tf_parts.append("event_time >= ?"); tp.append(cutoff)
+        src = one("source")
+        if src:
+            tf_parts.append("source = ?"); tp.append(src)
+        tf = " AND ".join(tf_parts) if tf_parts else "1=1"
         clause = (" WHERE " + " AND ".join(where)) if where else ""
 
         with DB_LOCK:
@@ -508,6 +537,7 @@ class Handler(BaseHTTPRequestHandler):
                 # Enhanced audits (Server 2025): NTLMv1-derived SSO credentials.
                 # From October 2026 Windows blocks these by itself (BlockNtlmv1SSO).
                 "v1sso": c.execute(f"SELECT COUNT(*) FROM events WHERE kind='ntlmv1sso' AND {tf}", tp).fetchone()[0],
+                "inbound": c.execute(f"SELECT COUNT(*) FROM events WHERE kind='incoming' AND {tf}", tp).fetchone()[0],
                 "downgrade": c.execute(f"SELECT COUNT(*) FROM events WHERE auth_method='Downgrade' AND {tf}", tp).fetchone()[0],
             }
             # Trend: NTLM events per time bucket (24h -> hourly, otherwise daily).
@@ -539,6 +569,16 @@ class Handler(BaseHTTPRequestHandler):
                 f"GROUP_CONCAT(DISTINCT user) "
                 f"FROM events WHERE event_id IN (8001,4020,4021) AND {tf} "
                 f"GROUP BY process, target_server ORDER BY COUNT(*) DESC LIMIT 50", tp).fetchall()]
+            # Incoming NTLM (8002/8003): which local service accepts NTLM, and
+            # which remote accounts come in. 8002 carries the calling process,
+            # 8003 the remote account - grouped per machine + process.
+            incoming = [with_status("inc", r[0], r[1],
+                          dict(machine=r[0], process=r[1], n=r[2], users=r[3],
+                               sources=r[4], last_seen=r[5])) for r in c.execute(
+                f"SELECT source, COALESCE(process,'(unknown)'), COUNT(*), "
+                f"COUNT(DISTINCT user), COUNT(DISTINCT workstation), MAX(event_time) "
+                f"FROM events WHERE kind='incoming' AND {tf} "
+                f"GROUP BY source, process ORDER BY COUNT(*) DESC LIMIT 50", tp).fetchall()]
             # NTLMv1 SSO (4024/4025): its own blocker with a hard October 2026 deadline
             v1sso = [with_status("v1sso", r[0], r[1],
                           dict(user=r[0], target=r[1], n=r[2], sources=r[3],
@@ -554,7 +594,7 @@ class Handler(BaseHTTPRequestHandler):
                            n=r[3], last_seen=r[4], who=r[5])) for r in c.execute(
                 f"SELECT COALESCE(workstation,'(unbekannt)'), COALESCE(target_server,'(unbekannt)'), "
                 f"COUNT(DISTINCT user), COUNT(*), MAX(event_time), GROUP_CONCAT(DISTINCT user) "
-                f"FROM events WHERE event_id IN (8004,4022,4023,4030,4031,4032,4033) AND {tf} "
+                f"FROM events WHERE event_id IN (8004,8005,8006,4022,4023,4030,4031,4032,4033) AND {tf} "
                 f"GROUP BY workstation, target_server ORDER BY COUNT(*) DESC LIMIT 50", tp).fetchall()]
             # Kerberos (informational): which services/SPNs already use Kerberos
             kerberos = [dict(service=r[0], accounts=r[1], n=r[2],
@@ -577,12 +617,31 @@ class Handler(BaseHTTPRequestHandler):
             # (deliberately WITHOUT the time filter: shows the agents' current state)
             agents = [dict(source=r[0], is_dc=bool(r[1]), agent_version=r[2],
                            outgoing_audit=r[3], incoming_audit=r[4], domain_audit=r[5],
-                           last_seen=r[6], events=r[7] or 0, last_event=r[8]) for r in c.execute(
+                           last_seen=r[6], events=r[7] or 0, last_event=r[8],
+                           lm_level=r[9], first_event=r[10],
+                           block_v1sso=r[11], cred_guard=r[12]) for r in c.execute(
                 "SELECT a.source, a.is_dc, a.agent_version, a.outgoing_audit, a.incoming_audit, "
                 "a.domain_audit, a.last_seen, "
                 "(SELECT COUNT(*) FROM events e WHERE e.source=a.source), "
-                "(SELECT MAX(event_time) FROM events e WHERE e.source=a.source) "
+                "(SELECT MAX(event_time) FROM events e WHERE e.source=a.source), "
+                "a.lm_level, "
+                "(SELECT MIN(event_time) FROM events e WHERE e.source=a.source), "
+                "a.block_v1sso, a.cred_guard "
                 "FROM agents a ORDER BY a.last_seen DESC").fetchall()]
+
+            # Datenbasis: seit wann liegen ueberhaupt Events vor? Zwei Wochen im
+            # Normalbetrieb gelten als Minimum, damit auch woechentliche
+            # Aufgaben und Batch-Jobs einmal gelaufen sind.
+            first_all = c.execute("SELECT MIN(event_time) FROM events").fetchone()[0]
+            coverage_days = None
+            if first_all:
+                try:
+                    d0 = datetime.strptime(first_all[:19], "%Y-%m-%dT%H:%M:%S")
+                    coverage_days = max(0, (datetime.now() - d0).days)
+                except ValueError:
+                    coverage_days = None
+            stats["coverage_days"] = coverage_days
+            stats["coverage_target"] = 14
             cols2 = ["source"] + list(FIELDS)
             rows = c.execute(
                 f"SELECT {','.join(cols2)} FROM events{clause} "
@@ -590,7 +649,7 @@ class Handler(BaseHTTPRequestHandler):
                 params + [limit]).fetchall()
             events = [dict(zip(cols2, r)) for r in rows]
 
-        return {"stats": stats, "v1sso": v1sso, "trend": trend, "trend_bucket": ("hour" if rng == "24h" else "day"),
+        return {"stats": stats, "v1sso": v1sso, "incoming": incoming, "trend": trend, "trend_bucket": ("hour" if rng == "24h" else "day"),
                 "top_proc": top_proc, "v1_users": v1_users,
                 "blockers": blockers, "domain": domain, "kerberos": kerberos,
                 "kerberos_accounts": kerberos_accounts,
@@ -703,6 +762,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .num-cell{text-align:right;font-family:var(--mono);font-variant-numeric:tabular-nums;color:var(--ink)}
   .empty{padding:30px 18px;text-align:center;color:var(--faint);font-size:13px}
 
+  .badge.b-inline{margin-left:12px;padding:3px 11px;gap:7px;vertical-align:middle}
   .badge{display:inline-flex;align-items:center;gap:6px;padding:3px 9px;border-radius:6px;
     font-size:11.5px;font-weight:500;font-family:var(--mono);letter-spacing:.01em;
     white-space:nowrap;border:1px solid transparent;line-height:1.45}
@@ -721,7 +781,38 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .fill.bad{background:linear-gradient(90deg,#b94a45,var(--bad))}
   .fill.good{background:linear-gradient(90deg,#3f9d72,var(--good))}
 
-  .filters{display:flex;flex-wrap:wrap;gap:8px;padding:14px 20px;
+  .secnav{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:7px;flex-wrap:wrap;
+    background:var(--panel);border:1px solid var(--line);border-radius:10px;
+    padding:9px 12px;margin:0 0 16px}
+  .navlabel{color:var(--faint);font-family:var(--mono);font-size:10px;letter-spacing:.06em;
+    text-transform:uppercase;margin-right:4px}
+  .navchip{display:inline-flex;align-items:center;gap:7px;padding:4px 11px;border-radius:6px;
+    font-family:var(--mono);font-size:11.5px;color:var(--soft);border:1px solid var(--line-2);
+    cursor:pointer;white-space:nowrap;transition:border-color .12s,color .12s}
+  .navchip:hover{border-color:var(--accent);color:var(--ink)}
+  .navchip .n{background:var(--line);border-radius:9px;padding:0 6px;font-size:10.5px}
+  .navchip.t-bad{color:var(--bad);border-color:var(--bad-bd)}
+  .navchip.t-bad .n{background:var(--bad-bg)}
+  .navchip.t-warn{color:var(--old);border-color:var(--old-bd)}
+  .navchip.t-warn .n{background:var(--old-bg)}
+  .navchip.t-good{color:var(--good);border-color:var(--good-bd)}
+  .navchip.t-good .n{background:var(--good-bg)}
+  .navchip.empty{color:var(--faint);border:1px dashed var(--line);cursor:default}
+  .navchip.empty:hover{border-color:var(--line);color:var(--faint)}
+  .navchip.empty .n{background:none;padding:0}
+  .navchip.active{background:var(--accent-dim);border-color:var(--accent);color:var(--ink)}
+  body.hide-done tr.row-done{display:none}
+  .gsep{display:inline-block;width:1px;height:18px;background:var(--line-2);margin:0 10px;vertical-align:middle}
+  .gsel{background:var(--panel);color:var(--ink);border:1px solid var(--line-2);border-radius:6px;
+    padding:4px 8px;font-family:var(--mono);font-size:11.5px;max-width:230px}
+  .gtoggle{display:inline-flex;align-items:center;gap:6px;margin-left:14px;color:var(--soft);
+    font-size:11.5px;font-family:var(--mono);cursor:pointer;user-select:none}
+  .gtoggle input{accent-color:var(--accent);cursor:pointer}
+  .coverage{margin-top:8px !important;font-family:var(--mono);font-size:11.5px}
+  .coverage .warn{color:var(--old)}
+  .coverage .ok{color:var(--good)}
+  .fsep{width:1px;height:20px;background:var(--line-2);margin:0 4px;display:inline-block;vertical-align:middle}
+.filters{display:flex;flex-wrap:wrap;gap:8px;padding:14px 20px;
     border-bottom:1px solid var(--line);align-items:center}
   #q{flex:1;min-width:220px;background:var(--bg);border:1px solid var(--line-2);
     border-radius:8px;color:var(--ink);padding:9px 12px;font-family:var(--sans);
@@ -811,7 +902,23 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <span class="rchip on" data-r="7d" data-i18n="r7d">7 days</span>
     <span class="rchip" data-r="30d" data-i18n="r30d">30 days</span>
     <span class="rchip" data-r="all" data-i18n="rall">All</span>
+    <span class="gsep"></span>
+    <span class="rlabel" data-i18n="g_machine">Machine</span>
+    <select id="srcsel" class="gsel"><option value="" data-i18n="g_all_mach">All machines</option></select>
+    <label class="gtoggle"><input type="checkbox" id="hidedone"><span data-i18n="g_hidedone">Hide done</span></label>
   </div>
+
+  <nav class="secnav" id="secnav">
+    <span class="navlabel" data-i18n="nav_label">Sections</span>
+    <span class="navchip" data-sec="sec-programs"   data-tone="warn" data-i18n="nav_prog">Programs</span>
+    <span class="navchip" data-sec="sec-incoming"   data-tone="neut" data-i18n="nav_inc">Services</span>
+    <span class="navchip" data-sec="sec-v1sso"      data-tone="bad"  data-i18n="nav_v1sso">NTLMv1 SSO</span>
+    <span class="navchip" data-sec="sec-v1"         data-tone="bad"  data-i18n="nav_v1">NTLMv1</span>
+    <span class="navchip" data-sec="sec-domain"     data-tone="neut" data-i18n="nav_dom">Domain</span>
+    <span class="navchip" data-sec="sec-kerberos-accounts" data-tone="good" data-i18n="nav_krb">Kerberos</span>
+    <span class="navchip" data-sec="sec-agents"     data-tone="neut" data-i18n="nav_mach">Machines</span>
+    <span class="navchip" data-sec="sec-events"     data-tone="neut" data-i18n="nav_ev">Events</span>
+  </nav>
 
   <div class="stats">
     <div class="stat clickable" tabindex="0" data-filter="all" data-scroll="#sec-events"
@@ -855,7 +962,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <section id="sec-programs">
     <div class="head">
       <h2><span class="badge b-bad"><span class="d"></span></span> <span data-i18n="prog_h">Programs still using NTLM</span></h2>
-      <p data-i18n="prog_p">These programs authenticate outward via NTLM. Before disabling NTLM they should be reviewed or reconfigured. "SMB/Kernel" means file-share access – no single program can be named there.</p>
+      <p data-i18n="prog_p">These programs authenticate outward via NTLM. Before disabling NTLM they should be reviewed or reconfigured. "Kernel: SMB/HTTP.sys" means the request came from kernel mode (PID 4) – file shares, but also WinRM, ADWS, SSRS or the Remote Desktop Gateway. No single program can be named there.</p>
     </div>
     <div class="scroll">
       <table>
@@ -875,6 +982,20 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <table>
         <thead><tr><th data-i18n="th_srccomp">Computer (source)</th><th data-i18n="th_target2">Target server</th><th data-i18n="th_users2">Users</th><th data-i18n="th_count2">Count</th><th data-i18n="th_status2">Status</th><th data-i18n="th_last2">Last seen</th></tr></thead>
         <tbody id="domain"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- Eingehender NTLM: welcher Dienst nimmt an (8002/8003) -->
+  <section id="sec-incoming" style="display:none">
+    <div class="head">
+      <h2 data-i18n="inc_h">Services accepting NTLM</h2>
+      <p data-i18n="inc_p">The other direction: which service on these machines accepts incoming NTLM. Needs the "Audit Incoming NTLM Traffic" policy — without it this section stays empty.</p>
+    </div>
+    <div class="scroll">
+      <table>
+        <thead><tr><th data-i18n="th_mach2">Machine</th><th data-i18n="th_svc">Service / process</th><th data-i18n="th_count5">Count</th><th data-i18n="th_users5">Accounts</th><th data-i18n="th_status5">Status</th><th data-i18n="th_last6">Last seen</th></tr></thead>
+        <tbody id="incoming"></tbody>
       </table>
     </div>
   </section>
@@ -921,10 +1042,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <div class="head">
       <h2 data-i18n="ag_h">Machines & auditing status</h2>
       <p data-i18n="ag_p">Which agents report – and whether the required auditing is enabled there. A green dot means "reported recently". Red auditing badges explain why a machine may not deliver data.</p>
+      <p id="coverage" class="coverage"></p>
     </div>
     <div class="scroll">
       <table>
-        <thead><tr><th data-i18n="th_machine">Machine</th><th data-i18n="th_type">Type</th><th data-i18n="th_status3">Status</th><th>Auditing</th><th>Events</th><th data-i18n="th_lastrep">Last reported</th></tr></thead>
+        <thead><tr><th data-i18n="th_machine">Machine</th><th data-i18n="th_type">Type</th><th data-i18n="th_status3">Status</th><th>Auditing</th><th data-i18n="th_lm">NTLM level</th><th data-i18n="th_oct">Oct 2026</th><th>Events</th><th data-i18n="th_lastrep">Last reported</th></tr></thead>
         <tbody id="agents"></tbody>
       </table>
     </div>
@@ -943,6 +1065,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <span class="chip" data-f="v2" data-i18n="f_v2">Outdated only</span>
       <span class="chip" data-f="outgoing" data-i18n="f_out">Programs</span>
       <span class="chip" data-f="domain" data-i18n="f_dom">Domain</span>
+      <span class="fsep"></span>
+      <span class="chip achip on" data-a="all" data-i18n="f_a_all"
+            data-i18n-title="f_a_t" title="Filters the event list and the CSV export (not the metric cards above)">All accounts</span>
+      <span class="chip achip" data-a="user" data-i18n="f_a_user">People only</span>
+      <span class="chip achip" data-a="machine" data-i18n="f_a_mach">Computers only</span>
       <span class="rchip" id="csvbtn" data-i18n="csv" data-i18n-title="csv_t" title="Download the current selection as CSV">CSV-Export</span>
     </div>
     <div class="scroll">
@@ -974,7 +1101,7 @@ de: {
   trend_h:'Verlauf',
   trend_p:'NTLM-Vorgänge im gewählten Zeitraum – diese Balken sollen über die Wochen gegen null gehen. Rot = NTLMv1, Gelb = NTLMv2, Grau = NTLM ohne Versionsangabe (Domäne/ausgehend). Kerberos steht zur Einordnung im Tooltip.',
   prog_h:'Programme, die noch NTLM verwenden',
-  prog_p:'Diese Programme melden sich per NTLM nach außen an. Vor dem Abschalten von NTLM sollten sie geprüft oder umgestellt werden. „SMB/Kernel" bedeutet Dateifreigabe-Zugriff – dort lässt sich kein einzelnes Programm benennen.',
+  prog_p:'Diese Programme melden sich per NTLM nach außen an. Vor dem Abschalten von NTLM sollten sie geprüft oder umgestellt werden. „Kernel: SMB/HTTP.sys" bedeutet, die Anfrage kam aus dem Kernel-Modus (PID 4) – Dateifreigaben, aber auch WinRM, ADWS, SSRS oder das Remotedesktop-Gateway. Dort lässt sich kein einzelnes Programm benennen.',
   dom_h:'Wer nutzt NTLM – und wohin',
   dom_p:'Vom Domänencontroller gemeldet: welcher Computer sich per NTLM mit welchem Server verbindet. Die zuverlässigste Gesamtsicht – auch wenn kein Programmname ermittelbar ist.',
   b_insec:'unsicher', b_sec:'sicher', b_sec2:'sicher',
@@ -995,6 +1122,36 @@ de: {
   th_machine:'Maschine', th_type:'Typ', th_status3:'Status', th_lastrep:'Zuletzt gemeldet',
   th_time:'Zeit', th_kind:'Art', th_users3:'Benutzer', th_prog2:'Programm', th_tgtsrc:'Ziel / Quelle', th_comp:'Computer',
   search_ph:'Suchen: Benutzer, Programm, Server, Computer …',
+  f_a_t:'Filtert die Ereignisliste und den CSV-Export (nicht die Kennzahlen oben)',
+  lt2:'Interaktiv (lokal am Gerät)', lt3:'Netzwerk (Freigabe, RPC – hier entsteht der meiste NTLM)',
+  lt4:'Batch (geplante Aufgabe)', lt5:'Dienst (Dienststart)',
+  lt7:'Entsperren (Bildschirmsperre)', lt8:'Netzwerk-Klartext (Passwort im Klartext, z. B. Basic-Auth)',
+  lt9:'Neue Anmeldeinformationen (runas /netonly)', lt10:'Remoteinteraktiv (RDP)',
+  lt11:'Zwischengespeichert interaktiv (gespeicherte Domänenanmeldung)',
+  lt12:'Zwischengespeichert remoteinteraktiv', lt13:'Zwischengespeichertes Entsperren',
+  nav_label:'Abschnitte', nav_prog:'Programme', nav_inc:'Dienste', nav_v1sso:'NTLMv1-SSO',
+  nav_v1:'NTLMv1', nav_dom:'Domäne', nav_krb:'Kerberos', nav_mach:'Maschinen', nav_ev:'Ereignisse',
+  g_machine:'Maschine', g_all_mach:'Alle Maschinen', g_hidedone:'Erledigte ausblenden',
+  th_oct:'Okt. 2026', oct_enf:'schon enforce', oct_cg:'Credential Guard', oct_aff:'betroffen', oct_unk:'unklar',
+  tt_oct_enf:'BlockNtlmv1SSO steht bereits auf Enforce – die Umstellung im Oktober 2026 ändert hier nichts mehr.',
+  tt_oct_cg:'Credential Guard ist konfiguriert. Die Umstellung im Oktober 2026 greift auf solchen Maschinen nicht, weil Credential Guard NTLMv1-Kryptografie ohnehin verhindert.',
+  tt_oct_aff:'BlockNtlmv1SSO steht auf Audit und Credential Guard ist aus: Diese Maschine ist von der Umstellung im Oktober 2026 betroffen. NTLMv1-abgeleitete Anmeldungen brechen dann.',
+  tt_oct_unk:'Credential Guard ließ sich aus der Registry nicht sicher bestimmen. Moderne Windows-Versionen aktivieren es teils standardmäßig, ohne einen Wert zu setzen – bitte auf der Maschine prüfen.',
+  th_lm:'NTLM-Stufe', lm_ok:'nur NTLMv2', lm_bad:'NTLMv1 erlaubt', lm_mid:'sendet v2',
+  lm_unset:'nicht gesetzt',
+  tt_lm5:'LmCompatibilityLevel 5: sendet und akzeptiert ausschließlich NTLMv2. Das ist der Zielzustand vor dem Abschalten.',
+  tt_lm_low:'LmCompatibilityLevel 0–2: die Maschine akzeptiert noch LM bzw. NTLMv1. Das gehört als Erstes auf Stufe 5 gehoben.',
+  tt_lm_mid:'LmCompatibilityLevel 3–4: sendet NTLMv2, akzeptiert als Server aber noch schwächere Antworten. Ziel ist Stufe 5.',
+  tt_lm_unset:'LmCompatibilityLevel ist nicht gesetzt und verhält sich wie Stufe 3: sendet NTLMv2, akzeptiert aber noch schwächere Antworten. Ziel ist Stufe 5.',
+  cov_ok:'Datenbasis: {d} Tage – ausreichend für eine belastbare Aussage.',
+  cov_warn:'Datenbasis: erst {d} von empfohlenen {t} Tagen. Wöchentliche Aufgaben und Batch-Jobs sind womöglich noch nicht gelaufen – eine leere Fundliste sagt jetzt wenig aus.',
+  inc_h:'Dienste, die NTLM annehmen',
+  inc_p:'Die Gegenrichtung: welcher Dienst auf diesen Maschinen eingehenden NTLM annimmt. Braucht die Richtlinie „Eingehenden NTLM-Datenverkehr überwachen“ – ohne sie bleibt dieser Abschnitt leer.',
+  th_mach2:'Maschine', th_svc:'Dienst / Prozess', th_count5:'Anzahl', th_users5:'Konten',
+  th_status5:'Status', th_last6:'Zuletzt',
+  lab_in:'Eingehend', sub_in:'NTLM angenommen', tt_in:'Zu den annehmenden Diensten springen',
+  b_ip:'Ziel ist eine IP', tt_ip:'Kerberos braucht einen Namen mit SPN – über eine IP-Adresse ist es technisch nicht möglich. Auf Hostnamen umstellen.',
+  f_a_all:'Alle Konten', f_a_user:'Nur Personen', f_a_mach:'Nur Computer',
   f_all:'Alle', f_v1:'Nur unsicher', f_v2:'Nur veraltet', f_out:'Programme', f_dom:'Domäne',
   csv:'CSV-Export', csv_t:'Aktuelle Auswahl als CSV herunterladen',
   more:'weitere', b_v1:'NTLMv1 · unsicher', b_v2:'NTLMv2 · veraltet', b_krb:'Kerberos · sicher',
@@ -1047,7 +1204,7 @@ en: {
   trend_h:'Trend',
   trend_p:'NTLM activity in the selected time range – these bars should approach zero over the weeks. Red = NTLMv1, yellow = NTLMv2, gray = NTLM without version info (domain/outgoing). Kerberos is shown in the tooltip for context.',
   prog_h:'Programs still using NTLM',
-  prog_p:'These programs authenticate outward via NTLM. Before disabling NTLM they should be reviewed or reconfigured. "SMB/Kernel" means file-share access – no single program can be named there.',
+  prog_p:'These programs authenticate outward via NTLM. Before disabling NTLM they should be reviewed or reconfigured. "Kernel: SMB/HTTP.sys" means the request came from kernel mode (PID 4) – file shares, but also WinRM, ADWS, SSRS or the Remote Desktop Gateway. No single program can be named there.',
   dom_h:'Who uses NTLM – and where to',
   dom_p:'Reported by the domain controller: which computer connects to which server via NTLM. The most reliable overall view – even when no program name can be determined.',
   b_insec:'insecure', b_sec:'secure', b_sec2:'secure',
@@ -1068,6 +1225,36 @@ en: {
   th_machine:'Machine', th_type:'Type', th_status3:'Status', th_lastrep:'Last reported',
   th_time:'Time', th_kind:'Kind', th_users3:'User', th_prog2:'Program', th_tgtsrc:'Target / source', th_comp:'Computer',
   search_ph:'Search: user, program, server, computer …',
+  f_a_t:'Filters the event list and the CSV export (not the metric cards above)',
+  lt2:'Interactive (locally at the device)', lt3:'Network (file share, RPC – where most NTLM comes from)',
+  lt4:'Batch (scheduled task)', lt5:'Service (service start-up)',
+  lt7:'Unlock (screen lock)', lt8:'Network cleartext (password sent in clear, e.g. basic auth)',
+  lt9:'New credentials (runas /netonly)', lt10:'Remote interactive (RDP)',
+  lt11:'Cached interactive (stored domain logon)',
+  lt12:'Cached remote interactive', lt13:'Cached unlock',
+  nav_label:'Sections', nav_prog:'Programs', nav_inc:'Services', nav_v1sso:'NTLMv1 SSO',
+  nav_v1:'NTLMv1', nav_dom:'Domain', nav_krb:'Kerberos', nav_mach:'Machines', nav_ev:'Events',
+  g_machine:'Machine', g_all_mach:'All machines', g_hidedone:'Hide done',
+  th_oct:'Oct 2026', oct_enf:'already enforce', oct_cg:'Credential Guard', oct_aff:'affected', oct_unk:'unclear',
+  tt_oct_enf:'BlockNtlmv1SSO is already set to enforce - the October 2026 change makes no difference here.',
+  tt_oct_cg:'Credential Guard is configured. The October 2026 change does not apply to such machines, because Credential Guard already prevents NTLMv1 cryptography.',
+  tt_oct_aff:'BlockNtlmv1SSO is on audit and Credential Guard is off: this machine is affected by the October 2026 change. NTLMv1-derived logons will break then.',
+  tt_oct_unk:'Credential Guard could not be determined reliably from the registry. Modern Windows may enable it by default without setting a value - please verify on the machine.',
+  th_lm:'NTLM level', lm_ok:'NTLMv2 only', lm_bad:'NTLMv1 allowed', lm_mid:'sends v2',
+  lm_unset:'not set',
+  tt_lm5:'LmCompatibilityLevel 5: sends and accepts NTLMv2 only. This is the target state before switching NTLM off.',
+  tt_lm_low:'LmCompatibilityLevel 0-2: this machine still accepts LM or NTLMv1. Raising it to level 5 is the first thing to do.',
+  tt_lm_mid:'LmCompatibilityLevel 3-4: sends NTLMv2 but as a server still accepts weaker responses. The target is level 5.',
+  tt_lm_unset:'LmCompatibilityLevel is not set and behaves like level 3: sends NTLMv2 but still accepts weaker responses. The target is level 5.',
+  cov_ok:'Data basis: {d} days - enough for a meaningful conclusion.',
+  cov_warn:'Data basis: only {d} of the recommended {t} days. Weekly tasks and batch jobs may not have run yet - an empty findings list means little at this point.',
+  inc_h:'Services accepting NTLM',
+  inc_p:'The other direction: which service on these machines accepts incoming NTLM. Needs the "Audit Incoming NTLM Traffic" policy - without it this section stays empty.',
+  th_mach2:'Machine', th_svc:'Service / process', th_count5:'Count', th_users5:'Accounts',
+  th_status5:'Status', th_last6:'Last seen',
+  lab_in:'Incoming', sub_in:'NTLM accepted', tt_in:'Jump to the accepting services',
+  b_ip:'target is an IP', tt_ip:'Kerberos needs a name with an SPN - over an IP address it is technically impossible. Switch to host names.',
+  f_a_all:'All accounts', f_a_user:'People only', f_a_mach:'Computers only',
   f_all:'All', f_v1:'Insecure only', f_v2:'Outdated only', f_out:'Programs', f_dom:'Domain',
   csv:'CSV export', csv_t:'Download the current selection as CSV',
   more:'more', b_v1:'NTLMv1 · insecure', b_v2:'NTLMv2 · outdated', b_krb:'Kerberos · secure',
@@ -1129,10 +1316,21 @@ function setLang(l){
 document.querySelectorAll('.lchip').forEach(c => c.addEventListener('click', () => setLang(c.dataset.l)));
 
 // ---------------- Zustand & Helfer ----------------
-const state = {f:"all", q:"", r:"7d"};
+const state = {f:"all", q:"", r:"7d", a:"all", src:"", hidedone:false};
 const $ = s => document.querySelector(s);
 const esc = s => (s==null?"":String(s)).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const dash = '<span class="soft">–</span>';
+// True when the target is (or contains) a bare IP address - also inside an SPN
+// such as "TERMSRV/10.0.0.5" or "cifs/192.168.1.9".
+function targetIsIp(v){
+  if(!v) return false;
+  const part = String(v).includes('/') ? String(v).split('/').pop() : String(v);
+  const raw = part.replace(/^\\\\/,'').trim();
+  // IPv6 first - it contains colons itself, so the port split below would ruin it
+  if(/^\[?[0-9a-fA-F]*:[0-9a-fA-F:]*\]?$/.test(raw) && raw.includes('::') || /^\[[0-9a-fA-F:]+\]/.test(raw)) return true;
+  const host = raw.split(':')[0];
+  return /^\d{1,3}(\.\d{1,3}){3}$/.test(host);
+}
 const when = s => esc((s||"").replace("T"," ").slice(0,16));
 function userList(who){
   if(!who) return dash;
@@ -1151,6 +1349,36 @@ function artBadge(e){
   if(e.kind=="outgoing")       return '<span class="badge b-neut"><span class="d"></span>'+t('b_out')+'</span>';
   return '<span class="soft">NTLM</span>';
 }
+// LmCompatibilityLevel: which NTLM versions the machine still permits.
+// 5 = NTLMv2 only (target state), 0-2 still accept the ancient LM/NTLMv1
+// responses, 3/4 (and "unset", which behaves like 3) sit in between: they send
+// NTLMv2 but would still accept weaker answers as a server.
+// October 2026: Microsoft flips BlockNtlmv1SSO from audit to enforce. Machines
+// with Credential Guard enabled are exempt - it already blocks NTLMv1
+// cryptography - and machines already set to enforce have nothing left to come.
+function octCell(a){
+  const b = a.block_v1sso, cg = a.cred_guard;
+  if(b===null || b===undefined || b==='') return dash;
+  if(b==='enforce')
+    return '<span class="badge b-good" title="'+esc(t('tt_oct_enf'))+'"><span class="d"></span>'+t('oct_enf')+'</span>';
+  if(cg==='on')
+    return '<span class="badge b-good" title="'+esc(t('tt_oct_cg'))+'"><span class="d"></span>'+t('oct_cg')+'</span>';
+  if(cg==='off')
+    return '<span class="badge b-old" title="'+esc(t('tt_oct_aff'))+'"><span class="d"></span>'+t('oct_aff')+'</span>';
+  return '<span class="badge b-neut" title="'+esc(t('tt_oct_unk'))+'"><span class="d"></span>'+t('oct_unk')+'</span>';
+}
+
+function lmCell(v){
+  if(v===null || v===undefined || v==='') return dash;
+  const n = String(v);
+  if(n==='5')  return '<span class="badge b-good" title="'+esc(t('tt_lm5'))+'"><span class="d"></span>5 · '+t('lm_ok')+'</span>';
+  if(n==='0'||n==='1'||n==='2')
+    return '<span class="badge b-bad" title="'+esc(t('tt_lm_low'))+'"><span class="d"></span>'+esc(n)+' · '+t('lm_bad')+'</span>';
+  if(n==='unset')
+    return '<span class="badge b-old" title="'+esc(t('tt_lm_unset'))+'"><span class="d"></span>'+t('lm_unset')+'</span>';
+  return '<span class="badge b-old" title="'+esc(t('tt_lm_mid'))+'"><span class="d"></span>'+esc(n)+' · '+t('lm_mid')+'</span>';
+}
+
 function heartbeat(lastSeen){
   if(!lastSeen) return '<span class="soft">–</span>';
   const ageMin = (Date.now() - new Date(lastSeen).getTime())/60000;
@@ -1188,6 +1416,17 @@ const openEvents = new Set();  // expanded event rows survive the auto-refresh
 
 // Detail view of an event row in the style of the Windows Event Viewer:
 // property on the left, value on the right, everything the event carries.
+// Logon type (4624) in plain text. Numbers alone say little; these are the
+// values Windows documents for the event. 3 and 8 are the network ones that
+// matter for NTLM, 9 is the classic runas /netonly.
+function logonTypeText(v){
+  if(v===null || v===undefined || v==='') return v;
+  const n = String(v).trim();
+  const k = {'2':'lt2','3':'lt3','4':'lt4','5':'lt5','7':'lt7','8':'lt8',
+             '9':'lt9','10':'lt10','11':'lt11','12':'lt12','13':'lt13'}[n];
+  return k ? n + ' – ' + t(k) : n;
+}
+
 function evDetailRow(e, id){
   if(!openEvents.has(id)) return '';
   const rows = [
@@ -1205,7 +1444,7 @@ function evDetailRow(e, id){
     ['d_target',e.target_server],
     ['d_ws',    e.workstation],
     ['d_ip',    e.ip],
-    ['d_lt',    e.logon_type],
+    ['d_lt',    logonTypeText(e.logon_type)],
     ['d_enc',   e.enc_type],
     ['d_reason',e.reason],
   ].filter(r => r[1] !== null && r[1] !== undefined && r[1] !== '');
@@ -1267,6 +1506,8 @@ function buildParams(){
   else if(state.f=="v2") p.set('version','NTLMv2');
   else if(state.f=="outgoing"||state.f=="domain") p.set('kind',state.f);
   if(state.q) p.set('q',state.q);
+  if(state.a && state.a!="all") p.set('acct', state.a);
+  if(state.src) p.set('source', state.src);
   p.set('range', state.r || 'all');
   return p;
 }
@@ -1308,10 +1549,31 @@ async function load(){
         <td class="soft mono">${when(x.last_seen)}</td></tr>`).join('');
   }
 
+  // Incoming NTLM: only show the section when the incoming audit actually
+  // produces events, so it does not sit there empty on every installation.
+  const inc = d.incoming || [];
+  document.getElementById('sec-incoming').style.display = inc.length ? '' : 'none';
+  if (inc.length) {
+    $('#incoming').innerHTML = inc.map(x=>`<tr class="${x.st==='erledigt'?'row-done':''}">
+        <td class="strong">${esc(x.machine)}</td>
+        <td>${esc(x.process)}</td>
+        <td class="num-cell">${x.n}</td>
+        <td class="soft">${x.users}</td>
+        <td>${stSel(x.key,x.st)}${againBadge(x)}</td>
+        <td class="soft mono">${when(x.last_seen)}</td></tr>`).join('');
+  }
+
+  // A target given as an IP address is the single most common reason Kerberos
+  // is skipped: it needs a name to look up an SPN. Works on any Windows
+  // version - unlike the reason field, which only the 40xx events provide.
+  const ipBadge = tgt => targetIsIp(tgt)
+    ? '<span class="badge b-bad b-inline" title="'+esc(t('tt_ip'))+'"><span class="d"></span>'+t('b_ip')+'</span>'
+    : '';
+
   $('#blockers').innerHTML = (d.blockers&&d.blockers.length)
     ? d.blockers.map(b=>`<tr class="${b.st==='erledigt'?'row-done':''}">
         <td class="strong">${esc(b.process)}${hintBtn(b.key)}</td>
-        <td>${esc(b.target)}</td>
+        <td>${esc(b.target)}${ipBadge(b.target)}</td>
         <td class="num-cell">${b.n}</td>
         <td>${userList(b.who)}</td>
         <td class="soft">${b.sources}</td>
@@ -1322,7 +1584,7 @@ async function load(){
   $('#domain').innerHTML = (d.domain&&d.domain.length)
     ? d.domain.map(x=>`<tr class="${x.st==='erledigt'?'row-done':''}">
         <td class="strong">${esc(x.workstation)}${hintBtn(x.key)}</td>
-        <td>${esc(x.target)}</td>
+        <td>${esc(x.target)}${ipBadge(x.target)}</td>
         <td>${userList(x.who)}</td>
         <td class="num-cell">${x.n}</td>
         <td>${stSel(x.key,x.st)}${againBadge(x)}</td>
@@ -1354,15 +1616,32 @@ async function load(){
         (/RC4|DES/i.test(k.enc||'')?hintRow('krba|'+k.account,5,t('hint_rc4')):'')).join('')
     : '<tr><td colspan="5" class="empty">'+t('empty_krba')+'</td></tr>';
 
+  // Data basis: two weeks of normal operation is the widely recommended
+  // minimum, so that weekly scheduled tasks and batch jobs have run at least
+  // once. Below that, an empty finding list means little.
+  const cd = d.stats.coverage_days, ct = d.stats.coverage_target || 14;
+  const covEl = document.getElementById('coverage');
+  if (covEl) {
+    if (cd === null || cd === undefined) covEl.innerHTML = '';
+    else if (cd >= ct)
+      covEl.innerHTML = '<span class="ok">'+t('cov_ok').replace('{d}', cd)+'</span>';
+    else
+      covEl.innerHTML = '<span class="warn">'+t('cov_warn').replace('{d}', cd).replace('{t}', ct)+'</span>';
+  }
+
+  syncNav(d);
+  syncMachines(d.agents);
   $('#agents').innerHTML = (d.agents&&d.agents.length)
     ? d.agents.map(a=>`<tr>
         <td class="strong">${esc(a.source)}</td>
         <td class="soft">${a.is_dc?t('type_dc'):t('type_member')}</td>
         <td>${heartbeat(a.last_seen)}</td>
         <td>${auditCell(a)}</td>
+        <td>${lmCell(a.lm_level)}</td>
+        <td>${octCell(a)}</td>
         <td class="num-cell">${a.events}</td>
         <td class="soft mono">${when(a.last_seen)}</td></tr>`).join('')
-    : '<tr><td colspan="6" class="empty">'+t('empty_agents')+'</td></tr>';
+    : '<tr><td colspan="8" class="empty">'+t('empty_agents')+'</td></tr>';
 
   $('#rows').innerHTML = d.events.length
     ? d.events.map(e=>{
@@ -1387,9 +1666,15 @@ async function load(){
   $('#foot').textContent = t('as_of') + tm.toLocaleString(LOCALE());
 }
 
-document.querySelectorAll('.chip').forEach(c=>c.addEventListener('click',()=>{
-  document.querySelectorAll('.chip').forEach(x=>x.classList.remove('on'));
+// Two independent chip groups: kind/version (data-f) and account type (data-a).
+// Each only clears the "on" state within its own group.
+document.querySelectorAll('.chip:not(.achip)').forEach(c=>c.addEventListener('click',()=>{
+  document.querySelectorAll('.chip:not(.achip)').forEach(x=>x.classList.remove('on'));
   c.classList.add('on'); state.f=c.dataset.f; load();
+}));
+document.querySelectorAll('.achip').forEach(c=>c.addEventListener('click',()=>{
+  document.querySelectorAll('.achip').forEach(x=>x.classList.remove('on'));
+  c.classList.add('on'); state.a=c.dataset.a; load();
 }));
 
 // Toggle hints and set status: delegated so it survives the 5s refresh
@@ -1417,6 +1702,73 @@ document.getElementById('csvbtn').addEventListener('click', ()=>{
   window.location = '/api/export.csv?' + buildParams().toString();
 });
 
+// Section nav: one chip per section with its finding count. Sections with no
+// findings stay visible but greyed out - "checked, nothing there" is the good
+// news and worth showing, unlike hiding it entirely.
+const NAV_COUNTS = {
+  'sec-programs':          d => (d.blockers||[]).length,
+  'sec-incoming':          d => (d.incoming||[]).length,
+  'sec-v1sso':             d => (d.v1sso||[]).length,
+  'sec-v1':                d => (d.v1_users||[]).length,
+  'sec-domain':            d => (d.domain||[]).length,
+  'sec-kerberos-accounts': d => (d.kerberos_accounts||[]).length,
+  'sec-agents':            d => (d.agents||[]).length,
+  'sec-events':            d => (d.events||[]).length,
+};
+function syncNav(d){
+  document.querySelectorAll('.navchip').forEach(c=>{
+    const id = c.dataset.sec;
+    const fn = NAV_COUNTS[id];
+    const n = fn ? fn(d) : 0;
+    const tone = c.dataset.tone || 'neut';
+    c.classList.remove('t-bad','t-warn','t-good','empty');
+    if(n > 0 && tone !== 'neut') c.classList.add('t-'+tone);
+    if(n === 0) c.classList.add('empty');
+    let badge = c.querySelector('.n');
+    if(!badge){ badge = document.createElement('span'); badge.className = 'n'; c.appendChild(badge); }
+    badge.textContent = n;
+  });
+}
+document.querySelectorAll('.navchip').forEach(c=>c.addEventListener('click',()=>{
+  const el = document.getElementById(c.dataset.sec);
+  // Hidden sections (v1sso / incoming without findings) cannot be scrolled to
+  if(!el || el.offsetParent === null) return;
+  el.scrollIntoView({behavior:'smooth', block:'start'});
+}));
+
+// Highlight the section currently in view
+if('IntersectionObserver' in window){
+  const obs = new IntersectionObserver(entries=>{
+    entries.forEach(e=>{
+      const chip = document.querySelector('.navchip[data-sec="'+e.target.id+'"]');
+      if(chip) chip.classList.toggle('active', e.isIntersecting);
+    });
+  }, {rootMargin:'-15% 0px -70% 0px'});
+  document.querySelectorAll('section[id]').forEach(sec=>obs.observe(sec));
+}
+
+// Machine picker: filters every panel, not just the event list. The option list
+// is rebuilt from the agent list on each load, keeping the current choice.
+function syncMachines(agents){
+  const sel = document.getElementById('srcsel');
+  if(!sel) return;
+  const names = (agents||[]).map(a=>a.source).sort();
+  const sig = names.join('|');
+  if(sel.dataset.sig === sig) return;
+  sel.dataset.sig = sig;
+  const cur = state.src;
+  sel.innerHTML = '<option value="">'+t('g_all_mach')+'</option>' +
+    names.map(n=>'<option value="'+esc(n)+'">'+esc(n)+'</option>').join('');
+  sel.value = cur;
+}
+const srcsel = document.getElementById('srcsel');
+if(srcsel) srcsel.addEventListener('change', ()=>{ state.src = srcsel.value; load(); });
+const hd = document.getElementById('hidedone');
+if(hd) hd.addEventListener('change', ()=>{
+  state.hidedone = hd.checked;
+  document.body.classList.toggle('hide-done', state.hidedone);
+});
+
 document.querySelectorAll('.rchip[data-r]').forEach(c=>c.addEventListener('click',()=>{
   document.querySelectorAll('.rchip[data-r]').forEach(x=>x.classList.remove('on'));
   c.classList.add('on'); state.r=c.dataset.r; load();
@@ -1425,7 +1777,7 @@ document.querySelectorAll('.rchip[data-r]').forEach(c=>c.addEventListener('click
 // Metric cards: apply the filter (if any) and jump to the matching section
 function applyFilter(f){
   state.f = f;
-  document.querySelectorAll('.chip').forEach(x=>x.classList.toggle('on', x.dataset.f===f));
+  document.querySelectorAll('.chip:not(.achip)').forEach(x=>x.classList.toggle('on', x.dataset.f===f));
   load();
 }
 function activateStat(c){

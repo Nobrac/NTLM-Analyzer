@@ -22,6 +22,14 @@ machine and pushes them to the central collector (`/ingest` + `/status`).
   (can be disabled with `--skip-kerberos`).
 - **8004** (DC): NTLM within the domain (user + source + target).
 - **8001** (all machines): outgoing NTLM including the originating process.
+- **8002/8003** (needs *Audit Incoming NTLM Traffic*): **incoming** NTLM.
+  8002 fires for authentication that needs no DC to validate it (local accounts,
+  loopback) and carries the calling process; 8003 fires on member servers for
+  domain accounts and carries the remote account, client machine, logon type and
+  the process that was accessed. Without the policy these queries return nothing.
+- **8005/8006** (DCs): NTLM straight to the domain controller (8005, e.g. a
+  type 3 logon to the DC) and requests from a **trusted domain** (8006). Same
+  field layout as 8004; collected through the same query.
 - **/status**: heartbeat + auditing state (registry) + agent version.
 
 **Enhanced auditing** (Windows 11 24H2 / Windows Server 2025, KB5064479) — these
@@ -44,7 +52,7 @@ with `roxmltree`. The classic events use `/f:xml`; the enhanced ones use
 resolved from the rendered message labels first (English and German), then from
 named XML fields, then by value pattern, so nothing is lost if a label differs.
 Watermarks are kept **per source/purpose** (`Security#4624`, `Security#4769`,
-`NTLM#8001`, `NTLM#8004`, `NTLM#40dc`, `NTLM#40cs`).
+`NTLM#8001`, `NTLM#8002`, `NTLM#8003`, `NTLM#8004` (covers 8004-8006), `NTLM#40dc`, `NTLM#40cs`).
 
 ## Building (on Windows)
 
