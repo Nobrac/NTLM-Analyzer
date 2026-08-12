@@ -110,6 +110,23 @@ CREATE TABLE IF NOT EXISTS agents (
 );
 """
 
+# Usage-IDs des Client-Logs laut KB5064479. Jede Ursache hat eine eigene
+# Abhilfe - deshalb wird nach ihr gruppiert statt nur nach Programm.
+REASON_IDS = {
+    "0":  ("Unknown reason", "unklar"),
+    "1":  ("Application called NTLM directly", "app"),
+    "2":  ("Local account logon", "local"),
+    "4":  ("Cloud account logon", "cloud"),
+    "5":  ("Target name was missing or empty", "spn"),
+    "6":  ("Target name could not be resolved by Kerberos", "spn"),
+    "7":  ("Target name contains an IP address", "ip"),
+    "8":  ("Target name is duplicated in Active Directory", "spn"),
+    "9":  ("No line of sight to a domain controller", "dc"),
+    "10": ("NTLM called over loopback", "loop"),
+    "11": ("NTLM called with a null session", "null"),
+}
+
+
 def normalize_process(p):
     """Vereinheitlicht Prozessnamen fuers Gruppieren: verschiedene Event-Quellen
     liefern denselben Prozess mal mit, mal ohne Endung ("lsass" aus 8001,
@@ -131,7 +148,7 @@ def normalize_process(p):
 FIELDS = ("record_id", "log", "event_id", "kind", "event_time", "user",
           "domain", "ntlm_version", "process", "target_server",
           "workstation", "ip", "logon_type", "enc_type", "auth_method",
-          "reason")
+          "reason", "reason_id", "mic", "epa")
 
 
 def init_db(path):
@@ -155,7 +172,7 @@ def init_db(path):
     # SYSTEM faelschlich zu SYSTEM.exe gemacht - es gibt keinen solchen Prozess.
     conn.execute("UPDATE events SET process = substr(process, 1, length(process)-4) "
                  "WHERE LOWER(process) = 'system.exe'")
-    for col in ("enc_type", "auth_method", "reason"):
+    for col in ("enc_type", "auth_method", "reason", "reason_id", "mic", "epa"):
         if col not in have:
             conn.execute(f"ALTER TABLE events ADD COLUMN {col} TEXT")
     # Indexes for the dashboard queries (time-range filter, aggregates).
@@ -437,6 +454,9 @@ class Handler(BaseHTTPRequestHandler):
                 e.get("enc_type"),
                 e.get("auth_method"),
                 e.get("reason"),
+                e.get("reason_id"),
+                e.get("mic"),
+                e.get("epa"),
                 now,
             ))
         if not rows:
@@ -598,6 +618,31 @@ class Handler(BaseHTTPRequestHandler):
                 f"GROUP_CONCAT(DISTINCT user) "
                 f"FROM events WHERE event_id IN (8001,4020,4021) AND {tf} "
                 f"GROUP BY process, target_server ORDER BY COUNT(*) DESC LIMIT 50", tp).fetchall()]
+            # "Why NTLM?" - grouped by the Usage ID of the enhanced 40xx events.
+            # This is the actual worklist: each cause has its own remediation,
+            # so the same program can appear under two different reasons.
+            reasons = [dict(rid=r[0],
+                            text=REASON_IDS.get(r[0], ("Unknown reason", "unklar"))[0],
+                            cat=REASON_IDS.get(r[0], ("", "unklar"))[1],
+                            n=r[1], procs=r[2], machines=r[3], last_seen=r[4],
+                            sample=r[5]) for r in c.execute(
+                f"SELECT reason_id, COUNT(*), COUNT(DISTINCT process), "
+                f"COUNT(DISTINCT source), MAX(event_time), "
+                f"MAX(COALESCE(target_server,'')) "
+                f"FROM events WHERE reason_id IS NOT NULL AND reason_id != '' AND {tf} "
+                f"GROUP BY reason_id ORDER BY COUNT(*) DESC", tp).fetchall()]
+
+            # Relay exposure: an unprotected MIC or missing channel binding is
+            # what makes an NTLM session relay-able. Only the 40xx events carry
+            # these fields, so this counts a subset - never the whole picture.
+            relay = c.execute(
+                f"SELECT COUNT(*) FROM events WHERE {tf} AND "
+                f"(mic = 'Unprotected' OR epa = 'Not Supported')", tp).fetchone()[0]
+            stats["relay"] = relay
+            stats["relay_scope"] = c.execute(
+                f"SELECT COUNT(*) FROM events WHERE {tf} AND "
+                f"(mic IS NOT NULL OR epa IS NOT NULL)", tp).fetchone()[0]
+
             # Incoming NTLM (8002/8003): which local service accepts NTLM, and
             # which remote accounts come in. 8002 carries the calling process,
             # 8003 the remote account - grouped per machine + process.
@@ -678,7 +723,7 @@ class Handler(BaseHTTPRequestHandler):
                 params + [limit]).fetchall()
             events = [dict(zip(cols2, r)) for r in rows]
 
-        return {"stats": stats, "v1sso": v1sso, "incoming": incoming, "trend": trend, "trend_bucket": ("hour" if rng == "24h" else "day"),
+        return {"stats": stats, "v1sso": v1sso, "incoming": incoming, "reasons": reasons, "trend": trend, "trend_bucket": ("hour" if rng == "24h" else "day"),
                 "top_proc": top_proc, "v1_users": v1_users,
                 "blockers": blockers, "domain": domain, "kerberos": kerberos,
                 "kerberos_accounts": kerberos_accounts,
@@ -941,6 +986,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <nav class="secnav" id="secnav">
     <span class="navlabel" data-i18n="nav_label">Sections</span>
     <span class="navchip" data-sec="sec-programs"   data-tone="warn" data-i18n="nav_prog">Programs</span>
+    <span class="navchip" data-sec="sec-why"        data-tone="warn" data-i18n="nav_why">Why NTLM</span>
     <span class="navchip" data-sec="sec-incoming"   data-tone="neut" data-i18n="nav_inc">Services</span>
     <span class="navchip" data-sec="sec-v1sso"      data-tone="bad"  data-i18n="nav_v1sso">NTLMv1 SSO</span>
     <span class="navchip" data-sec="sec-v1"         data-tone="bad"  data-i18n="nav_v1">NTLMv1</span>
@@ -1012,6 +1058,21 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <table>
         <thead><tr><th data-i18n="th_srccomp">Computer (source)</th><th data-i18n="th_target2">Target server</th><th data-i18n="th_users2">Users</th><th data-i18n="th_count2">Count</th><th data-i18n="th_status2">Status</th><th data-i18n="th_last2">Last seen</th></tr></thead>
         <tbody id="domain"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- Warum NTLM? Gruppierung nach Usage-ID der 40xx-Ereignisse -->
+  <section id="sec-why" style="display:none">
+    <div class="head">
+      <h2 data-i18n="why_h">Why NTLM was used</h2>
+      <p data-i18n="why_p">Windows reports the reason for every fallback (Server 2025 / Windows 11 24H2 only). Each cause has its own fix — this is the shortest path from finding to remedy.</p>
+      <p id="relayline" class="coverage"></p>
+    </div>
+    <div class="scroll">
+      <table>
+        <thead><tr><th data-i18n="th_reason">Reason</th><th data-i18n="th_fix">What helps</th><th data-i18n="th_count6">Count</th><th data-i18n="th_progs">Programs</th><th data-i18n="th_machines2">Machines</th><th data-i18n="th_last7">Last seen</th></tr></thead>
+        <tbody id="reasons"></tbody>
       </table>
     </div>
   </section>
@@ -1159,6 +1220,29 @@ de: {
   lt9:'Neue Anmeldeinformationen (runas /netonly)', lt10:'Remoteinteraktiv (RDP)',
   lt11:'Zwischengespeichert interaktiv (gespeicherte Domänenanmeldung)',
   lt12:'Zwischengespeichert remoteinteraktiv', lt13:'Zwischengespeichertes Entsperren',
+  d_mic:'MIC-Status', d_epa:'Kanalbindung (EPA)',
+  relay_warn:'{n} von {t} Ereignissen mit Sicherheitsangaben sind relay-gefährdet (MIC ungeschützt oder EPA fehlt) – diese zuerst angehen.',
+  relay_ok:'Alle {t} Ereignisse mit Sicherheitsangaben sind MIC-geschützt und nutzen Kanalbindung.',
+  why_h:'Warum NTLM verwendet wurde', nav_why:'Warum NTLM',
+  why_p:'Windows meldet bei jedem Rückfall den Grund (nur Server 2025 / Windows 11 24H2). Jede Ursache hat ihre eigene Abhilfe – das ist der kürzeste Weg vom Fund zur Lösung.',
+  th_reason:'Ursache', th_fix:'Was hilft', th_count6:'Anzahl', th_progs:'Programme',
+  th_machines2:'Maschinen', th_last7:'Zuletzt',
+  rid_0:'Unbekannter Grund', rid_1:'Anwendung ruft NTLM direkt auf',
+  rid_2:'Anmeldung mit lokalem Konto', rid_4:'Anmeldung mit Cloud-Konto',
+  rid_5:'Zielname fehlte oder war leer', rid_6:'Zielname per Kerberos nicht auflösbar',
+  rid_7:'Zielname enthält eine IP-Adresse', rid_8:'Zielname im AD doppelt vergeben',
+  rid_9:'Keine Sichtverbindung zu einem Domänencontroller',
+  rid_10:'NTLM über Loopback aufgerufen', rid_11:'NTLM mit Null-Session aufgerufen',
+  fix_app:'Anwendung auf Negotiate umstellen – sonst Hersteller fragen',
+  fix_local:'Domänenkonto statt lokalem Konto; LocalKDC kommt 2026',
+  fix_cloud:'Entra-ID-Anmeldung, kein NTLM-Ersatz nötig',
+  fix_spn:'SPN prüfen: fehlt, ist falsch oder doppelt (setspn -X findet Dubletten)',
+  fix_ip:'Auf Hostnamen umstellen – über eine IP ist Kerberos nicht möglich',
+  fix_dc:'Netzweg zum DC prüfen (Firewall, Segmentierung); IAKerb kommt 2026',
+  fix_loop:'Meist RPC-Endpoint-Mapper; die beiden RPC-Richtlinien prüfen',
+  fix_null:'Anonyme Verbindung – Aufrufer identifizieren und abstellen',
+  fix_unklar:'Ursache prüfen – Windows meldet hier keine bekannte ID',
+  k_relay:'Relay-gefährdet', k_relay_s:'ohne MIC oder EPA',
   nav_label:'Abschnitte', nav_prog:'Programme', nav_inc:'Dienste', nav_v1sso:'NTLMv1-SSO',
   nav_v1:'NTLMv1', nav_dom:'Domäne', nav_krb:'Kerberos', nav_mach:'Maschinen', nav_ev:'Ereignisse',
   g_machine:'Maschine', g_all_mach:'Alle Maschinen', g_hidedone:'Erledigte ausblenden',
@@ -1262,6 +1346,29 @@ en: {
   lt9:'New credentials (runas /netonly)', lt10:'Remote interactive (RDP)',
   lt11:'Cached interactive (stored domain logon)',
   lt12:'Cached remote interactive', lt13:'Cached unlock',
+  d_mic:'MIC status', d_epa:'Channel binding (EPA)',
+  relay_warn:'{n} of {t} events carrying security info are relay-exposed (MIC unprotected or EPA missing) - tackle these first.',
+  relay_ok:'All {t} events carrying security info are MIC-protected and use channel binding.',
+  why_h:'Why NTLM was used', nav_why:'Why NTLM',
+  why_p:'Windows reports the reason for every fallback (Server 2025 / Windows 11 24H2 only). Each cause has its own fix - this is the shortest path from finding to remedy.',
+  th_reason:'Reason', th_fix:'What helps', th_count6:'Count', th_progs:'Programs',
+  th_machines2:'Machines', th_last7:'Last seen',
+  rid_0:'Unknown reason', rid_1:'Application called NTLM directly',
+  rid_2:'Local account logon', rid_4:'Cloud account logon',
+  rid_5:'Target name was missing or empty', rid_6:'Target name could not be resolved by Kerberos',
+  rid_7:'Target name contains an IP address', rid_8:'Target name is duplicated in Active Directory',
+  rid_9:'No line of sight to a domain controller',
+  rid_10:'NTLM called over loopback', rid_11:'NTLM called with a null session',
+  fix_app:'Switch the application to Negotiate - otherwise ask the vendor',
+  fix_local:'Use a domain account instead of a local one; LocalKDC arrives 2026',
+  fix_cloud:'Entra ID logon, no NTLM replacement needed',
+  fix_spn:'Check the SPN: missing, wrong or duplicated (setspn -X finds duplicates)',
+  fix_ip:'Switch to host names - Kerberos cannot work over an IP address',
+  fix_dc:'Check the network path to a DC (firewall, segmentation); IAKerb arrives 2026',
+  fix_loop:'Usually the RPC endpoint mapper; review the two RPC policies',
+  fix_null:'Anonymous connection - identify the caller and stop it',
+  fix_unklar:'Investigate - Windows reported no known ID here',
+  k_relay:'Relay-exposed', k_relay_s:'no MIC or EPA',
   nav_label:'Sections', nav_prog:'Programs', nav_inc:'Services', nav_v1sso:'NTLMv1 SSO',
   nav_v1:'NTLMv1', nav_dom:'Domain', nav_krb:'Kerberos', nav_mach:'Machines', nav_ev:'Events',
   g_machine:'Machine', g_all_mach:'All machines', g_hidedone:'Hide done',
@@ -1326,6 +1433,9 @@ let LANG = 'de';
 try { LANG = localStorage.getItem('ntlm_lang') || 'de'; } catch(e) {}
 if (!I18N[LANG]) LANG = 'de';
 const t = k => (I18N[LANG] && I18N[LANG][k]) || I18N.de[k] || k;
+// Like t(), but falls back to a caller-supplied string instead of the key -
+// used for reason IDs, where an undocumented ID must not render as "rid_99".
+const tOr = (k, fb) => (I18N[LANG] && I18N[LANG][k]) || I18N.de[k] || fb;
 const LOCALE = () => LANG === 'de' ? 'de-DE' : 'en-GB';
 
 function applyStatic(){
@@ -1477,6 +1587,8 @@ function evDetailRow(e, id){
     ['d_lt',    logonTypeText(e.logon_type)],
     ['d_enc',   e.enc_type],
     ['d_reason',e.reason],
+    ['d_mic',   e.mic],
+    ['d_epa',   e.epa],
   ].filter(r => r[1] !== null && r[1] !== undefined && r[1] !== '');
   const grid = rows.map(r =>
     '<div class="dlab">'+t(r[0])+'</div><div class="dval">'+esc(r[1])+'</div>').join('');
@@ -1577,6 +1689,29 @@ async function load(){
               : '<span class="badge b-bad"><span class="d"></span>'+t('st_used')+'</span>'}</td>
         <td>${stSel(x.key,x.st)}${againBadge(x)}</td>
         <td class="soft mono">${when(x.last_seen)}</td></tr>`).join('');
+  }
+
+  // "Why NTLM?" - each cause gets a concrete remediation hint, because the
+  // reason alone ("target name contains an IP address") does not say what to do.
+  const rs = d.reasons || [];
+  // Relay exposure: only the 40xx events carry MIC and channel-binding status,
+  // so this is always a subset - stating the base makes that explicit.
+  const rel = d.stats.relay || 0, relScope = d.stats.relay_scope || 0;
+  const relEl = document.getElementById('relayline');
+  if (relEl) {
+    relEl.innerHTML = (rel > 0)
+      ? '<span class="warn">'+t('relay_warn').replace('{n}', rel).replace('{t}', relScope)+'</span>'
+      : (relScope > 0 ? '<span class="ok">'+t('relay_ok').replace('{t}', relScope)+'</span>' : '');
+  }
+  document.getElementById('sec-why').style.display = rs.length ? '' : 'none';
+  if (rs.length) {
+    $('#reasons').innerHTML = rs.map(r=>`<tr>
+        <td class="strong">${esc(tOr('rid_'+r.rid, r.text))}</td>
+        <td class="soft">${esc(tOr('fix_'+r.cat, ''))}</td>
+        <td class="num-cell">${r.n}</td>
+        <td class="soft">${r.procs}</td>
+        <td class="soft">${r.machines}</td>
+        <td class="soft mono">${when(r.last_seen)}</td></tr>`).join('');
   }
 
   // Incoming NTLM: only show the section when the incoming audit actually
@@ -1743,6 +1878,7 @@ document.getElementById('csvbtn').addEventListener('click', ()=>{
 // news and worth showing, unlike hiding it entirely.
 const NAV_COUNTS = {
   'sec-programs':          d => (d.blockers||[]).length,
+  'sec-why':               d => (d.reasons||[]).length,
   'sec-incoming':          d => (d.incoming||[]).length,
   'sec-v1sso':             d => (d.v1sso||[]).length,
   'sec-v1':                d => (d.v1_users||[]).length,
