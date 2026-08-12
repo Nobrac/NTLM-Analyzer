@@ -54,6 +54,15 @@ pub struct Event {
     /// Only for the enhanced 40xx events (Server 2025 / Win11 24H2): plain-text
     /// reason why NTLM was used instead of Kerberos.
     pub reason: Option<String>,
+    /// Numeric Usage ID behind `reason` (KB5064479, 0-11). Kept separately so
+    /// findings can be grouped by cause - each ID has its own remediation.
+    pub reason_id: Option<String>,
+    /// MIC status: "Protected" / "Unprotected". An unprotected message integrity
+    /// code is one of the things that makes an NTLM session relay-able.
+    pub mic: Option<String>,
+    /// Channel binding (Extended Protection for Authentication):
+    /// "Supported" / "Not Supported". Missing EPA is the other relay enabler.
+    pub epa: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -580,7 +589,7 @@ fn reason_text(id: &str) -> Option<String> {
         "6" => "Target name could not be resolved by Kerberos",
         "7" => "Target name contains an IP address",
         "8" => "Target name is duplicated in Active Directory",
-        "9" => "Keine Verbindung zu einem Domaenencontroller",
+        "9" => "No line of sight to a domain controller",
         "10" => "NTLM called over loopback",
         "11" => "NTLM called with a null session",
         _ => return None,
@@ -705,6 +714,8 @@ const L_CLIENT_MACHINE: &[&str] = &["Client Machine", "Clientcomputer", "Hostnam
 const L_VERSION: &[&str] = &["NTLM Version", "NTLM-Version"];
 const L_REASON: &[&str] = &["Reason", "Grund"];
 const L_REASON_ID: &[&str] = &["Reason ID", "Grund-ID"];
+const L_MIC: &[&str] = &["MIC Status", "MIC-Status"];
+const L_EPA: &[&str] = &["Channel Binding", "Kanalbindung"];
 
 fn map_enhanced(e: &RawEvent) -> Option<Event> {
     let id = e.event_id;
@@ -754,6 +765,44 @@ fn map_enhanced(e: &RawEvent) -> Option<Event> {
     if reason.is_none() && downgrade {
         reason = Some("Downgrade detected (NTLMv1, missing EPA or missing MIC)".into());
     }
+
+    // The numeric Usage ID is kept alongside the text so the dashboard can group
+    // findings by cause. Only 0-11 are defined (KB5064479); anything else is
+    // dropped rather than shown as a bogus category.
+    let reason_id = from_message(e, L_REASON_ID)
+        .or_else(|| find_named(e, &["reason", "id"]))
+        .or_else(|| find_named(e, &["usage", "id"]))
+        .map(|v| v.trim().to_string())
+        .filter(|v| reason_text(v).is_some());
+
+    // Relay indicators. Both are plain words in the rendered text; normalised to
+    // a small fixed vocabulary so the dashboard does not have to guess.
+    let norm_mic = |v: String| {
+        let l = v.to_lowercase();
+        if l.contains("unprotected") || l.contains("ungeschützt") {
+            Some("Unprotected".to_string())
+        } else if l.contains("protected") || l.contains("geschützt") {
+            Some("Protected".to_string())
+        } else {
+            None
+        }
+    };
+    let norm_epa = |v: String| {
+        let l = v.to_lowercase();
+        if l.contains("not supported") || l.contains("nicht unterstützt") {
+            Some("Not Supported".to_string())
+        } else if l.contains("supported") || l.contains("unterstützt") {
+            Some("Supported".to_string())
+        } else {
+            None
+        }
+    };
+    let mic = from_message(e, L_MIC)
+        .or_else(|| find_named(e, &["mic"]))
+        .and_then(norm_mic);
+    let epa = from_message(e, L_EPA)
+        .or_else(|| find_named(e, &["channel", "binding"]))
+        .and_then(norm_epa);
     if reason.is_none() && id == 4024 {
         reason = Some("NTLMv1-derived SSO credentials - blocked from October 2026".into());
     }
@@ -839,6 +888,9 @@ fn map_enhanced(e: &RawEvent) -> Option<Event> {
             Some("Direct".into())
         },
         reason,
+        reason_id,
+        mic,
+        epa,
     })
 }
 

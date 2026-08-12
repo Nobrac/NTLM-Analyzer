@@ -85,7 +85,7 @@ One agent runs per machine — on domain controllers and member machines alike.
 | **4769** | DCs *(optional)* | Kerberos service tickets — the "safe side": services and accounts already on Kerberos, including encryption (AES green, RC4 amber). |
 | **4020/4021** | Win11 24H2 / Server 2025 | **Enhanced client auditing** (KB5064479): outgoing NTLM with process, **NTLM version and the reason** Kerberos was not used (e.g. "target name contains an IP address"). Odd IDs flag a downgrade. |
 | **4022/4023** | Win11 24H2 / Server 2025 | **Enhanced server auditing**: incoming NTLM with source machine, client IP, target SPN and version — feeds the domain view. |
-| **4030–4033** | Server 2025 DCs | **Enhanced domain-wide auditing**: the NTLM version straight from the DC log — no longer requires collecting 4624 from every machine. |
+| **4030–4033** | Server 2025 DCs | **Enhanced domain-wide auditing**: the NTLM version straight from the DC log — no longer requires collecting 4624 from every machine. **4032/4033** cover same-domain authentication, **4030/4031** cross-domain; the odd ID of each pair marks a security downgrade. |
 | **4024/4025** | Win11 24H2 / Server 2025 | **NTLMv1-derived SSO credentials** used (4024) or already blocked (4025). Microsoft flips the default to *enforce* in **October 2026** — these logons will then break on their own. |
 | `/status` | all machines | Heartbeat plus the machine's auditing state, read from the registry. |
 
@@ -100,6 +100,8 @@ Watermarks are tracked per source and purpose, so only new events are transferre
 - **Time-range filter** (24 h / 7 days / 30 days / all), applied server-side to every metric, table and the event list.
 - **Trend chart**: NTLM activity per day (per hour in the 24 h view), stacked by v1 / v2 / unversioned — the curve that has to reach zero.
 - **Work lists with status**: blocker and domain entries can be set to *open / in progress / done* (persisted). If a "done" entry produces new events, a red **"active again"** badge appears automatically.
+- **"Why NTLM?" panel**: groups every fallback by the *Usage ID* Windows reports (KB5064479) — target name is an IP, SPN duplicated in AD, no line of sight to a DC, application called NTLM directly, and so on. Each cause is shown with its own remediation, which turns a list of findings into a list of fixes. Server 2025 / Windows 11 24H2 only.
+- **Relay exposure**: the enhanced events also report MIC status and channel binding (EPA). Sessions with an unprotected MIC or missing channel binding are the relay-able ones and are flagged as such — useful for prioritising *which* NTLM to remove first.
 - **October 2026 readiness**: the machine list flags which machines the `BlockNtlmv1SSO` switch will actually hit. Machines with **Credential Guard** enabled are exempt (it already prevents NTLMv1 cryptography), and machines already set to enforce have nothing left to come.
 - **NTLM level per machine**: the machine list shows each machine's `LmCompatibilityLevel` — which NTLM versions it still *permits*, independent of what it actually used. Level 5 (NTLMv2 only) is the target state before any blocking.
 - **Data-basis indicator**: shows how many days of events exist and warns while that is below the recommended two weeks — an empty findings list after two days means little.
