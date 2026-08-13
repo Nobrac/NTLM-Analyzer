@@ -29,6 +29,8 @@ const DATA_4624: &str = "(*[EventData[Data[@Name='LmPackageName']='NTLM V1']] or
 
 const LSA: &str = r"SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0";
 const LSA_ROOT: &str = r"SYSTEM\CurrentControlSet\Control\Lsa";
+const NTLM_CHANNEL: &str =
+    r"SOFTWARE\Microsoft\Windows\CurrentVersion\WINEVT\Channels\Microsoft-Windows-NTLM/Operational";
 const DEVGUARD_CG: &str = r"SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\CredentialGuard";
 const NETLOGON: &str = r"SYSTEM\CurrentControlSet\Services\Netlogon\Parameters";
 
@@ -63,6 +65,13 @@ pub struct Event {
     /// Channel binding (Extended Protection for Authentication):
     /// "Supported" / "Not Supported". Missing EPA is the other relay enabler.
     pub epa: Option<String>,
+    /// Target operating system as reported by 4032 - outdated server OSes are
+    /// a finding of their own.
+    pub server_os: Option<String>,
+    /// Kerberos failure code from unsuccessful 4769 events (e.g. 0x7 = SPN not
+    /// found). On systems without the enhanced 40xx events this is the only
+    /// early warning for the causes behind NTLM fallback. None on success.
+    pub failure_code: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -80,6 +89,10 @@ struct AgentStatus {
     /// BlockNtlmv1SSO: 0 = audit (default), 1 = enforce. Microsoft flips the
     /// default to enforce in October 2026.
     block_v1sso: String,
+    /// Configured maximum size of the NTLM/Operational log in KB. The default
+    /// is only ~1 MB - with incoming auditing enabled the log can roll over
+    /// between two poll cycles, silently losing events. "unset" = OS default.
+    ntlm_log_kb: String,
     /// Credential Guard state. Machines with Credential Guard enabled are NOT
     /// affected by the BlockNtlmv1SSO change - it already prevents NTLMv1
     /// cryptography. Read from the registry, so this is the *configured*
@@ -118,6 +131,7 @@ pub fn run_cycle(cfg: &Config) -> Result<(), String> {
         lm_level: lm_level(),
         block_v1sso: block_v1sso(),
         cred_guard: cred_guard(),
+        ntlm_log_kb: ntlm_log_kb(),
     };
     let status_url = format!("{}/status", cfg.collector_url.trim_end_matches('/'));
     match serde_json::to_string(&status) {
@@ -165,17 +179,9 @@ pub fn run_cycle(cfg: &Config) -> Result<(), String> {
             );
         }
         gather(
-            "Microsoft-Windows-NTLM/Operational",
-            "NTLM#8004",
-            "(EventID=8004 or EventID=8005 or EventID=8006)",
-            "",
-            window_ms,
-            &state,
-            &me,
-            map_dc_ntlm,
-            &mut collected,
-            &mut new_seen,
-            false,
+            "Microsoft-Windows-NTLM/Operational", "NTLM#8004",
+            "(EventID=8004 or EventID=8005 or EventID=8006 or EventID=4004 or EventID=4005 or EventID=4006)", "", window_ms,
+            &state, &me, map_dc_ntlm, &mut collected, &mut new_seen, false,
         );
         // Enhanced DC audits (Server 2025): they carry the NTLM version straight
         // from the DC log - on older systems the query simply returns nothing.
@@ -196,7 +202,7 @@ pub fn run_cycle(cfg: &Config) -> Result<(), String> {
     gather(
         "Microsoft-Windows-NTLM/Operational",
         "NTLM#8001",
-        "EventID=8001",
+        "(EventID=8001 or EventID=4001)",
         "",
         window_ms,
         &state,
@@ -212,7 +218,7 @@ pub fn run_cycle(cfg: &Config) -> Result<(), String> {
     gather(
         "Microsoft-Windows-NTLM/Operational",
         "NTLM#8002",
-        "EventID=8002",
+        "(EventID=8002 or EventID=4002)",
         "",
         window_ms,
         &state,
@@ -225,7 +231,7 @@ pub fn run_cycle(cfg: &Config) -> Result<(), String> {
     gather(
         "Microsoft-Windows-NTLM/Operational",
         "NTLM#8003",
-        "EventID=8003",
+        "(EventID=8003 or EventID=4003)",
         "",
         window_ms,
         &state,
@@ -361,20 +367,35 @@ fn map_4624(e: &RawEvent) -> Option<Event> {
     })
 }
 
+/// Normalises a Kerberos status ("0x00000007" -> "0x7") so the dashboard can
+/// group identical codes reported in different widths.
+fn norm_krb_status(st: &str) -> String {
+    let t = st.trim().to_lowercase();
+    let hex = t.strip_prefix("0x").unwrap_or(&t).trim_start_matches('0');
+    format!("0x{}", if hex.is_empty() { "0" } else { hex })
+}
+
 fn map_4769(e: &RawEvent) -> Option<Event> {
     let u = e.named.get("TargetUserName").cloned().unwrap_or_default();
-    if u.trim().is_empty() || u.ends_with('$') {
-        return None;
-    }
     let svc = e.named.get("ServiceName").cloned().unwrap_or_default();
     if svc.is_empty() || svc == "krbtgt" || svc.starts_with("krbtgt") {
         return None;
     }
-    // Only successful tickets (status 0x0 / 0x00000000); drop real error codes.
-    if let Some(st) = e.named.get("Status") {
-        if !is_success_status(st) {
-            return None;
-        }
+    // Failed requests are kept as their own kind: on systems without the 40xx
+    // events (2016/2019/2022) the failure code is the only early warning for
+    // NTLM-fallback causes such as a missing SPN (0x7). Machine accounts are
+    // kept for failures - a computer account with an SPN problem matters -
+    // while successes keep the old person-only rule to limit noise.
+    let failure = e
+        .named
+        .get("Status")
+        .filter(|st| !is_success_status(st))
+        .map(|st| norm_krb_status(st));
+    if failure.is_none() && (u.trim().is_empty() || u.ends_with('$')) {
+        return None;
+    }
+    if u.trim().is_empty() {
+        return None;
     }
     let enc = map_enc(
         e.named
@@ -391,7 +412,13 @@ fn map_4769(e: &RawEvent) -> Option<Event> {
         record_id: e.record_id,
         log: "Security".to_string(),
         event_id: e.event_id,
-        kind: "kerberos".to_string(),
+        kind: if failure.is_some() {
+            "krbfail"
+        } else {
+            "kerberos"
+        }
+        .to_string(),
+        failure_code: failure,
         event_time: e.time.clone(),
         user: Some(u),
         domain: e.named.get("TargetDomainName").cloned(),
@@ -402,7 +429,9 @@ fn map_4769(e: &RawEvent) -> Option<Event> {
     })
 }
 
-/// DC-side NTLM credential validation. Microsoft splits this across three IDs,
+/// DC-side NTLM credential validation (plus the 4004-4006 enforce twins with
+/// identical layout - 4004 is also what fires for the MS-CHAPv2 blind spot).
+/// Microsoft splits the audit side across three IDs,
 /// all with the same field layout - collecting only 8004 leaves two blind spots:
 ///   8004  request from a domain member over the secure channel (the common case)
 ///   8005  NTLM straight to the DC itself (e.g. a type 3 logon to the DC)
@@ -487,7 +516,7 @@ fn map_8002(e: &RawEvent) -> Option<Event> {
     Some(Event {
         record_id: e.record_id,
         log: "NTLM/Operational".to_string(),
-        event_id: 8002,
+        event_id: e.event_id,
         kind: "incoming".to_string(),
         event_time: e.time.clone(),
         process,
@@ -519,7 +548,7 @@ fn map_8003(e: &RawEvent) -> Option<Event> {
     Some(Event {
         record_id: e.record_id,
         log: "NTLM/Operational".to_string(),
-        event_id: 8003,
+        event_id: e.event_id,
         kind: "incoming".to_string(),
         event_time: e.time.clone(),
         user: Some(user),
@@ -715,6 +744,7 @@ const L_VERSION: &[&str] = &["NTLM Version", "NTLM-Version"];
 const L_REASON: &[&str] = &["Reason", "Grund"];
 const L_REASON_ID: &[&str] = &["Reason ID", "Grund-ID"];
 const L_MIC: &[&str] = &["MIC Status", "MIC-Status"];
+const L_SRV_OS: &[&str] = &["Server OS", "Serverbetriebssystem"];
 const L_EPA: &[&str] = &["Channel Binding", "Kanalbindung"];
 
 fn map_enhanced(e: &RawEvent) -> Option<Event> {
@@ -803,6 +833,13 @@ fn map_enhanced(e: &RawEvent) -> Option<Event> {
     let epa = from_message(e, L_EPA)
         .or_else(|| find_named(e, &["channel", "binding"]))
         .and_then(norm_epa);
+
+    // 4032 names the target's operating system - outdated server OSes are a
+    // finding of their own (they often cannot do anything better than NTLM).
+    let server_os = from_message(e, L_SRV_OS)
+        .or_else(|| find_named(e, &["server", "os"]))
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty() && v != "-");
     if reason.is_none() && id == 4024 {
         reason = Some("NTLMv1-derived SSO credentials - blocked from October 2026".into());
     }
@@ -891,6 +928,8 @@ fn map_enhanced(e: &RawEvent) -> Option<Event> {
         reason_id,
         mic,
         epa,
+        server_os,
+        failure_code: None,
     })
 }
 
@@ -1001,6 +1040,15 @@ fn block_v1sso() -> String {
 /// LsaCfgFlags is the older equivalent (1 = with UEFI lock, 2 = without).
 /// Returns "unknown" when neither is present - modern Windows can enable it by
 /// default without either value being set, so absence is not proof of absence.
+/// Max size of the NTLM/Operational channel in KB, read from the channel's
+/// registry config. Absent value = OS default (~1028 KB on current builds).
+fn ntlm_log_kb() -> String {
+    match read_dword(NTLM_CHANNEL, "MaxSize") {
+        Some(v) => (v / 1024).to_string(),
+        None => "unset".to_string(),
+    }
+}
+
 fn cred_guard() -> String {
     if let Some(v) = read_dword(DEVGUARD_CG, "Enabled") {
         return if v >= 1 { "on" } else { "off" }.to_string();

@@ -80,9 +80,10 @@ One agent runs per machine — on domain controllers and member machines alike.
 | **8001** | all machines | **Outgoing** NTLM including the originating process — the "shutdown blocker" list. Requests handled in kernel mode (PID 4) are labeled `(Kernel: SMB/HTTP.sys)` — that covers file shares as well as WinRM, ADWS, SSRS and the Remote Desktop Gateway, none of which can be attributed to a single process. |
 | **8002** | all machines *(optional)* | **Incoming** NTLM that needs *no* domain controller to validate it — local accounts and loopback authentication. Carries the **calling process**, so it names the local service involved. |
 | **8003** | member servers *(optional)* | **Incoming** NTLM with a **domain account** (validated by a DC): remote account, client machine, logon type and the **process that was accessed** (e.g. `w3wp.exe`). Together with 8002 this answers "which service accepts NTLM". |
+| **4001–4006** | all machines / DCs | The **enforce twins** of 8001–8006: once a deny policy is active, events switch IDs (8001→4001 and so on) with identical layout. Collected so the dashboard stays sighted during enforcement — blocked authentications appear as a red **blocked** badge. **4004** is also what fires for the MS-CHAPv2 blind spot. |
 | **8005/8006** | DCs | Two blind spots most setups miss: **8005** is NTLM straight *to the domain controller* (e.g. a type 3 logon to the DC), **8006** a request from a **trusted domain**. Same field layout as 8004; under enforcement they become 4005/4006. |
 | **8004** | DCs | NTLM authentication inside the domain (source → target → user). |
-| **4769** | DCs *(optional)* | Kerberos service tickets — the "safe side": services and accounts already on Kerberos, including encryption (AES green, RC4 amber). |
+| **4769** | DCs | Kerberos service tickets — the "safe side" for contrast. **Failed requests are kept too**: on systems without the 40xx events (2016/2019/2022) the failure code (e.g. `0x7` = SPN not found) is the only early warning for NTLM-fallback causes; they feed the *Why NTLM?* panel. Needs *Audit Kerberos Service Ticket Operations* incl. **Failure**. |
 | **4020/4021** | Win11 24H2 / Server 2025 | **Enhanced client auditing** (KB5064479): outgoing NTLM with process, **NTLM version and the reason** Kerberos was not used (e.g. "target name contains an IP address"). Odd IDs flag a downgrade. |
 | **4022/4023** | Win11 24H2 / Server 2025 | **Enhanced server auditing**: incoming NTLM with source machine, client IP, target SPN and version — feeds the domain view. |
 | **4030–4033** | Server 2025 DCs | **Enhanced domain-wide auditing**: the NTLM version straight from the DC log — no longer requires collecting 4624 from every machine. **4032/4033** cover same-domain authentication, **4030/4031** cross-domain; the odd ID of each pair marks a security downgrade. |
@@ -100,7 +101,9 @@ Watermarks are tracked per source and purpose, so only new events are transferre
 - **Time-range filter** (24 h / 7 days / 30 days / all), applied server-side to every metric, table and the event list.
 - **Trend chart**: NTLM activity per day (per hour in the 24 h view), stacked by v1 / v2 / unversioned — the curve that has to reach zero.
 - **Work lists with status**: blocker and domain entries can be set to *open / in progress / done* (persisted). If a "done" entry produces new events, a red **"active again"** badge appears automatically.
-- **"Why NTLM?" panel**: groups every fallback by the *Usage ID* Windows reports (KB5064479) — target name is an IP, SPN duplicated in AD, no line of sight to a DC, application called NTLM directly, and so on. Each cause is shown with its own remediation, which turns a list of findings into a list of fixes. Server 2025 / Windows 11 24H2 only.
+- **Enforcement visibility**: the blocked events 4001–4006 are collected alongside their audit twins, so the moment a deny policy goes live (even on a single test machine) the dashboard shows what got blocked instead of going dark.
+- **Log-size guard**: the agent reports the configured size of the NTLM/Operational log; the machine list warns when it is below 16 MB, because the OS default (~1 MB) can roll over between two poll cycles once incoming auditing is active — silently losing events. One-liner fix: `wevtutil sl Microsoft-Windows-NTLM/Operational /ms:20971520`.
+- **"Why NTLM?" panel**: groups every fallback by the *Usage ID* Windows reports (KB5064479) — target name is an IP, SPN duplicated in AD, no line of sight to a DC, application called NTLM directly, and so on. Each cause is shown with its own remediation, which turns a list of findings into a list of fixes. On Server 2025 / Windows 11 24H2 the panel is fed by the Usage IDs; on older systems (2016/2019/2022) it is fed by **failed Kerberos requests** (4769 failure codes such as `0x7` = SPN not found) — so mixed environments get the cause analysis everywhere.
 - **Relay exposure**: the enhanced events also report MIC status and channel binding (EPA). Sessions with an unprotected MIC or missing channel binding are the relay-able ones and are flagged as such — useful for prioritising *which* NTLM to remove first.
 - **October 2026 readiness**: the machine list flags which machines the `BlockNtlmv1SSO` switch will actually hit. Machines with **Credential Guard** enabled are exempt (it already prevents NTLMv1 cryptography), and machines already set to enforce have nothing left to come.
 - **NTLM level per machine**: the machine list shows each machine's `LmCompatibilityLevel` — which NTLM versions it still *permits*, independent of what it actually used. Level 5 (NTLMv2 only) is the target state before any blocking.
@@ -206,7 +209,7 @@ The agent only reads events that Windows actually writes. Enable the following v
 | Category → Subcategory | Value | Produces |
 | --- | --- | --- |
 | Logon/Logoff → **Audit Logon** | `Success` | **Event 4624** — the only source of the NTLMv1/v2 distinction and of Kerberos-fallback detection |
-| Account Logon → **Audit Kerberos Service Ticket Operations** *(optional)* | `Success` | **Event 4769** — Kerberos services and accounts ("the safe side") |
+| Account Logon → **Audit Kerberos Service Ticket Operations** *(optional)* | `Success and Failure` | **Event 4769** — successes show Kerberos services and accounts ("the safe side"); **failures feed the *Why NTLM?* panel** with the cause (e.g. `0x7` = SPN not found) on systems without the 40xx events |
 
 #### Applying and verifying
 
@@ -336,6 +339,11 @@ month-end batch jobs and rarely used applications only show up over time. The
 dashboard shows the current data basis above the machine list and warns while it
 is below 14 days.
 
+**Enlarge the NTLM/Operational log before enabling incoming auditing.** The
+default is only about 1 MB and rolls over quickly under load — events lost that
+way are gone for good. `wevtutil sl Microsoft-Windows-NTLM/Operational
+/ms:20971520` sets 20 MB; the machine list warns while a log is below 16 MB.
+
 **Raise `LmCompatibilityLevel` to 5 first.** This is a separate question from
 "who uses NTLM": a machine can go months without a single NTLMv1 event and still
 *permit* it. The **NTLM level** column in the machine list shows the value per
@@ -364,6 +372,13 @@ something like EAP-TLS before restricting NTLM.
 mistake there is a domain-wide outage. Make sure you have console access (iLO,
 iDRAC, vSphere) to at least one DC before enforcing anything: if the change locks
 out RDP, that console is your way back.
+
+**Test single connections before any policy.** On Windows 11 24H2 / Server 2025,
+`NET USE \\server\share /BLOCKNTLM` maps one share with NTLM forbidden — the
+safest way to verify a target survives Kerberos-only, one connection at a time.
+For IP targets that cannot be renamed, `TryIPSPN` (Server 2016+) can force
+Kerberos over an IP if the address is registered as an SPN on the target account
+— a niche workaround, host names remain the clean fix.
 
 **Useful intermediate steps** instead of an all-or-nothing switch:
 `Network security: Restrict NTLM: Add remote server exceptions for NTLM

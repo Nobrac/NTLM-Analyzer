@@ -106,9 +106,23 @@ CREATE TABLE IF NOT EXISTS agents (
     lm_level        TEXT,          -- LmCompatibilityLevel: welche NTLM-Versionen erlaubt sind
     block_v1sso     TEXT,          -- BlockNtlmv1SSO: audit/enforce/unset
     cred_guard      TEXT,          -- Credential Guard: on/off/unknown (aus der Registry)
+    ntlm_log_kb     TEXT,          -- Maximalgröße des NTLM/Operational-Logs in KB
     last_seen       TEXT
 );
 """
+
+# Kerberos-Fehlercodes aus fehlgeschlagenen 4769-Anfragen: auf Systemen ohne
+# die 40xx-Ereignisse (2016/2019/2022) die einzige Fruehwarnung fuer die
+# Ursachen hinter NTLM-Fallback. Kategorie -> dieselben Abhilfe-Texte wie beim
+# Warum-Panel; unbekannte Codes laufen als "unklar" mit rohem Code durch.
+KRB_FAIL = {
+    "0x6":  ("Kerberos: client account unknown", "unklar"),
+    "0x7":  ("Kerberos: SPN not found (service principal unknown)", "spn"),
+    "0xe":  ("Kerberos: encryption type not supported", "etype"),
+    "0x12": ("Kerberos: account disabled, expired or locked out", "acct"),
+    "0x1b": ("Kerberos: principal not allowed to delegate", "unklar"),
+    "0x25": ("Kerberos: clock skew too great", "clock"),
+}
 
 # Usage-IDs des Client-Logs laut KB5064479. Jede Ursache hat eine eigene
 # Abhilfe - deshalb wird nach ihr gruppiert statt nur nach Programm.
@@ -148,7 +162,7 @@ def normalize_process(p):
 FIELDS = ("record_id", "log", "event_id", "kind", "event_time", "user",
           "domain", "ntlm_version", "process", "target_server",
           "workstation", "ip", "logon_type", "enc_type", "auth_method",
-          "reason", "reason_id", "mic", "epa")
+          "reason", "reason_id", "mic", "epa", "server_os", "failure_code")
 
 
 def init_db(path):
@@ -158,7 +172,7 @@ def init_db(path):
     have = {r[1] for r in conn.execute("PRAGMA table_info(events)").fetchall()}
     # agents-Tabelle nachziehen (aeltere Installationen kennen lm_level nicht)
     have_a = {r[1] for r in conn.execute("PRAGMA table_info(agents)")}
-    for col in ("lm_level", "block_v1sso", "cred_guard"):
+    for col in ("lm_level", "block_v1sso", "cred_guard", "ntlm_log_kb"):
         if have_a and col not in have_a:
             conn.execute(f"ALTER TABLE agents ADD COLUMN {col} TEXT")
     # Bestandsdaten: Prozessnamen ohne Endung angleichen (einmalig wirksam,
@@ -172,7 +186,7 @@ def init_db(path):
     # SYSTEM faelschlich zu SYSTEM.exe gemacht - es gibt keinen solchen Prozess.
     conn.execute("UPDATE events SET process = substr(process, 1, length(process)-4) "
                  "WHERE LOWER(process) = 'system.exe'")
-    for col in ("enc_type", "auth_method", "reason", "reason_id", "mic", "epa"):
+    for col in ("enc_type", "auth_method", "reason", "reason_id", "mic", "epa", "server_os", "failure_code"):
         if col not in have:
             conn.execute(f"ALTER TABLE events ADD COLUMN {col} TEXT")
     # Indexes for the dashboard queries (time-range filter, aggregates).
@@ -417,17 +431,18 @@ class Handler(BaseHTTPRequestHandler):
         with DB_LOCK:
             self.server.conn.execute(
                 "INSERT INTO agents (source,is_dc,agent_version,outgoing_audit,"
-                "incoming_audit,domain_audit,lm_level,block_v1sso,cred_guard,last_seen) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?) "
+                "incoming_audit,domain_audit,lm_level,block_v1sso,cred_guard,ntlm_log_kb,last_seen) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(source) DO UPDATE SET is_dc=excluded.is_dc, "
                 "agent_version=excluded.agent_version, outgoing_audit=excluded.outgoing_audit, "
                 "incoming_audit=excluded.incoming_audit, domain_audit=excluded.domain_audit, "
                 "lm_level=excluded.lm_level, block_v1sso=excluded.block_v1sso, "
-                "cred_guard=excluded.cred_guard, last_seen=excluded.last_seen",
+                "cred_guard=excluded.cred_guard, ntlm_log_kb=excluded.ntlm_log_kb, "
+                "last_seen=excluded.last_seen",
                 (source, 1 if p.get("is_dc") else 0, p.get("agent_version"),
                  p.get("outgoing_audit"), p.get("incoming_audit"),
                  p.get("domain_audit"), p.get("lm_level"), p.get("block_v1sso"),
-                 p.get("cred_guard"), now))
+                 p.get("cred_guard"), p.get("ntlm_log_kb"), now))
             self.server.conn.commit()
         return True
 
@@ -457,6 +472,8 @@ class Handler(BaseHTTPRequestHandler):
                 e.get("reason_id"),
                 e.get("mic"),
                 e.get("epa"),
+                e.get("server_os"),
+                e.get("failure_code"),
                 now,
             ))
         if not rows:
@@ -518,7 +535,8 @@ class Handler(BaseHTTPRequestHandler):
         clause = (" WHERE " + " AND ".join(where)) if where else ""
         cols = ["event_time", "source", "kind", "event_id", "ntlm_version",
                 "auth_method", "user", "domain", "process", "target_server",
-                "workstation", "ip", "logon_type", "enc_type", "reason"]
+                "workstation", "ip", "logon_type", "enc_type", "reason",
+                "reason_id", "mic", "epa", "server_os", "failure_code"]
         with DB_LOCK:
             rows = self.server.conn.execute(
                 f"SELECT {','.join(cols)} FROM events{clause} "
@@ -534,7 +552,8 @@ class Handler(BaseHTTPRequestHandler):
         w.writerow(["Time", "Machine", "Kind", "EventID", "NTLM version",
                     "Auth path", "User", "Domain", "Process", "Target",
                     "Source/Workstation", "IP", "Logon type", "Encryption",
-                    "Reason"])
+                    "Reason", "Reason ID", "MIC", "Channel binding", "Server OS",
+                    "Kerberos failure"])
         for r in rows:
             w.writerow([cell(v) for v in r])
         body = "\ufeff" + buf.getvalue()   # BOM -> Excel erkennt UTF-8
@@ -611,12 +630,12 @@ class Handler(BaseHTTPRequestHandler):
                 f"GROUP BY user ORDER BY COUNT(*) DESC LIMIT 15", tp).fetchall()]
             # Shutdown blockers: outgoing NTLM (8001) - breaks once the outgoing policy denies
             blockers = [with_status("proc", r[0], r[1],
-                             dict(process=r[0], target=r[1], n=r[2],
-                             users=r[3], sources=r[4], last_seen=r[5], who=r[6])) for r in c.execute(
+                             dict(process=r[0], target=r[1], n=r[2], blocked=r[3],
+                             users=r[4], sources=r[5], last_seen=r[6], who=r[7])) for r in c.execute(
                 f"SELECT COALESCE(process,'(unbekannt)'), COALESCE(target_server,'(unbekannt)'), "
-                f"COUNT(*), COUNT(DISTINCT user), COUNT(DISTINCT source), MAX(event_time), "
+                f"COUNT(*), SUM(CASE WHEN event_id IN (4001,4002,4003,4004,4005,4006) THEN 1 ELSE 0 END), COUNT(DISTINCT user), COUNT(DISTINCT source), MAX(event_time), "
                 f"GROUP_CONCAT(DISTINCT user) "
-                f"FROM events WHERE event_id IN (8001,4020,4021) AND {tf} "
+                f"FROM events WHERE event_id IN (8001,4001,4020,4021) AND {tf} "
                 f"GROUP BY process, target_server ORDER BY COUNT(*) DESC LIMIT 50", tp).fetchall()]
             # "Why NTLM?" - grouped by the Usage ID of the enhanced 40xx events.
             # This is the actual worklist: each cause has its own remediation,
@@ -631,10 +650,32 @@ class Handler(BaseHTTPRequestHandler):
                 f"MAX(COALESCE(target_server,'')) "
                 f"FROM events WHERE reason_id IS NOT NULL AND reason_id != '' AND {tf} "
                 f"GROUP BY reason_id ORDER BY COUNT(*) DESC", tp).fetchall()]
+            # Zweite Quelle: fehlgeschlagene Kerberos-Anfragen (4769). Auf
+            # Systemen ohne die 40xx-Ereignisse die einzige Fruehwarnung -
+            # 0x7 (SPN fehlt) ist der klassische Fallback-Vorbote. Gleiche
+            # Tabelle, gleiche Abhilfe-Spalte; rid bekommt ein "k"-Praefix,
+            # damit die i18n-Schluessel nicht mit den Usage-IDs kollidieren.
+            reasons += [dict(rid="k" + r[0],
+                             text=KRB_FAIL.get(r[0], ("Kerberos failure " + r[0], "unklar"))[0],
+                             cat=KRB_FAIL.get(r[0], ("", "unklar"))[1],
+                             n=r[1], procs=0, machines=r[2], last_seen=r[3],
+                             sample=r[4]) for r in c.execute(
+                f"SELECT failure_code, COUNT(*), COUNT(DISTINCT source), "
+                f"MAX(event_time), MAX(COALESCE(target_server,'')) "
+                f"FROM events WHERE kind='krbfail' AND failure_code IS NOT NULL AND {tf} "
+                f"GROUP BY failure_code", tp).fetchall()]
+            reasons.sort(key=lambda x: -x["n"])
 
             # Relay exposure: an unprotected MIC or missing channel binding is
             # what makes an NTLM session relay-able. Only the 40xx events carry
             # these fields, so this counts a subset - never the whole picture.
+            # Blocked events (4001-4006): under a deny policy the audit events
+            # switch IDs. These are no longer a worklist but an alarm/success
+            # signal, so they are counted and badged rather than mixed in.
+            stats["blocked"] = c.execute(
+                f"SELECT COUNT(*) FROM events WHERE {tf} AND "
+                f"event_id IN (4001,4002,4003,4004,4005,4006)", tp).fetchone()[0]
+
             relay = c.execute(
                 f"SELECT COUNT(*) FROM events WHERE {tf} AND "
                 f"(mic = 'Unprotected' OR epa = 'Not Supported')", tp).fetchone()[0]
@@ -647,9 +688,10 @@ class Handler(BaseHTTPRequestHandler):
             # which remote accounts come in. 8002 carries the calling process,
             # 8003 the remote account - grouped per machine + process.
             incoming = [with_status("inc", r[0], r[1],
-                          dict(machine=r[0], process=r[1], n=r[2], users=r[3],
-                               sources=r[4], last_seen=r[5])) for r in c.execute(
+                          dict(machine=r[0], process=r[1], n=r[2], blocked=r[3],
+                               users=r[4], sources=r[5], last_seen=r[6])) for r in c.execute(
                 f"SELECT source, COALESCE(process,'(unknown)'), COUNT(*), "
+                f"SUM(CASE WHEN event_id IN (4002,4003) THEN 1 ELSE 0 END), "
                 f"COUNT(DISTINCT user), COUNT(DISTINCT workstation), MAX(event_time) "
                 f"FROM events WHERE kind='incoming' AND {tf} "
                 f"GROUP BY source, process ORDER BY COUNT(*) DESC LIMIT 50", tp).fetchall()]
@@ -665,10 +707,12 @@ class Handler(BaseHTTPRequestHandler):
             # NTLM inside the domain (8004, from the DC): most reliable source->target view
             domain = [with_status("dom", r[0], r[1],
                            dict(workstation=r[0], target=r[1], users=r[2],
-                           n=r[3], last_seen=r[4], who=r[5])) for r in c.execute(
+                           n=r[3], blocked=r[4], last_seen=r[5], who=r[6])) for r in c.execute(
                 f"SELECT COALESCE(workstation,'(unbekannt)'), COALESCE(target_server,'(unbekannt)'), "
-                f"COUNT(DISTINCT user), COUNT(*), MAX(event_time), GROUP_CONCAT(DISTINCT user) "
-                f"FROM events WHERE event_id IN (8004,8005,8006,4022,4023,4030,4031,4032,4033) AND {tf} "
+                f"COUNT(DISTINCT user), COUNT(*), "
+                f"SUM(CASE WHEN event_id IN (4004,4005,4006) THEN 1 ELSE 0 END), "
+                f"MAX(event_time), GROUP_CONCAT(DISTINCT user) "
+                f"FROM events WHERE event_id IN (8004,8005,8006,4004,4005,4006,4022,4023,4030,4031,4032,4033) AND {tf} "
                 f"GROUP BY workstation, target_server ORDER BY COUNT(*) DESC LIMIT 50", tp).fetchall()]
             # Kerberos (informational): which services/SPNs already use Kerberos
             kerberos = [dict(service=r[0], accounts=r[1], n=r[2],
@@ -693,14 +737,15 @@ class Handler(BaseHTTPRequestHandler):
                            outgoing_audit=r[3], incoming_audit=r[4], domain_audit=r[5],
                            last_seen=r[6], events=r[7] or 0, last_event=r[8],
                            lm_level=r[9], first_event=r[10],
-                           block_v1sso=r[11], cred_guard=r[12]) for r in c.execute(
+                           block_v1sso=r[11], cred_guard=r[12],
+                           ntlm_log_kb=r[13]) for r in c.execute(
                 "SELECT a.source, a.is_dc, a.agent_version, a.outgoing_audit, a.incoming_audit, "
                 "a.domain_audit, a.last_seen, "
                 "(SELECT COUNT(*) FROM events e WHERE e.source=a.source), "
                 "(SELECT MAX(event_time) FROM events e WHERE e.source=a.source), "
                 "a.lm_level, "
                 "(SELECT MIN(event_time) FROM events e WHERE e.source=a.source), "
-                "a.block_v1sso, a.cred_guard "
+                "a.block_v1sso, a.cred_guard, a.ntlm_log_kb "
                 "FROM agents a ORDER BY a.last_seen DESC").fetchall()]
 
             # Datenbasis: seit wann liegen ueberhaupt Events vor? Zwei Wochen im
@@ -1122,7 +1167,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     </div>
     <div class="scroll">
       <table>
-        <thead><tr><th data-i18n="th_account">Account</th><th data-i18n="th_services">Services</th><th data-i18n="th_tickets">Tickets</th><th data-i18n="th_enc2">Encryption</th><th data-i18n="th_last4">Last seen</th></tr></thead>
+        <thead><tr><th data-i18n="th_account">Account</th><th data-i18n="th_services">Services</th><th data-i18n="th_tickets" data-i18n-title="tt_th_tickets" title="">Tickets</th><th data-i18n="th_enc2">Encryption</th><th data-i18n="th_last4">Last seen</th></tr></thead>
         <tbody id="kerb-accounts"></tbody>
       </table>
     </div>
@@ -1137,7 +1182,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     </div>
     <div class="scroll">
       <table>
-        <thead><tr><th data-i18n="th_machine">Machine</th><th data-i18n="th_type">Type</th><th data-i18n="th_status3">Status</th><th>Auditing</th><th data-i18n="th_lm">NTLM level</th><th data-i18n="th_oct">Oct 2026</th><th>Events</th><th data-i18n="th_lastrep">Last reported</th></tr></thead>
+        <thead><tr><th data-i18n="th_machine">Machine</th><th data-i18n="th_type">Type</th><th data-i18n="th_status3">Status</th><th data-i18n-title="tt_th_aud" title="">Auditing</th><th data-i18n="th_lm" data-i18n-title="tt_th_lm" title="">NTLM level</th><th data-i18n="th_oct" data-i18n-title="tt_th_oct" title="">Oct 2026</th><th>Events</th><th data-i18n="th_lastrep">Last reported</th></tr></thead>
         <tbody id="agents"></tbody>
       </table>
     </div>
@@ -1183,12 +1228,12 @@ de: {
   live:'Aktualisiert sich automatisch · zuletzt',
   leg_goal:'Farbbedeutung', leg_bad:'Rot = unsicher (NTLMv1)', leg_old:'Gelb = veraltet (NTLMv2)', leg_good:'Grün = sicher (Kerberos)',
   range:'Zeitraum', r7d:'7 Tage', r30d:'30 Tage', rall:'Alles',
-  lab_total:'NTLM gesamt', sub_total:'erfasste Vorgänge', tt_total:'Alle Ereignisse anzeigen',
-  lab_v1:'Unsicher', sub_v1:'NTLMv1 – zuerst ablösen', tt_v1:'Zu den unsicheren Anmeldungen springen',
-  lab_v2:'Veraltet', sub_v2:'NTLMv2 – besser, aber alt', tt_v2:'Zu den veralteten Anmeldungen springen',
-  lab_krb:'Schon sicher', sub_krb:'Dienste über Kerberos', tt_krb:'Zur Kerberos-Übersicht springen',
-  lab_src:'Beteiligte Computer', sub_src:'Quellen & Server', tt_src:'Zur Domänen-Übersicht springen',
-  lab_proc:'Erkannte Programme', sub_proc:'die NTLM auslösen', tt_proc:'Zu den Programmen springen',
+  lab_total:'NTLM gesamt', sub_total:'erfasste Vorgänge', tt_total:'Zählt jedes erfasste Ereignis im gewählten Zeitraum – NTLM, Kerberos und Domänenmeldungen zusammen. Klick zeigt die Liste.',
+  lab_v1:'Unsicher', sub_v1:'NTLMv1 – zuerst ablösen', tt_v1:'Zählt Anmeldungen mit NTLMv1: Ereignis 4624 mit Version NTLMv1 sowie 4024/4025 (NTLMv1-SSO). Klick filtert die Liste.',
+  lab_v2:'Veraltet', sub_v2:'NTLMv2 – besser, aber alt', tt_v2:'Zählt Anmeldungen mit NTLMv2 (4624 und 40xx mit Version NTLMv2). Besser als v1, aber weiterhin Relay-anfällig. Klick filtert die Liste.',
+  lab_krb:'Schon sicher', sub_krb:'Dienste über Kerberos', tt_krb:'Zählt Dienste, die bereits Kerberos-Servicetickets ausstellen (Ereignis 4769). Zum Vergleich, keine Aufgabe. Klick springt zur Übersicht.',
+  lab_src:'Beteiligte Computer', sub_src:'Quellen & Server', tt_src:'Zählt verschiedene Maschinen, die als Quelle oder Ziel in NTLM-Ereignissen auftauchen. Klick springt zur Domänen-Sicht.',
+  lab_proc:'Erkannte Programme', sub_proc:'die NTLM auslösen', tt_proc:'Zählt verschiedene Programme aus 8001/4020 – die Abschalt-Blockerliste. Klick springt dorthin.',
   trend_h:'Verlauf',
   trend_p:'NTLM-Vorgänge im gewählten Zeitraum – diese Balken sollen über die Wochen gegen null gehen. Rot = NTLMv1, Gelb = NTLMv2, Grau = NTLM ohne Versionsangabe (Domäne/ausgehend). Kerberos steht zur Einordnung im Tooltip.',
   prog_h:'Programme, die noch NTLM verwenden',
@@ -1220,6 +1265,52 @@ de: {
   lt9:'Neue Anmeldeinformationen (runas /netonly)', lt10:'Remoteinteraktiv (RDP)',
   lt11:'Zwischengespeichert interaktiv (gespeicherte Domänenanmeldung)',
   lt12:'Zwischengespeichert remoteinteraktiv', lt13:'Zwischengespeichertes Entsperren',
+  b_krbfail:'Kerberos-Fehlschlag',
+  tt_krbfail:'Kerberos wurde versucht und scheiterte – der Fehlercode nennt die Ursache. Auf Systemen ohne die 2025er-Ereignisse ist das die Frühwarnung vor NTLM-Fallback.',
+  d_fcode:'Kerberos-Fehlercode',
+  rid_k0x6:'Kerberos: Konto unbekannt (0x6)',
+  rid_k0x7:'Kerberos: SPN nicht gefunden (0x7)',
+  rid_k0xe:'Kerberos: Verschlüsselungstyp nicht unterstützt (0xE)',
+  rid_k0x12:'Kerberos: Konto deaktiviert, abgelaufen oder gesperrt (0x12)',
+  rid_k0x1b:'Kerberos: Delegierung nicht erlaubt (0x1B)',
+  rid_k0x25:'Kerberos: Uhrzeitabweichung zu groß (0x25)',
+  fix_etype:'Verschlüsselungstypen des Kontos prüfen (msDS-SupportedEncryptionTypes) – oft ein Nur-RC4-Konto gegen AES-only-Richtlinie',
+  fix_acct:'Kontostatus prüfen: deaktiviert, abgelaufen oder gesperrt – kein SPN-Problem',
+  fix_clock:'Zeitsynchronisation prüfen (w32tm /resync) – Kerberos erlaubt maximal 5 Minuten Abweichung',
+  eid_4624:'Erfolgreiche Anmeldung (Security-Log). Nur hier steht die NTLM-Version – der DC sieht jede Domänenanmeldung.',
+  eid_4769:'Kerberos-Serviceticket angefordert – dieser Dienst läuft bereits über Kerberos.',
+  eid_8001:'Ausgehender NTLM-Verkehr dieser Maschine, mit dem verursachenden Programm.',
+  eid_8002:'Eingehender NTLM ohne DC-Beteiligung (lokale Konten, Loopback) – nennt den annehmenden Dienst.',
+  eid_8003:'Eingehender NTLM mit Domänenkonto auf einem Mitgliedsserver – wer kam von wo.',
+  eid_8004:'DC-Prüfung einer NTLM-Anmeldung aus der Domäne (über den sicheren Kanal).',
+  eid_8005:'NTLM direkt gegen den Domänencontroller selbst.',
+  eid_8006:'NTLM-Anfrage aus einer vertrauten Domäne.',
+  eid_4001:'BLOCKIERT: ausgehender NTLM wurde durch die Deny-Richtlinie verhindert (Gegenstück zu 8001).',
+  eid_4002:'BLOCKIERT: eingehender NTLM verhindert (Gegenstück zu 8002).',
+  eid_4003:'BLOCKIERT: eingehender NTLM mit Domänenkonto verhindert (Gegenstück zu 8003).',
+  eid_4004:'BLOCKIERT: Domänenanmeldung per NTLM verhindert – feuert auch beim MS-CHAPv2-Blindfleck (0xc0000418).',
+  eid_4005:'BLOCKIERT: NTLM direkt gegen den DC verhindert (Gegenstück zu 8005).',
+  eid_4006:'BLOCKIERT: NTLM aus vertrauter Domäne verhindert (Gegenstück zu 8006).',
+  eid_4020:'Erweitertes Client-Audit (Server 2025/24H2): ausgehender NTLM mit Version, Prozess und Grund.',
+  eid_4021:'Erweitertes Client-Audit mit erkanntem Sicherheits-Downgrade.',
+  eid_4022:'Erweitertes Server-Audit: eingehender NTLM auf diesem Server.',
+  eid_4023:'Erweitertes Server-Audit mit erkanntem Downgrade.',
+  eid_4024:'NTLMv1-abgeleitete SSO-Anmeldung erkannt (Audit) – ab Oktober 2026 standardmäßig blockiert.',
+  eid_4025:'NTLMv1-abgeleitete SSO-Anmeldung BLOCKIERT (Enforce aktiv).',
+  eid_4030:'Erweitertes DC-Audit: NTLM domänenübergreifend, mit Version.',
+  eid_4031:'Erweitertes DC-Audit: domänenübergreifend, mit Downgrade.',
+  eid_4032:'Erweitertes DC-Audit: NTLM innerhalb der Domäne, mit Version und Ziel-Betriebssystem.',
+  eid_4033:'Erweitertes DC-Audit: innerhalb der Domäne, mit Downgrade.',
+  tt_fb:'Kerberos wurde zuerst versucht und schlug fehl – meist SPN-, DNS- oder Zeitproblem. Die Ursache steht oft im „Warum NTLM?"-Abschnitt.',
+  tt_down:'Sicherheits-Downgrade erkannt: NTLMv1, fehlende Kanalbindung oder fehlender MIC.',
+  tt_th_lm:'LmCompatibilityLevel aus der Registry: welche NTLM-Versionen die Maschine noch erlaubt – unabhängig davon, was sie tatsächlich nutzt. Ziel: Stufe 5.',
+  tt_th_oct:'Trifft die Oktober-2026-Umstellung (BlockNtlmv1SSO auf Enforce) diese Maschine? Credential Guard = ausgenommen.',
+  tt_th_aud:'Welche Audit-Richtlinien auf der Maschine aktiv sind – ohne sie liefert sie keine Daten.',
+  tt_th_tickets:'Anzahl der Kerberos-Servicetickets (4769) für dieses Konto im Zeitraum.',
+  b_blocked:'blockiert', tt_blocked:'Eine Deny-Richtlinie hat diese Authentifizierung bereits verhindert (Ereignis 4001–4006). Das ist keine Aufgabe mehr, sondern Erfolgskontrolle – oder ein Alarm, falls unbeabsichtigt.',
+  b_logsize:'Log klein', log_default:'Standard, ~1 MB',
+  tt_logsize:'Das NTLM/Operational-Log ist kleiner als 16 MB. Bei aktivem eingehendem Audit kann es zwischen zwei Abfragen überrollen – Ereignisse gehen dann verloren. Vergrößern mit: wevtutil sl Microsoft-Windows-NTLM/Operational /ms:20971520',
+  d_os:'Server-Betriebssystem',
   d_mic:'MIC-Status', d_epa:'Kanalbindung (EPA)',
   relay_warn:'{n} von {t} Ereignissen mit Sicherheitsangaben sind relay-gefährdet (MIC ungeschützt oder EPA fehlt) – diese zuerst angehen.',
   relay_ok:'Alle {t} Ereignisse mit Sicherheitsangaben sind MIC-geschützt und nutzen Kanalbindung.',
@@ -1309,12 +1400,12 @@ en: {
   live:'Refreshes automatically · last',
   leg_goal:'Color legend', leg_bad:'Red = insecure (NTLMv1)', leg_old:'Yellow = outdated (NTLMv2)', leg_good:'Green = secure (Kerberos)',
   range:'Time range', r7d:'7 days', r30d:'30 days', rall:'All',
-  lab_total:'NTLM total', sub_total:'recorded events', tt_total:'Show all events',
-  lab_v1:'Insecure', sub_v1:'NTLMv1 – replace first', tt_v1:'Jump to insecure logons',
-  lab_v2:'Outdated', sub_v2:'NTLMv2 – better, but old', tt_v2:'Jump to outdated logons',
-  lab_krb:'Already secure', sub_krb:'services via Kerberos', tt_krb:'Jump to the Kerberos overview',
-  lab_src:'Computers involved', sub_src:'sources & servers', tt_src:'Jump to the domain overview',
-  lab_proc:'Programs detected', sub_proc:'that trigger NTLM', tt_proc:'Jump to programs',
+  lab_total:'NTLM total', sub_total:'recorded events', tt_total:'Counts every recorded event in the selected range - NTLM, Kerberos and domain reports combined. Click shows the list.',
+  lab_v1:'Insecure', sub_v1:'NTLMv1 – replace first', tt_v1:'Counts NTLMv1 logons: event 4624 with version NTLMv1 plus 4024/4025 (NTLMv1 SSO). Click filters the list.',
+  lab_v2:'Outdated', sub_v2:'NTLMv2 – better, but old', tt_v2:'Counts NTLMv2 logons (4624 and 40xx with version NTLMv2). Better than v1, but still relay-prone. Click filters the list.',
+  lab_krb:'Already secure', sub_krb:'services via Kerberos', tt_krb:'Counts services already issuing Kerberos service tickets (event 4769). For contrast, not a to-do. Click jumps to the overview.',
+  lab_src:'Computers involved', sub_src:'sources & servers', tt_src:'Counts distinct machines appearing as source or target in NTLM events. Click jumps to the domain view.',
+  lab_proc:'Programs detected', sub_proc:'that trigger NTLM', tt_proc:'Counts distinct programs from 8001/4020 - the shutdown-blocker list. Click jumps there.',
   trend_h:'Trend',
   trend_p:'NTLM activity in the selected time range – these bars should approach zero over the weeks. Red = NTLMv1, yellow = NTLMv2, gray = NTLM without version info (domain/outgoing). Kerberos is shown in the tooltip for context.',
   prog_h:'Programs still using NTLM',
@@ -1346,6 +1437,52 @@ en: {
   lt9:'New credentials (runas /netonly)', lt10:'Remote interactive (RDP)',
   lt11:'Cached interactive (stored domain logon)',
   lt12:'Cached remote interactive', lt13:'Cached unlock',
+  b_krbfail:'Kerberos failure',
+  tt_krbfail:'Kerberos was attempted and failed - the failure code names the cause. On systems without the 2025 events this is the early warning before NTLM fallback.',
+  d_fcode:'Kerberos failure code',
+  rid_k0x6:'Kerberos: account unknown (0x6)',
+  rid_k0x7:'Kerberos: SPN not found (0x7)',
+  rid_k0xe:'Kerberos: encryption type not supported (0xE)',
+  rid_k0x12:'Kerberos: account disabled, expired or locked out (0x12)',
+  rid_k0x1b:'Kerberos: delegation not allowed (0x1B)',
+  rid_k0x25:'Kerberos: clock skew too great (0x25)',
+  fix_etype:'Check the account\'s encryption types (msDS-SupportedEncryptionTypes) - often an RC4-only account against an AES-only policy',
+  fix_acct:'Check the account state: disabled, expired or locked out - not an SPN problem',
+  fix_clock:'Check time sync (w32tm /resync) - Kerberos allows at most 5 minutes of skew',
+  eid_4624:'Successful logon (Security log). The only classic event carrying the NTLM version - the DC sees every domain logon.',
+  eid_4769:'Kerberos service ticket requested - this service already runs over Kerberos.',
+  eid_8001:'Outgoing NTLM from this machine, including the originating program.',
+  eid_8002:'Incoming NTLM without DC involvement (local accounts, loopback) - names the accepting service.',
+  eid_8003:'Incoming NTLM with a domain account on a member server - who came from where.',
+  eid_8004:'DC validation of an NTLM logon from the domain (over the secure channel).',
+  eid_8005:'NTLM straight against the domain controller itself.',
+  eid_8006:'NTLM request from a trusted domain.',
+  eid_4001:'BLOCKED: outgoing NTLM prevented by the deny policy (twin of 8001).',
+  eid_4002:'BLOCKED: incoming NTLM prevented (twin of 8002).',
+  eid_4003:'BLOCKED: incoming NTLM with a domain account prevented (twin of 8003).',
+  eid_4004:'BLOCKED: domain NTLM logon prevented - also fires for the MS-CHAPv2 blind spot (0xc0000418).',
+  eid_4005:'BLOCKED: NTLM straight to the DC prevented (twin of 8005).',
+  eid_4006:'BLOCKED: NTLM from a trusted domain prevented (twin of 8006).',
+  eid_4020:'Enhanced client auditing (Server 2025/24H2): outgoing NTLM with version, process and reason.',
+  eid_4021:'Enhanced client auditing with a detected security downgrade.',
+  eid_4022:'Enhanced server auditing: incoming NTLM on this server.',
+  eid_4023:'Enhanced server auditing with a detected downgrade.',
+  eid_4024:'NTLMv1-derived SSO credentials detected (audit) - blocked by default from October 2026.',
+  eid_4025:'NTLMv1-derived SSO credentials BLOCKED (enforce active).',
+  eid_4030:'Enhanced DC auditing: cross-domain NTLM, with version.',
+  eid_4031:'Enhanced DC auditing: cross-domain, with downgrade.',
+  eid_4032:'Enhanced DC auditing: same-domain NTLM, with version and target OS.',
+  eid_4033:'Enhanced DC auditing: same-domain, with downgrade.',
+  tt_fb:'Kerberos was tried first and failed - usually an SPN, DNS or clock issue. The cause often shows in the "Why NTLM?" section.',
+  tt_down:'Security downgrade detected: NTLMv1, missing channel binding or missing MIC.',
+  tt_th_lm:'LmCompatibilityLevel from the registry: which NTLM versions this machine still permits - regardless of what it actually uses. Target: level 5.',
+  tt_th_oct:'Will the October 2026 change (BlockNtlmv1SSO to enforce) hit this machine? Credential Guard = exempt.',
+  tt_th_aud:'Which audit policies are active on the machine - without them it delivers no data.',
+  tt_th_tickets:'Number of Kerberos service tickets (4769) for this account in the range.',
+  b_blocked:'blocked', tt_blocked:'A deny policy already prevented this authentication (event 4001-4006). No longer a to-do but a success check - or an alarm if unintended.',
+  b_logsize:'log small', log_default:'default, ~1 MB',
+  tt_logsize:'The NTLM/Operational log is smaller than 16 MB. With incoming auditing enabled it can roll over between two polls - events are then lost. Enlarge with: wevtutil sl Microsoft-Windows-NTLM/Operational /ms:20971520',
+  d_os:'Server OS',
   d_mic:'MIC status', d_epa:'Channel binding (EPA)',
   relay_warn:'{n} of {t} events carrying security info are relay-exposed (MIC unprotected or EPA missing) - tackle these first.',
   relay_ok:'All {t} events carrying security info are MIC-protected and use channel binding.',
@@ -1480,14 +1617,18 @@ function userList(who){
 }
 
 function artBadge(e){
-  let fb = (e.auth_method=="Fallback") ? ' <span class="badge b-old"><span class="d"></span>'+t('b_fb')+'</span>' : '';
-  if(e.auth_method=="Downgrade") fb = ' <span class="badge b-bad"><span class="d"></span>'+t('b_down')+'</span>';
-  if(e.ntlm_version=="NTLMv1") return '<span class="badge b-bad"><span class="d"></span>'+t('b_v1')+'</span>'+fb;
-  if(e.ntlm_version=="NTLMv2") return '<span class="badge b-old"><span class="d"></span>'+t('b_v2')+'</span>'+fb;
-  if(e.kind=="kerberos")       return '<span class="badge b-good"><span class="d"></span>'+t('b_krb')+'</span>';
-  if(e.kind=="domain")         return '<span class="badge b-neut"><span class="d"></span>'+t('b_dom')+'</span>';
-  if(e.kind=="outgoing")       return '<span class="badge b-neut"><span class="d"></span>'+t('b_out')+'</span>';
-  return '<span class="soft">NTLM</span>';
+  // Hovering the kind column explains the underlying event ID in one sentence.
+  const ti = eidText(e.event_id) ? ' title="'+esc(e.event_id+' – '+eidText(e.event_id))+'"' : '';
+  let fb = (e.auth_method=="Fallback") ? ' <span class="badge b-old" title="'+esc(t('tt_fb'))+'"><span class="d"></span>'+t('b_fb')+'</span>' : '';
+  if(e.auth_method=="Downgrade") fb = ' <span class="badge b-bad" title="'+esc(t('tt_down'))+'"><span class="d"></span>'+t('b_down')+'</span>';
+  if(e.ntlm_version=="NTLMv1") return '<span class="badge b-bad"'+ti+'><span class="d"></span>'+t('b_v1')+'</span>'+fb;
+  if(e.ntlm_version=="NTLMv2") return '<span class="badge b-old"'+ti+'><span class="d"></span>'+t('b_v2')+'</span>'+fb;
+  if(e.kind=="krbfail")        return '<span class="badge b-old" title="'+esc(t('tt_krbfail')+(e.failure_code?' ('+e.failure_code+')':''))+'"><span class="d"></span>'+t('b_krbfail')+'</span>';
+  if(e.kind=="kerberos")       return '<span class="badge b-good"'+ti+'><span class="d"></span>'+t('b_krb')+'</span>';
+  if(e.kind=="domain")         return '<span class="badge b-neut"'+ti+'><span class="d"></span>'+t('b_dom')+'</span>';
+  if(e.kind=="outgoing")       return '<span class="badge b-neut"'+ti+'><span class="d"></span>'+t('b_out')+'</span>';
+  if(e.kind=="incoming")       return '<span class="badge b-neut"'+ti+'><span class="d"></span>'+t('b_in')+'</span>';
+  return '<span class="soft"'+ti+'>NTLM</span>';
 }
 // LmCompatibilityLevel: which NTLM versions the machine still permits.
 // 5 = NTLMv2 only (target state), 0-2 still accept the ancient LM/NTLMv1
@@ -1506,6 +1647,17 @@ function octCell(a){
   if(cg==='off')
     return '<span class="badge b-old" title="'+esc(t('tt_oct_aff'))+'"><span class="d"></span>'+t('oct_aff')+'</span>';
   return '<span class="badge b-neut" title="'+esc(t('tt_oct_unk'))+'"><span class="d"></span>'+t('oct_unk')+'</span>';
+}
+
+// NTLM/Operational log size: the OS default (~1 MB) rolls over quickly once
+// incoming auditing is on - events would then be lost between two poll cycles.
+function logSizeBadge(a){
+  const v = a.ntlm_log_kb;
+  if (v === null || v === undefined || v === '') return '';
+  const kb = (v === 'unset') ? 1028 : parseInt(v, 10);
+  if (isNaN(kb) || kb >= 16384) return '';
+  const label = (v === 'unset') ? t('log_default') : Math.round(kb/1024*10)/10 + ' MB';
+  return ' <span class="badge b-old" title="'+esc(t('tt_logsize'))+'"><span class="d"></span>'+t('b_logsize')+' ('+label+')</span>';
 }
 
 function lmCell(v){
@@ -1567,11 +1719,15 @@ function logonTypeText(v){
   return k ? n + ' – ' + t(k) : n;
 }
 
+// One-sentence explanation per event ID - shown in the detail view and as a
+// hover on the kind badge, so nobody has to look IDs up elsewhere.
+const eidText = id => tOr('eid_' + id, '');
+
 function evDetailRow(e, id){
   if(!openEvents.has(id)) return '';
   const rows = [
     ['d_log',   e.log],
-    ['d_eid',   e.event_id],
+    ['d_eid',   e.event_id + (eidText(e.event_id) ? ' – ' + eidText(e.event_id) : '')],
     ['d_rid',   e.record_id],
     ['d_time',  (e.event_time||'').replace('T',' ')],
     ['d_comp',  e.source],
@@ -1589,6 +1745,8 @@ function evDetailRow(e, id){
     ['d_reason',e.reason],
     ['d_mic',   e.mic],
     ['d_epa',   e.epa],
+    ['d_os',    e.server_os],
+    ['d_fcode', e.failure_code],
   ].filter(r => r[1] !== null && r[1] !== undefined && r[1] !== '');
   const grid = rows.map(r =>
     '<div class="dlab">'+t(r[0])+'</div><div class="dval">'+esc(r[1])+'</div>').join('');
@@ -1683,7 +1841,7 @@ async function load(){
     $('#v1sso').innerHTML = v1s.map(x=>`<tr class="${x.st==='erledigt'?'row-done':''}">
         <td class="strong">${esc(x.user)}</td>
         <td>${esc(x.target)}</td>
-        <td class="num-cell">${x.n}</td>
+        <td class="num-cell">${x.n}${blockedBadge(x.blocked)}</td>
         <td>${x.blocked
               ? '<span class="badge b-neut"><span class="d"></span>'+t('st_blocked')+'</span>'
               : '<span class="badge b-bad"><span class="d"></span>'+t('st_used')+'</span>'}</td>
@@ -1722,7 +1880,7 @@ async function load(){
     $('#incoming').innerHTML = inc.map(x=>`<tr class="${x.st==='erledigt'?'row-done':''}">
         <td class="strong">${esc(x.machine)}</td>
         <td>${esc(x.process)}</td>
-        <td class="num-cell">${x.n}</td>
+        <td class="num-cell">${x.n}${blockedBadge(x.blocked)}</td>
         <td class="soft">${x.users}</td>
         <td>${stSel(x.key,x.st)}${againBadge(x)}</td>
         <td class="soft mono">${when(x.last_seen)}</td></tr>`).join('');
@@ -1734,6 +1892,17 @@ async function load(){
   // Target + badge share a flex wrapper: side by side on one line, and when
   // the cell is too narrow the badge wraps cleanly left-aligned underneath
   // instead of dangling indented.
+  // Blocked events (enforce policy active): shown as a red badge behind the
+  // count - these rows are an alarm/success signal, not a to-do anymore.
+  // Accepts a count (aggregates) or a boolean (v1sso panel, where 4025 marks
+  // the blocked variant) - booleans render without a number.
+  const blockedBadge = v => {
+    if (!v) return '';
+    const num = (typeof v === 'number') ? v + ' ' : '';
+    return ' <span class="badge b-bad b-inline" title="'+esc(t('tt_blocked'))+'"><span class="d"></span>'
+      + num + t('b_blocked') + '</span>';
+  };
+
   const ipBadge = tgt => targetIsIp(tgt)
     ? '<span class="badge b-bad b-inline" title="'+esc(t('tt_ip'))+'"><span class="d"></span>'+t('b_ip')+'</span>'
     : '';
@@ -1745,7 +1914,7 @@ async function load(){
     ? d.blockers.map(b=>`<tr class="${b.st==='erledigt'?'row-done':''}">
         <td class="strong">${esc(b.process)}${hintBtn(b.key)}</td>
         <td>${tgtCell(b.target)}</td>
-        <td class="num-cell">${b.n}</td>
+        <td class="num-cell">${b.n}${blockedBadge(b.blocked)}</td>
         <td>${userList(b.who)}</td>
         <td class="soft">${b.sources}</td>
         <td>${stSel(b.key,b.st)}${againBadge(b)}</td>
@@ -1757,7 +1926,7 @@ async function load(){
         <td class="strong">${esc(x.workstation)}${hintBtn(x.key)}</td>
         <td>${tgtCell(x.target)}</td>
         <td>${userList(x.who)}</td>
-        <td class="num-cell">${x.n}</td>
+        <td class="num-cell">${x.n}${blockedBadge(x.blocked)}</td>
         <td>${stSel(x.key,x.st)}${againBadge(x)}</td>
         <td class="soft mono">${when(x.last_seen)}</td></tr>`+hintRow(x.key,6,t('hint_dom'))).join('')
     : '<tr><td colspan="6" class="empty">'+t('empty_domain')+'</td></tr>';
@@ -1807,7 +1976,7 @@ async function load(){
         <td class="strong">${esc(a.source)}</td>
         <td class="soft">${a.is_dc?t('type_dc'):t('type_member')}</td>
         <td>${heartbeat(a.last_seen)}</td>
-        <td>${auditCell(a)}</td>
+        <td>${auditCell(a)}${logSizeBadge(a)}</td>
         <td>${lmCell(a.lm_level)}</td>
         <td>${octCell(a)}</td>
         <td class="num-cell">${a.events}</td>
