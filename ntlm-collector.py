@@ -881,6 +881,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .num-cell{text-align:right;font-family:var(--mono);font-variant-numeric:tabular-nums;color:var(--ink)}
   .empty{padding:30px 18px;text-align:center;color:var(--faint);font-size:13px}
 
+  .btn{background:#1c2430;border:1px solid #2e3a4a;color:#c6d4e2;border-radius:7px;
+       padding:6px 14px;font:inherit;font-size:13px;cursor:pointer;margin-top:8px}
+  .btn:hover{background:#243044}
+  .excbox{margin-top:10px;background:#0d1218;border:1px solid #2e3a4a;border-radius:9px;padding:12px}
+  .excbox textarea{width:100%;box-sizing:border-box;background:#0a0e13;color:#d8e4ef;
+       border:1px solid #26303d;border-radius:7px;padding:9px;font-family:ui-monospace,monospace;
+       font-size:12.5px;resize:vertical;margin:6px 0}
   .tgtwrap{display:inline-flex;align-items:center;gap:10px;white-space:nowrap}
   .badge.b-inline{padding:3px 11px;gap:7px}
   .badge{display:inline-flex;align-items:center;gap:6px;padding:3px 9px;border-radius:6px;
@@ -1084,6 +1091,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <div class="head">
       <h2><span class="badge b-bad"><span class="d"></span></span> <span data-i18n="prog_h">Programs still using NTLM</span></h2>
       <p data-i18n="prog_p">These programs authenticate outward via NTLM. Before disabling NTLM they should be reviewed or reconfigured. "Kernel: SMB/HTTP.sys" means the request came from kernel mode (PID 4) – file shares, but also WinRM, ADWS, SSRS or the Remote Desktop Gateway. No single program can be named there.</p>
+      <button class="btn" onclick="toggleExc('out')" data-i18n="btn_exc">Generate exception list</button>
+      <div id="excbox-out" class="excbox" style="display:none">
+        <p class="soft"><span data-i18n="exc_gpo_out">Paste into: Network security: Restrict NTLM: Add remote server exceptions for NTLM authentication</span> · <span class="exc-count mono">0</span> <span data-i18n="exc_entries">entries (open items only)</span></p>
+        <textarea rows="6" readonly spellcheck="false"></textarea>
+        <button class="btn" onclick="copyExc('out', this)" data-i18n="exc_copy">Copy</button>
+        <p class="soft" data-i18n="exc_note">An exception is a stay of execution, not a fix — keep working the list down.</p>
+      </div>
     </div>
     <div class="scroll">
       <table>
@@ -1098,6 +1112,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <div class="head">
       <h2 data-i18n="dom_h">Who uses NTLM – and where to</h2>
       <p data-i18n="dom_p">Reported by the domain controller: which computer connects to which server via NTLM. The most reliable overall view – even when no program name can be determined.</p>
+      <button class="btn" onclick="toggleExc('dom')" data-i18n="btn_exc">Generate exception list</button>
+      <div id="excbox-dom" class="excbox" style="display:none">
+        <p class="soft"><span data-i18n="exc_gpo_dom">Paste into: Network security: Restrict NTLM: Add server exceptions in this domain (on the DCs)</span> · <span class="exc-count mono">0</span> <span data-i18n="exc_entries">entries (open items only)</span></p>
+        <textarea rows="6" readonly spellcheck="false"></textarea>
+        <button class="btn" onclick="copyExc('dom', this)" data-i18n="exc_copy">Copy</button>
+        <p class="soft" data-i18n="exc_note">An exception is a stay of execution, not a fix — keep working the list down.</p>
+      </div>
     </div>
     <div class="scroll">
       <table>
@@ -1265,6 +1286,11 @@ de: {
   lt9:'Neue Anmeldeinformationen (runas /netonly)', lt10:'Remoteinteraktiv (RDP)',
   lt11:'Zwischengespeichert interaktiv (gespeicherte Domänenanmeldung)',
   lt12:'Zwischengespeichert remoteinteraktiv', lt13:'Zwischengespeichertes Entsperren',
+  btn_exc:'Ausnahmeliste erzeugen', exc_copy:'Kopieren', exc_copied:'Kopiert!',
+  exc_entries:'Einträge (nur offene)', exc_empty:'Keine offenen Einträge – nichts zu tun.',
+  exc_gpo_out:'Einfügen in: Netzwerksicherheit: NTLM einschränken: Remoteserverausnahmen für die NTLM-Authentifizierung hinzufügen',
+  exc_gpo_dom:'Einfügen in: Netzwerksicherheit: NTLM einschränken: Serverausnahmen in dieser Domäne hinzufügen (auf den DCs)',
+  exc_note:'Eine Ausnahme ist ein Aufschub, kein Fix – die Liste weiter abarbeiten.',
   b_krbfail:'Kerberos-Fehlschlag',
   tt_krbfail:'Kerberos wurde versucht und scheiterte – der Fehlercode nennt die Ursache. Auf Systemen ohne die 2025er-Ereignisse ist das die Frühwarnung vor NTLM-Fallback.',
   d_fcode:'Kerberos-Fehlercode',
@@ -1437,6 +1463,11 @@ en: {
   lt9:'New credentials (runas /netonly)', lt10:'Remote interactive (RDP)',
   lt11:'Cached interactive (stored domain logon)',
   lt12:'Cached remote interactive', lt13:'Cached unlock',
+  btn_exc:'Generate exception list', exc_copy:'Copy', exc_copied:'Copied!',
+  exc_entries:'entries (open items only)', exc_empty:'No open items - nothing to do.',
+  exc_gpo_out:'Paste into: Network security: Restrict NTLM: Add remote server exceptions for NTLM authentication',
+  exc_gpo_dom:'Paste into: Network security: Restrict NTLM: Add server exceptions in this domain (on the DCs)',
+  exc_note:'An exception is a stay of execution, not a fix - keep working the list down.',
   b_krbfail:'Kerberos failure',
   tt_krbfail:'Kerberos was attempted and failed - the failure code names the cause. On systems without the 2025 events this is the early warning before NTLM fallback.',
   d_fcode:'Kerberos failure code',
@@ -1812,6 +1843,59 @@ function buildParams(){
   return p;
 }
 
+// --- GPO exception-list generator -------------------------------------------
+// Turns the still-open rows into a paste-ready server list for the two
+// "Restrict NTLM" exception policies. An exception is a stay of execution,
+// not a fix - the note in the box says so.
+function excName(target){
+  if(!target) return null;
+  let v = String(target).trim();
+  if(v.startsWith('(')) return null;                 // placeholders
+  const i = v.indexOf('/');
+  if(i > 0) v = v.slice(i + 1);                      // strip SPN class (cifs/, TERMSRV/...)
+  v = v.replace(/\\/g, '').trim();
+  return v || null;
+}
+
+function buildExceptions(which){
+  if(!LAST) return [];
+  const rows = (which === 'out') ? (LAST.blockers || []) : (LAST.domain || []);
+  const seen = new Set(); const out = [];
+  rows.forEach(r => {
+    if(r.st === 'erledigt') return;                  // fixed -> no exception needed
+    const n = excName(r.target);
+    if(!n) return;
+    const k = n.toLowerCase();
+    if(seen.has(k)) return;
+    seen.add(k); out.push(n);
+  });
+  return out.sort((a, b) => a.localeCompare(b));
+}
+
+function toggleExc(which){
+  const box = document.getElementById('excbox-' + which);
+  if(box.style.display !== 'none'){ box.style.display = 'none'; return; }
+  const list = buildExceptions(which);
+  const ta = box.querySelector('textarea');
+  ta.value = list.length ? list.join('\n') : t('exc_empty');
+  box.querySelector('.exc-count').textContent = list.length;
+  box.style.display = '';
+}
+
+function copyExc(which, btn){
+  const ta = document.querySelector('#excbox-' + which + ' textarea');
+  ta.select();
+  const done = () => { btn.textContent = t('exc_copied');
+                       setTimeout(() => { btn.textContent = t('exc_copy'); }, 1500); };
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(ta.value).then(done, () => { document.execCommand('copy'); done(); });
+  } else { document.execCommand('copy'); done(); }
+}
+
+// Last successful API payload - the exception-list generator reads from it so
+// it always reflects exactly what the tables show (same filters, same range).
+let LAST = null;
+
 async function load(){
   // Do not re-render while a status field is being operated
   const ae = document.activeElement;
@@ -1825,6 +1909,7 @@ async function load(){
     d = await r.json();
   }
   catch(e){ return; }
+  LAST = d;
 
   $('#s-total').textContent = d.stats.total;
   $('#s-v1').textContent = d.stats.v1;
