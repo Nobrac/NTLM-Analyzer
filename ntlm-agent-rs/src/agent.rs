@@ -619,6 +619,7 @@ fn map_8003(e: &RawEvent) -> Option<Event> {
         domain: nonempty(1),
         workstation: nonempty(2),
         process,
+        process_path,
         logon_type: nonempty(5).filter(|s| s.chars().all(|c| c.is_ascii_digit())),
         ..Default::default()
     })
