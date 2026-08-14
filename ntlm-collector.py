@@ -107,6 +107,12 @@ CREATE TABLE IF NOT EXISTS agents (
     block_v1sso     TEXT,          -- BlockNtlmv1SSO: audit/enforce/unset
     cred_guard      TEXT,          -- Credential Guard: on/off/unknown (aus der Registry)
     ntlm_log_kb     TEXT,          -- Maximalgröße des NTLM/Operational-Logs in KB
+    os_version      TEXT,          -- Produktname + Build der meldenden Maschine
+    restrict_out    TEXT,          -- Deny-Richtlinien: allow/deny-accounts/deny-all
+    restrict_in     TEXT,
+    restrict_dom    TEXT,
+    exc_client      TEXT,          -- bereits konfigurierte GPO-Ausnahmelisten
+    exc_dc          TEXT,
     last_seen       TEXT
 );
 """
@@ -162,7 +168,8 @@ def normalize_process(p):
 FIELDS = ("record_id", "log", "event_id", "kind", "event_time", "user",
           "domain", "ntlm_version", "process", "target_server",
           "workstation", "ip", "logon_type", "enc_type", "auth_method",
-          "reason", "reason_id", "mic", "epa", "server_os", "failure_code")
+          "reason", "reason_id", "mic", "epa", "server_os", "failure_code",
+          "process_path")
 
 
 def init_db(path):
@@ -172,7 +179,9 @@ def init_db(path):
     have = {r[1] for r in conn.execute("PRAGMA table_info(events)").fetchall()}
     # agents-Tabelle nachziehen (aeltere Installationen kennen lm_level nicht)
     have_a = {r[1] for r in conn.execute("PRAGMA table_info(agents)")}
-    for col in ("lm_level", "block_v1sso", "cred_guard", "ntlm_log_kb"):
+    for col in ("lm_level", "block_v1sso", "cred_guard", "ntlm_log_kb",
+                "os_version", "restrict_out", "restrict_in", "restrict_dom",
+                "exc_client", "exc_dc"):
         if have_a and col not in have_a:
             conn.execute(f"ALTER TABLE agents ADD COLUMN {col} TEXT")
     # Bestandsdaten: Prozessnamen ohne Endung angleichen (einmalig wirksam,
@@ -186,7 +195,8 @@ def init_db(path):
     # SYSTEM faelschlich zu SYSTEM.exe gemacht - es gibt keinen solchen Prozess.
     conn.execute("UPDATE events SET process = substr(process, 1, length(process)-4) "
                  "WHERE LOWER(process) = 'system.exe'")
-    for col in ("enc_type", "auth_method", "reason", "reason_id", "mic", "epa", "server_os", "failure_code"):
+    for col in ("enc_type", "auth_method", "reason", "reason_id", "mic", "epa",
+                "server_os", "failure_code", "process_path"):
         if col not in have:
             conn.execute(f"ALTER TABLE events ADD COLUMN {col} TEXT")
     # Indexes for the dashboard queries (time-range filter, aggregates).
@@ -431,18 +441,25 @@ class Handler(BaseHTTPRequestHandler):
         with DB_LOCK:
             self.server.conn.execute(
                 "INSERT INTO agents (source,is_dc,agent_version,outgoing_audit,"
-                "incoming_audit,domain_audit,lm_level,block_v1sso,cred_guard,ntlm_log_kb,last_seen) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?) "
+                "incoming_audit,domain_audit,lm_level,block_v1sso,cred_guard,ntlm_log_kb,"
+                "os_version,restrict_out,restrict_in,restrict_dom,exc_client,exc_dc,"
+                "last_seen) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(source) DO UPDATE SET is_dc=excluded.is_dc, "
                 "agent_version=excluded.agent_version, outgoing_audit=excluded.outgoing_audit, "
                 "incoming_audit=excluded.incoming_audit, domain_audit=excluded.domain_audit, "
                 "lm_level=excluded.lm_level, block_v1sso=excluded.block_v1sso, "
                 "cred_guard=excluded.cred_guard, ntlm_log_kb=excluded.ntlm_log_kb, "
+                "os_version=excluded.os_version, restrict_out=excluded.restrict_out, "
+                "restrict_in=excluded.restrict_in, restrict_dom=excluded.restrict_dom, "
+                "exc_client=excluded.exc_client, exc_dc=excluded.exc_dc, "
                 "last_seen=excluded.last_seen",
                 (source, 1 if p.get("is_dc") else 0, p.get("agent_version"),
                  p.get("outgoing_audit"), p.get("incoming_audit"),
                  p.get("domain_audit"), p.get("lm_level"), p.get("block_v1sso"),
-                 p.get("cred_guard"), p.get("ntlm_log_kb"), now))
+                 p.get("cred_guard"), p.get("ntlm_log_kb"),
+                 p.get("os_version"), p.get("restrict_out"), p.get("restrict_in"),
+                 p.get("restrict_dom"), p.get("exc_client"), p.get("exc_dc"), now))
             self.server.conn.commit()
         return True
 
@@ -474,6 +491,7 @@ class Handler(BaseHTTPRequestHandler):
                 e.get("epa"),
                 e.get("server_os"),
                 e.get("failure_code"),
+                e.get("process_path"),
                 now,
             ))
         if not rows:
@@ -536,7 +554,8 @@ class Handler(BaseHTTPRequestHandler):
         cols = ["event_time", "source", "kind", "event_id", "ntlm_version",
                 "auth_method", "user", "domain", "process", "target_server",
                 "workstation", "ip", "logon_type", "enc_type", "reason",
-                "reason_id", "mic", "epa", "server_os", "failure_code"]
+                "reason_id", "mic", "epa", "server_os", "failure_code",
+                "process_path"]
         with DB_LOCK:
             rows = self.server.conn.execute(
                 f"SELECT {','.join(cols)} FROM events{clause} "
@@ -553,7 +572,7 @@ class Handler(BaseHTTPRequestHandler):
                     "Auth path", "User", "Domain", "Process", "Target",
                     "Source/Workstation", "IP", "Logon type", "Encryption",
                     "Reason", "Reason ID", "MIC", "Channel binding", "Server OS",
-                    "Kerberos failure"])
+                    "Kerberos failure", "Process path"])
         for r in rows:
             w.writerow([cell(v) for v in r])
         body = "\ufeff" + buf.getvalue()   # BOM -> Excel erkennt UTF-8
@@ -621,6 +640,33 @@ class Handler(BaseHTTPRequestHandler):
                 f"GROUP BY b ORDER BY b DESC LIMIT 60", tp).fetchall()
             trend = [dict(b=r[0], v1=r[1] or 0, v2=r[2] or 0,
                           other=r[3] or 0, krb=r[4] or 0) for r in reversed(trend_rows)]
+            # Heatmap weekday x hour: batch jobs and maintenance windows are the
+            # stragglers that break a shutdown, and they only show up as a
+            # pattern over time - the daily trend averages them away.
+            # SQLite %w: 0=Sunday..6=Saturday -> shifted to 0=Monday for display.
+            heat_rows = c.execute(
+                f"SELECT CAST(strftime('%w', event_time) AS INTEGER), "
+                f"CAST(strftime('%H', event_time) AS INTEGER), COUNT(*) "
+                f"FROM events WHERE kind != 'kerberos' AND {tf} "
+                f"GROUP BY 1, 2", tp).fetchall()
+            heat = [[0] * 24 for _ in range(7)]
+            for wd, hr, n in heat_rows:
+                if wd is None or hr is None:
+                    continue
+                heat[(wd + 6) % 7][hr] = n
+
+            # Per-program mini time series for the sparklines. Limited to the
+            # programs that actually appear in the blocker table, and bucketed
+            # by day so a short range still yields a usable line.
+            spark_rows = c.execute(
+                f"SELECT process, date(event_time), COUNT(*) "
+                f"FROM events WHERE event_id IN (8001,4001,4020,4021) "
+                f"AND process IS NOT NULL AND {tf} "
+                f"GROUP BY 1, 2 ORDER BY 2", tp).fetchall()
+            spark = {}
+            for proc, day, n in spark_rows:
+                spark.setdefault(proc, []).append([day, n])
+
             top_proc = [dict(name=r[0], n=r[1]) for r in c.execute(
                 f"SELECT process, COUNT(*) "
                 f"FROM events WHERE kind='outgoing' AND process IS NOT NULL AND {tf} "
@@ -738,14 +784,18 @@ class Handler(BaseHTTPRequestHandler):
                            last_seen=r[6], events=r[7] or 0, last_event=r[8],
                            lm_level=r[9], first_event=r[10],
                            block_v1sso=r[11], cred_guard=r[12],
-                           ntlm_log_kb=r[13]) for r in c.execute(
+                           ntlm_log_kb=r[13], os_version=r[14],
+                           restrict_out=r[15], restrict_in=r[16],
+                           restrict_dom=r[17], exc_client=r[18],
+                           exc_dc=r[19]) for r in c.execute(
                 "SELECT a.source, a.is_dc, a.agent_version, a.outgoing_audit, a.incoming_audit, "
                 "a.domain_audit, a.last_seen, "
                 "(SELECT COUNT(*) FROM events e WHERE e.source=a.source), "
                 "(SELECT MAX(event_time) FROM events e WHERE e.source=a.source), "
                 "a.lm_level, "
                 "(SELECT MIN(event_time) FROM events e WHERE e.source=a.source), "
-                "a.block_v1sso, a.cred_guard, a.ntlm_log_kb "
+                "a.block_v1sso, a.cred_guard, a.ntlm_log_kb, a.os_version, "
+                "a.restrict_out, a.restrict_in, a.restrict_dom, a.exc_client, a.exc_dc "
                 "FROM agents a ORDER BY a.last_seen DESC").fetchall()]
 
             # Datenbasis: seit wann liegen ueberhaupt Events vor? Zwei Wochen im
@@ -768,7 +818,7 @@ class Handler(BaseHTTPRequestHandler):
                 params + [limit]).fetchall()
             events = [dict(zip(cols2, r)) for r in rows]
 
-        return {"stats": stats, "v1sso": v1sso, "incoming": incoming, "reasons": reasons, "trend": trend, "trend_bucket": ("hour" if rng == "24h" else "day"),
+        return {"stats": stats, "v1sso": v1sso, "incoming": incoming, "reasons": reasons, "trend": trend, "trend_bucket": ("hour" if rng == "24h" else "day"), "heat": heat, "spark": spark,
                 "top_proc": top_proc, "v1_users": v1_users,
                 "blockers": blockers, "domain": domain, "kerberos": kerberos,
                 "kerberos_accounts": kerberos_accounts,
@@ -881,6 +931,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .num-cell{text-align:right;font-family:var(--mono);font-variant-numeric:tabular-nums;color:var(--ink)}
   .empty{padding:30px 18px;text-align:center;color:var(--faint);font-size:13px}
 
+  .heatwrap{display:grid;grid-template-columns:38px repeat(24,1fr);gap:2px;margin-top:4px}
+  .hcell{height:15px;border-radius:2px;background:#171d26}
+  .hhr{font-size:9px;color:#5d6b7c;text-align:center;line-height:12px}
+  .hday{font-size:11px;color:#8fa0b4;line-height:15px}
+  .sparkrow{display:flex;align-items:center;gap:10px}
+  .sparkrow svg{flex:none}
   .btn{background:#1c2430;border:1px solid #2e3a4a;color:#c6d4e2;border-radius:7px;
        padding:6px 14px;font:inherit;font-size:13px;cursor:pointer;margin-top:8px}
   .btn:hover{background:#243044}
@@ -1038,6 +1094,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <nav class="secnav" id="secnav">
     <span class="navlabel" data-i18n="nav_label">Sections</span>
     <span class="navchip" data-sec="sec-programs"   data-tone="warn" data-i18n="nav_prog">Programs</span>
+    <span class="navchip" data-sec="sec-heat"       data-tone="neut" data-i18n="nav_heat">Timing</span>
     <span class="navchip" data-sec="sec-why"        data-tone="warn" data-i18n="nav_why">Why NTLM</span>
     <span class="navchip" data-sec="sec-incoming"   data-tone="neut" data-i18n="nav_inc">Services</span>
     <span class="navchip" data-sec="sec-v1sso"      data-tone="bad"  data-i18n="nav_v1sso">NTLMv1 SSO</span>
@@ -1072,6 +1129,15 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <div class="trend" id="trend"></div>
   </section>
 
+  <section id="sec-heat">
+    <div class="head">
+      <h2 data-i18n="heat_h">When NTLM happens</h2>
+      <p data-i18n="heat_p">Weekday against hour of day. Batch jobs, maintenance windows and weekend scripts are the stragglers that break a shutdown — as a single figure they hide in the daily trend, as a pattern they stand out.</p>
+    </div>
+    <div id="heatwrap" class="heatwrap"></div>
+    <p id="heathint" class="coverage"></p>
+  </section>
+
   <!-- NTLMv1 SSO: hard October 2026 deadline (Server 2025 / Win11 24H2) -->
   <section id="sec-v1sso" style="display:none">
     <div class="head">
@@ -1101,7 +1167,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     </div>
     <div class="scroll">
       <table>
-        <thead><tr><th data-i18n="th_prog">Program</th><th data-i18n="th_target">Target server</th><th data-i18n="th_count">Count</th><th data-i18n="th_users">Users</th><th data-i18n="th_comps">Computers (no.)</th><th data-i18n="th_status">Status</th><th data-i18n="th_last">Last seen</th></tr></thead>
+        <thead><tr><th data-i18n="th_prog">Program</th><th data-i18n="th_target">Target server</th><th data-i18n="th_count">Count</th><th data-i18n="th_trend2" data-i18n-title="tt_th_trend" title="">Trend</th><th data-i18n="th_users">Users</th><th data-i18n="th_comps">Computers (no.)</th><th data-i18n="th_status">Status</th><th data-i18n="th_last">Last seen</th></tr></thead>
         <tbody id="blockers"></tbody>
       </table>
     </div>
@@ -1293,6 +1359,7 @@ de: {
   exc_note:'Eine Ausnahme ist ein Aufschub, kein Fix – die Liste weiter abarbeiten.',
   b_krbfail:'Kerberos-Fehlschlag',
   tt_krbfail:'Kerberos wurde versucht und scheiterte – der Fehlercode nennt die Ursache. Auf Systemen ohne die 2025er-Ereignisse ist das die Frühwarnung vor NTLM-Fallback.',
+  d_ppath:'Programmpfad',
   d_fcode:'Kerberos-Fehlercode',
   rid_k0x6:'Kerberos: Konto unbekannt (0x6)',
   rid_k0x7:'Kerberos: SPN nicht gefunden (0x7)',
@@ -1334,6 +1401,17 @@ de: {
   tt_th_aud:'Welche Audit-Richtlinien auf der Maschine aktiv sind – ohne sie liefert sie keine Daten.',
   tt_th_tickets:'Anzahl der Kerberos-Servicetickets (4769) für dieses Konto im Zeitraum.',
   b_blocked:'blockiert', tt_blocked:'Eine Deny-Richtlinie hat diese Authentifizierung bereits verhindert (Ereignis 4001–4006). Das ist keine Aufgabe mehr, sondern Erfolgskontrolle – oder ein Alarm, falls unbeabsichtigt.',
+  nav_heat:'Zeitmuster', heat_h:'Wann NTLM passiert',
+  heat_p:'Wochentag gegen Tagesstunde. Batch-Jobs, Wartungsfenster und Wochenend-Skripte sind die Nachzügler, die eine Abschaltung sprengen – als Einzelzahl verstecken sie sich im Tagestrend, als Muster fallen sie auf.',
+  heat_cell:'{d} {h}:00 – {n} Ereignisse', heat_peak:'Spitze: {d} {h}:00 Uhr mit {n} Ereignissen – bei ungewöhnlichen Zeiten lohnt der Blick auf geplante Aufgaben und Dienste.',
+  d_mon:'Mo', d_tue:'Di', d_wed:'Mi', d_thu:'Do', d_fri:'Fr', d_sat:'Sa', d_sun:'So',
+  th_trend2:'Verlauf', spark_tt:'Verlauf über {n} Tage – fallend ist gut, steigend heißt: hier kommt Neues dazu.',
+  tt_th_trend:'Entwicklung dieser Zeile über den gewählten Zeitraum. Eine steigende Linie trotz sinkendem Gesamttrend ist die Zeile, die man zuerst anfasst.',
+  b_os_old:'keine 40xx', tt_os_old:'Dieses System ist älter als Server 2025 / Windows 11 24H2 und kennt die erweiterten 40xx-Ereignisse nicht. Die Ursachenanalyse läuft hier über fehlgeschlagene Kerberos-Anfragen.',
+  r_out:'Ausgehend', r_in:'Eingehend', r_dom:'Domäne',
+  tt_restrict:'Eine Deny-Richtlinie ist aktiv – diese Maschine blockiert NTLM bereits. „deny-accounts" betrifft Konten, „deny-all" alles.',
+  b_exc_cfg:'{n} Ausnahmen konfiguriert',
+  tt_exc_cfg:'Bereits in der Gruppenrichtlinie eingetragene Ausnahmen:',
   b_logsize:'Log klein', log_default:'Standard, ~1 MB',
   tt_logsize:'Das NTLM/Operational-Log ist kleiner als 16 MB. Bei aktivem eingehendem Audit kann es zwischen zwei Abfragen überrollen – Ereignisse gehen dann verloren. Vergrößern mit: wevtutil sl Microsoft-Windows-NTLM/Operational /ms:20971520',
   d_os:'Server-Betriebssystem',
@@ -1470,6 +1548,7 @@ en: {
   exc_note:'An exception is a stay of execution, not a fix - keep working the list down.',
   b_krbfail:'Kerberos failure',
   tt_krbfail:'Kerberos was attempted and failed - the failure code names the cause. On systems without the 2025 events this is the early warning before NTLM fallback.',
+  d_ppath:'Program path',
   d_fcode:'Kerberos failure code',
   rid_k0x6:'Kerberos: account unknown (0x6)',
   rid_k0x7:'Kerberos: SPN not found (0x7)',
@@ -1511,6 +1590,17 @@ en: {
   tt_th_aud:'Which audit policies are active on the machine - without them it delivers no data.',
   tt_th_tickets:'Number of Kerberos service tickets (4769) for this account in the range.',
   b_blocked:'blocked', tt_blocked:'A deny policy already prevented this authentication (event 4001-4006). No longer a to-do but a success check - or an alarm if unintended.',
+  nav_heat:'Timing', heat_h:'When NTLM happens',
+  heat_p:'Weekday against hour of day. Batch jobs, maintenance windows and weekend scripts are the stragglers that break a shutdown - as a single figure they hide in the daily trend, as a pattern they stand out.',
+  heat_cell:'{d} {h}:00 - {n} events', heat_peak:'Peak: {d} at {h}:00 with {n} events - for unusual hours it is worth checking scheduled tasks and services.',
+  d_mon:'Mon', d_tue:'Tue', d_wed:'Wed', d_thu:'Thu', d_fri:'Fri', d_sat:'Sat', d_sun:'Sun',
+  th_trend2:'Trend', spark_tt:'Trend across {n} days - falling is good, rising means something new is coming in.',
+  tt_th_trend:'How this row developed over the selected range. A rising line despite a falling overall trend is the row to tackle first.',
+  b_os_old:'no 40xx', tt_os_old:'This system predates Server 2025 / Windows 11 24H2 and does not know the enhanced 40xx events. Cause analysis here runs on failed Kerberos requests instead.',
+  r_out:'Outgoing', r_in:'Incoming', r_dom:'Domain',
+  tt_restrict:'A deny policy is active - this machine already blocks NTLM. "deny-accounts" covers accounts, "deny-all" covers everything.',
+  b_exc_cfg:'{n} exceptions configured',
+  tt_exc_cfg:'Exceptions already present in Group Policy:',
   b_logsize:'log small', log_default:'default, ~1 MB',
   tt_logsize:'The NTLM/Operational log is smaller than 16 MB. With incoming auditing enabled it can roll over between two polls - events are then lost. Enlarge with: wevtutil sl Microsoft-Windows-NTLM/Operational /ms:20971520',
   d_os:'Server OS',
@@ -1680,6 +1770,42 @@ function octCell(a){
   return '<span class="badge b-neut" title="'+esc(t('tt_oct_unk'))+'"><span class="d"></span>'+t('oct_unk')+'</span>';
 }
 
+// OS line under the machine type. Also decides whether the enhanced 40xx
+// events can exist here at all - build 26100+ (Server 2025 / Win11 24H2).
+function osLine(a){
+  if(!a.os_version) return '';
+  const m = String(a.os_version).match(/\((\d+)\)\s*$/);
+  const build = m ? parseInt(m[1], 10) : null;
+  const old = (build !== null && build < 26100);
+  const hint = old ? ' <span class="badge b-neut" title="'+esc(t('tt_os_old'))+'">'+t('b_os_old')+'</span>' : '';
+  return '<div class="soft mono" style="font-size:11.5px;margin-top:3px">'+esc(a.os_version)+hint+'</div>';
+}
+
+// Restriction (deny) policies - the counterpart to the audit badges. Only shown
+// when something is actually restricted; "allow" everywhere needs no badge.
+function restrictBadges(a){
+  const map = [['restrict_out','r_out'], ['restrict_in','r_in'], ['restrict_dom','r_dom']];
+  let out = '';
+  map.forEach(([k, lbl]) => {
+    const v = a[k];
+    if(!v || v === 'allow') return;
+    const cls = (v === 'deny-all') ? 'b-bad' : 'b-old';
+    out += ' <span class="badge '+cls+'" title="'+esc(t('tt_restrict'))+'"><span class="d"></span>'
+         + t(lbl) + ': ' + esc(v) + '</span>';
+  });
+  return out;
+}
+
+// Exception lists already configured in policy on this machine.
+function excBadge(a){
+  const n = ['exc_client','exc_dc'].reduce((acc, k) =>
+      acc + (a[k] ? String(a[k]).split(',').filter(x => x.trim()).length : 0), 0);
+  if(!n) return '';
+  const all = ['exc_client','exc_dc'].map(k => a[k]).filter(Boolean).join(', ');
+  return ' <span class="badge b-neut" title="'+esc(t('tt_exc_cfg')+' '+all)+'">'
+       + t('b_exc_cfg').replace('{n}', n) + '</span>';
+}
+
 // NTLM/Operational log size: the OS default (~1 MB) rolls over quickly once
 // incoming auditing is on - events would then be lost between two poll cycles.
 function logSizeBadge(a){
@@ -1778,6 +1904,7 @@ function evDetailRow(e, id){
     ['d_epa',   e.epa],
     ['d_os',    e.server_os],
     ['d_fcode', e.failure_code],
+    ['d_ppath', e.process_path],
   ].filter(r => r[1] !== null && r[1] !== undefined && r[1] !== '');
   const grid = rows.map(r =>
     '<div class="dlab">'+t(r[0])+'</div><div class="dval">'+esc(r[1])+'</div>').join('');
@@ -1843,6 +1970,62 @@ function buildParams(){
   return p;
 }
 
+// Heatmap weekday x hour. Intensity is relative to the busiest cell, so a
+// quiet environment still shows its pattern instead of a uniformly dark grid.
+function renderHeat(heat){
+  const wrap = document.getElementById('heatwrap');
+  const hint = document.getElementById('heathint');
+  const sec  = document.getElementById('sec-heat');
+  if(!wrap) return;
+  const rows = heat || [];
+  const max = rows.reduce((m,r) => Math.max(m, ...r), 0);
+  sec.style.display = max > 0 ? '' : 'none';
+  if(!max){ wrap.innerHTML = ''; hint.textContent = ''; return; }
+
+  const days = ['d_mon','d_tue','d_wed','d_thu','d_fri','d_sat','d_sun'];
+  let html = '<div></div>';
+  for(let h = 0; h < 24; h++) html += '<div class="hhr">' + (h % 6 === 0 ? h : '') + '</div>';
+  rows.forEach((row, di) => {
+    html += '<div class="hday">' + t(days[di]) + '</div>';
+    row.forEach((n, h) => {
+      const a = n ? (0.16 + (n / max) * 0.84).toFixed(2) : 0;
+      const bg = n ? 'rgba(224,122,95,' + a + ')' : '';
+      const ti = t('heat_cell').replace('{d}', t(days[di]))
+                              .replace('{h}', String(h).padStart(2,'0'))
+                              .replace('{n}', n);
+      html += '<div class="hcell" style="' + (bg ? 'background:' + bg : '') + '" title="' + esc(ti) + '"></div>';
+    });
+  });
+  wrap.innerHTML = html;
+
+  // Name the single busiest slot - that is usually the batch job worth hunting.
+  let bd = 0, bh = 0;
+  rows.forEach((row, di) => row.forEach((n, h) => { if(n > rows[bd][bh]){ bd = di; bh = h; } }));
+  const off = rows[bd][bh];
+  hint.innerHTML = '<span class="warn">' + esc(t('heat_peak')
+      .replace('{d}', t(days[bd])).replace('{h}', String(bh).padStart(2,'0'))
+      .replace('{n}', off)) + '</span>';
+}
+
+// Sparkline for one program: shows whether this specific row is shrinking or
+// growing. A rising line inside a falling overall trend is the row to attack.
+function sparkline(series){
+  if(!series || series.length < 2) return '';
+  const vals = series.map(x => x[1]);
+  const max = Math.max(...vals), w = 96, h = 20;
+  const pts = vals.map((v, i) =>
+      (i * (w / (vals.length - 1))).toFixed(1) + ',' + (h - (max ? v / max : 0) * (h - 3)).toFixed(1)
+  ).join(' ');
+  const delta = vals[vals.length - 1] - vals[0];
+  const col = delta < 0 ? '#4ea87b' : (delta > 0 ? '#e0644f' : '#7c8b9d');
+  const lbl = (delta > 0 ? '+' : '') + delta;
+  const ti = t('spark_tt').replace('{n}', vals.length);
+  return '<span class="sparkrow" title="' + esc(ti) + '">'
+       + '<svg width="' + w + '" height="' + h + '" aria-hidden="true"><polyline fill="none" stroke="' + col
+       + '" stroke-width="1.7" stroke-linejoin="round" stroke-linecap="round" points="' + pts + '"/></svg>'
+       + '<span class="soft mono" style="color:' + col + ';font-size:12px">' + lbl + '</span></span>';
+}
+
 // --- GPO exception-list generator -------------------------------------------
 // Turns the still-open rows into a paste-ready server list for the two
 // "Restrict NTLM" exception policies. An exception is a stay of execution,
@@ -1857,16 +2040,31 @@ function excName(target){
   return v || null;
 }
 
+// Entries already present in Group Policy on any reporting machine - proposing
+// them again would just inflate the list.
+function alreadyExcepted(){
+  const set = new Set();
+  ((LAST && LAST.agents) || []).forEach(a => {
+    ['exc_client', 'exc_dc'].forEach(k => {
+      if(!a[k]) return;
+      String(a[k]).split(',').map(x => x.trim().toLowerCase())
+                  .filter(Boolean).forEach(x => set.add(x));
+    });
+  });
+  return set;
+}
+
 function buildExceptions(which){
   if(!LAST) return [];
   const rows = (which === 'out') ? (LAST.blockers || []) : (LAST.domain || []);
+  const have = alreadyExcepted();
   const seen = new Set(); const out = [];
   rows.forEach(r => {
     if(r.st === 'erledigt') return;                  // fixed -> no exception needed
     const n = excName(r.target);
     if(!n) return;
     const k = n.toLowerCase();
-    if(seen.has(k)) return;
+    if(seen.has(k) || have.has(k)) return;      // skip what policy already covers
     seen.add(k); out.push(n);
   });
   return out.sort((a, b) => a.localeCompare(b));
@@ -1918,6 +2116,7 @@ async function load(){
   $('#s-src').textContent = d.stats.sources;
   $('#s-proc').textContent = d.stats.procs;
   renderTrend(d.trend, d.trend_bucket);
+  renderHeat(d.heat);
 
   // NTLMv1-SSO: Sektion nur einblenden, wenn es tatsaechlich Funde gibt
   const v1s = d.v1sso || [];
@@ -2000,11 +2199,12 @@ async function load(){
         <td class="strong">${esc(b.process)}${hintBtn(b.key)}</td>
         <td>${tgtCell(b.target)}</td>
         <td class="num-cell">${b.n}${blockedBadge(b.blocked)}</td>
+        <td>${sparkline((LAST.spark||{})[b.process])}</td>
         <td>${userList(b.who)}</td>
         <td class="soft">${b.sources}</td>
         <td>${stSel(b.key,b.st)}${againBadge(b)}</td>
         <td class="soft mono">${when(b.last_seen)}</td></tr>`+hintRow(b.key,7,procHint(b))).join('')
-    : '<tr><td colspan="7" class="empty">'+t('empty_blockers')+'</td></tr>';
+    : '<tr><td colspan="8" class="empty">'+t('empty_blockers')+'</td></tr>';
 
   $('#domain').innerHTML = (d.domain&&d.domain.length)
     ? d.domain.map(x=>`<tr class="${x.st==='erledigt'?'row-done':''}">
@@ -2059,9 +2259,9 @@ async function load(){
   $('#agents').innerHTML = (d.agents&&d.agents.length)
     ? d.agents.map(a=>`<tr>
         <td class="strong">${esc(a.source)}</td>
-        <td class="soft">${a.is_dc?t('type_dc'):t('type_member')}</td>
+        <td class="soft">${a.is_dc?t('type_dc'):t('type_member')}${osLine(a)}</td>
         <td>${heartbeat(a.last_seen)}</td>
-        <td>${auditCell(a)}${logSizeBadge(a)}</td>
+        <td>${auditCell(a)}${logSizeBadge(a)}${restrictBadges(a)}${excBadge(a)}</td>
         <td>${lmCell(a.lm_level)}</td>
         <td>${octCell(a)}</td>
         <td class="num-cell">${a.events}</td>
@@ -2132,6 +2332,7 @@ document.getElementById('csvbtn').addEventListener('click', ()=>{
 // news and worth showing, unlike hiding it entirely.
 const NAV_COUNTS = {
   'sec-programs':          d => (d.blockers||[]).length,
+  'sec-heat':              d => (d.heat||[]).reduce((a,r)=>a+r.reduce((x,y)=>x+(y>0?1:0),0),0),
   'sec-why':               d => (d.reasons||[]).length,
   'sec-incoming':          d => (d.incoming||[]).length,
   'sec-v1sso':             d => (d.v1sso||[]).length,
