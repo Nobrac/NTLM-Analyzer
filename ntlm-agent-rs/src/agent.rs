@@ -33,6 +33,7 @@ const NTLM_CHANNEL: &str =
     r"SOFTWARE\Microsoft\Windows\CurrentVersion\WINEVT\Channels\Microsoft-Windows-NTLM/Operational";
 const DEVGUARD_CG: &str = r"SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\CredentialGuard";
 const NETLOGON: &str = r"SYSTEM\CurrentControlSet\Services\Netlogon\Parameters";
+const WINNT_CV: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion";
 
 // ----------------------------- Datenmodelle -----------------------------
 
@@ -72,6 +73,11 @@ pub struct Event {
     /// found). On systems without the enhanced 40xx events this is the only
     /// early warning for the causes behind NTLM fallback. None on success.
     pub failure_code: Option<String>,
+    /// Full image path when Windows reported one. Grouping still happens by
+    /// file name (see base_name), but for generic names like svchost.exe the
+    /// path is what actually identifies the application. None when the event
+    /// only carried a bare name.
+    pub process_path: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -98,6 +104,20 @@ struct AgentStatus {
     /// cryptography. Read from the registry, so this is the *configured*
     /// value, not proof that it is actually running.
     cred_guard: String,
+    /// Product name and build of the reporting machine. Decides which events
+    /// this machine can produce at all - without it the dashboard cannot tell
+    /// "no 40xx data because too old" from "because auditing is off".
+    os_version: String,
+    /// Restriction (deny) policies, as opposed to the audit ones above:
+    /// allow / deny-accounts / deny-all. Shows which machines already run in
+    /// enforce mode instead of inferring it from blocked events appearing.
+    restrict_out: String,
+    restrict_in: String,
+    restrict_dom: String,
+    /// Exception lists already configured in policy. The generator can then
+    /// point out what is already covered instead of proposing duplicates.
+    exc_client: Option<String>,
+    exc_dc: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -132,6 +152,12 @@ pub fn run_cycle(cfg: &Config) -> Result<(), String> {
         block_v1sso: block_v1sso(),
         cred_guard: cred_guard(),
         ntlm_log_kb: ntlm_log_kb(),
+        os_version: os_version(),
+        restrict_out: restrict_state(LSA, "RestrictSendingNTLMTraffic"),
+        restrict_in: restrict_state(LSA, "RestrictReceivingNTLMTraffic"),
+        restrict_dom: restrict_state(NETLOGON, "RestrictNTLMInDomain"),
+        exc_client: read_multi_sz(LSA, "ClientAllowedNTLMServers"),
+        exc_dc: read_multi_sz(NETLOGON, "DCAllowedNTLMServers"),
     };
     let status_url = format!("{}/status", cfg.collector_url.trim_end_matches('/'));
     match serde_json::to_string(&status) {
@@ -463,6 +489,18 @@ fn map_dc_ntlm(e: &RawEvent) -> Option<Event> {
 }
 
 /// Splits a process path into its bare file name ("C:\\...\\w3wp.exe" -> "w3wp.exe").
+/// Keeps a value only if it looks like a real path (contains a separator).
+/// A bare "lsass.exe" carries no extra information and is dropped so the
+/// detail view does not show a redundant line.
+fn full_path(n: &str) -> Option<String> {
+    let v = n.trim();
+    if v.len() > 3 && (v.contains('\\') || v.contains('/')) && !v.starts_with('(') {
+        Some(v.to_string())
+    } else {
+        None
+    }
+}
+
 fn base_name(n: &str) -> String {
     n.rsplit(['\\', '/']).next().unwrap_or(n).to_string()
 }
@@ -470,6 +508,29 @@ fn base_name(n: &str) -> String {
 /// Picks the process name out of an event: a value that looks like an
 /// executable wins, regardless of its position - the field order of the NTLM
 /// events is not officially documented.
+/// Same selection logic as sniff_process, but returns the raw value so the
+/// full path survives. Kept as its own function to avoid changing the many
+/// existing sniff_process call sites.
+fn sniff_process_raw(e: &RawEvent, fallback_idx: usize) -> Option<String> {
+    let looks_exe = |v: &str| {
+        let l = v.to_lowercase();
+        l.ends_with(".exe") || l.ends_with(".dll") || l.contains('\\')
+    };
+    e.named
+        .values()
+        .chain(e.positional.iter())
+        .map(|s| s.trim())
+        .find(|s| !s.is_empty() && *s != "-" && looks_exe(s))
+        .map(|s| s.to_string())
+        .or_else(|| {
+            e.positional
+                .get(fallback_idx)
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty() && *s != "-")
+                .map(|s| s.to_string())
+        })
+}
+
 fn sniff_process(e: &RawEvent, fallback_idx: usize) -> Option<String> {
     let looks_exe = |v: &str| {
         let l = v.to_lowercase();
@@ -501,6 +562,7 @@ fn map_8002(e: &RawEvent) -> Option<Event> {
 
     // The identity here is the identity of the *calling process*, not the
     // remote user - do not present it as the authenticating account.
+    let process_path = sniff_process_raw(e, 1).as_deref().and_then(full_path);
     let process = sniff_process(e, 1).or_else(|| {
         // PID 4 = kernel mode. Not only SMB: HTTP.sys also runs there, which
         // covers WinRM, ADWS, SSRS and the Remote Desktop Gateway.
@@ -520,6 +582,7 @@ fn map_8002(e: &RawEvent) -> Option<Event> {
         kind: "incoming".to_string(),
         event_time: e.time.clone(),
         process,
+        process_path,
         user: nonempty(3),
         domain: nonempty(4),
         ..Default::default()
@@ -537,6 +600,7 @@ fn map_8003(e: &RawEvent) -> Option<Event> {
         return None;
     }
     let pid = p.get(3).cloned().unwrap_or_default();
+    let process_path = sniff_process_raw(e, 4).as_deref().and_then(full_path);
     let process = sniff_process(e, 4).or_else(|| {
         if pid == "4" {
             Some("(Kernel: SMB/HTTP.sys)".to_string())
@@ -570,7 +634,10 @@ fn map_8001(e: &RawEvent) -> Option<Event> {
     let user = nonempty(6).or_else(|| nonempty(1));
     let domain = nonempty(7).or_else(|| nonempty(2));
 
-    let process_val = match pname {
+    // Keep the full path alongside the grouped file name: for generic names
+    // like svchost.exe the path is what identifies the actual application.
+    let process_path = pname.as_deref().and_then(full_path);
+    let process_val = match &pname {
         Some(n) => {
             let base = n
                 .rsplit(['\\', '/'])
@@ -595,6 +662,7 @@ fn map_8001(e: &RawEvent) -> Option<Event> {
         user,
         domain,
         process: process_val,
+        process_path,
         target_server: target,
         ..Default::default()
     })
@@ -865,10 +933,12 @@ fn map_enhanced(e: &RawEvent) -> Option<Event> {
     }
 
     // Jeweils: gerenderter Text -> XML-Feldname -> Wertmuster.
-    let process = from_message(e, L_PROCESS)
+    let process_raw = from_message(e, L_PROCESS)
         .or_else(|| find_named(e, &["process"]))
         .or_else(|| find_named(e, &["image"]))
         .or_else(|| find_value(e, |s| s.to_lowercase().ends_with(".exe")));
+    let process_path = process_raw.as_deref().and_then(full_path);
+    let process = process_raw.as_deref().map(base_name);
 
     // Target: an SPN is the most informative value (e.g. "TERMSRV/192.0.2.10"
     // zeigt sofort: RDP per IP-Adresse -> deshalb NTLM statt Kerberos).
@@ -930,6 +1000,7 @@ fn map_enhanced(e: &RawEvent) -> Option<Event> {
         epa,
         server_os,
         failure_code: None,
+        process_path,
     })
 }
 
@@ -996,6 +1067,71 @@ fn read_dword(path: &str, name: &str) -> Option<u32> {
 #[cfg(not(windows))]
 fn read_dword(_path: &str, _name: &str) -> Option<u32> {
     None
+}
+
+#[cfg(windows)]
+fn read_sz(path: &str, name: &str) -> Option<String> {
+    use winreg::enums::HKEY_LOCAL_MACHINE;
+    use winreg::RegKey;
+    RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey(path)
+        .ok()
+        .and_then(|k| k.get_value::<String, _>(name).ok())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+#[cfg(not(windows))]
+fn read_sz(_path: &str, _name: &str) -> Option<String> {
+    None
+}
+
+/// Reads a REG_MULTI_SZ (the exception lists are stored that way) and joins the
+/// entries with a comma. Falls back to REG_SZ, because policy editors have been
+/// known to write a single string.
+#[cfg(windows)]
+fn read_multi_sz(path: &str, name: &str) -> Option<String> {
+    use winreg::enums::HKEY_LOCAL_MACHINE;
+    use winreg::RegKey;
+    let key = RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey(path).ok()?;
+    let joined = match key.get_value::<Vec<String>, _>(name) {
+        Ok(v) => v.join(","),
+        Err(_) => key.get_value::<String, _>(name).ok()?,
+    };
+    let t = joined.trim().to_string();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t)
+    }
+}
+
+#[cfg(not(windows))]
+fn read_multi_sz(_path: &str, _name: &str) -> Option<String> {
+    None
+}
+
+/// Restriction policies (as opposed to the audit ones): 0/absent = allow,
+/// 1 = deny for accounts, 2 = deny all. Knowing which machines already run in
+/// enforce mode turns the blocked events from a surprise into expected progress.
+fn restrict_state(path: &str, name: &str) -> String {
+    match read_dword(path, name) {
+        None | Some(0) => "allow".to_string(),
+        Some(1) => "deny-accounts".to_string(),
+        Some(2) => "deny-all".to_string(),
+        Some(v) => format!("unknown({v})"),
+    }
+}
+
+/// Product name plus build, e.g. "Windows Server 2019 (17763)". The build is
+/// what decides whether the enhanced 40xx events can exist at all, so the
+/// dashboard can tell "no data because too old" from "no data because unaudited".
+fn os_version() -> String {
+    let name = read_sz(WINNT_CV, "ProductName").unwrap_or_else(|| "unknown".to_string());
+    match read_sz(WINNT_CV, "CurrentBuildNumber") {
+        Some(b) => format!("{name} ({b})"),
+        None => name,
+    }
 }
 
 fn outgoing_audit() -> String {
