@@ -35,6 +35,14 @@ const DEVGUARD_CG: &str = r"SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenari
 const NETLOGON: &str = r"SYSTEM\CurrentControlSet\Services\Netlogon\Parameters";
 const WINNT_CV: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion";
 
+// The NTLM provider writes into three channels, not one. Protected Users and
+// Authentication Policy failures land in their own DC-only logs, which are
+// DISABLED by default - if they are off the queries simply return nothing.
+const LOG_PROTECTED_USER: &str =
+    "Microsoft-Windows-Authentication/ProtectedUserFailures-DomainController";
+const LOG_AUTH_POLICY: &str =
+    "Microsoft-Windows-Authentication/AuthenticationPolicyFailures-DomainController";
+
 // ----------------------------- Datenmodelle -----------------------------
 
 #[derive(Serialize, Default)]
@@ -188,6 +196,7 @@ pub fn run_cycle(cfg: &Config) -> Result<(), String> {
             &mut collected,
             &mut new_seen,
             false,
+            false,
         );
         if !cfg.skip_kerberos {
             gather(
@@ -202,12 +211,44 @@ pub fn run_cycle(cfg: &Config) -> Result<(), String> {
                 &mut collected,
                 &mut new_seen,
                 false,
+                false,
             );
         }
         gather(
             "Microsoft-Windows-NTLM/Operational", "NTLM#8004",
             "(EventID=8004 or EventID=8005 or EventID=8006 or EventID=4004 or EventID=4005 or EventID=4006)", "", window_ms,
-            &state, &me, map_dc_ntlm, &mut collected, &mut new_seen, false,
+            &state, &me, map_dc_ntlm, &mut collected, &mut new_seen, false, false,
+        );
+        // Protected Users / Authentication Policy failures. Both channels are
+        // DISABLED by default, so these stay silent until an admin turns them on -
+        // marked optional so a switched-off channel is not reported as an error.
+        gather(
+            LOG_PROTECTED_USER,
+            "AUTH#protected",
+            "(EventID=100 or EventID=101)",
+            "",
+            window_ms,
+            &state,
+            &me,
+            map_auth_policy,
+            &mut collected,
+            &mut new_seen,
+            true,
+            true,
+        );
+        gather(
+            LOG_AUTH_POLICY,
+            "AUTH#policy",
+            "EventID=301",
+            "",
+            window_ms,
+            &state,
+            &me,
+            map_auth_policy,
+            &mut collected,
+            &mut new_seen,
+            true,
+            true,
         );
         // Enhanced DC audits (Server 2025): they carry the NTLM version straight
         // from the DC log - on older systems the query simply returns nothing.
@@ -223,6 +264,7 @@ pub fn run_cycle(cfg: &Config) -> Result<(), String> {
             &mut collected,
             &mut new_seen,
             true,
+            false,
         );
     }
     gather(
@@ -236,6 +278,23 @@ pub fn run_cycle(cfg: &Config) -> Result<(), String> {
         map_8001,
         &mut collected,
         &mut new_seen,
+        false,
+        false,
+    );
+    // Session-security and secret-fallback blocks. Undocumented IDs taken from
+    // the provider manifest; harmless where they never fire.
+    gather(
+        "Microsoft-Windows-NTLM/Operational",
+        "NTLM#secblock",
+        "(EventID=4010 or EventID=4011 or EventID=4012 or EventID=4015)",
+        "",
+        window_ms,
+        &state,
+        &me,
+        map_sec_block,
+        &mut collected,
+        &mut new_seen,
+        false,
         false,
     );
     // Credential Guard blocks: without these a Credential-Guard machine shows
@@ -251,6 +310,7 @@ pub fn run_cycle(cfg: &Config) -> Result<(), String> {
         map_credguard,
         &mut collected,
         &mut new_seen,
+        false,
         false,
     );
     // Incoming NTLM: 8002 names the local service that accepts it, 8003 the
@@ -268,6 +328,7 @@ pub fn run_cycle(cfg: &Config) -> Result<(), String> {
         &mut collected,
         &mut new_seen,
         false,
+        false,
     );
     gather(
         "Microsoft-Windows-NTLM/Operational",
@@ -281,6 +342,7 @@ pub fn run_cycle(cfg: &Config) -> Result<(), String> {
         &mut collected,
         &mut new_seen,
         false,
+        false,
     );
     // Erweiterte Client-/Server-Audits + NTLMv1-SSO (Server 2025 / Win11 24H2).
     // 4024/4025 are the time-critical part: NTLMv1-derived credentials stop
@@ -289,7 +351,7 @@ pub fn run_cycle(cfg: &Config) -> Result<(), String> {
         "Microsoft-Windows-NTLM/Operational", "NTLM#40cs",
         "(EventID=4020 or EventID=4021 or EventID=4022 or EventID=4023 or EventID=4024 or EventID=4025)",
         "", window_ms,
-        &state, &me, map_enhanced, &mut collected, &mut new_seen, true,
+        &state, &me, map_enhanced, &mut collected, &mut new_seen, true, false,
     );
 
     // 3) Nothing to send: still advance the watermarks (don't re-read noise)
@@ -346,6 +408,7 @@ fn gather(
     collected: &mut Vec<Event>,
     new_seen: &mut HashMap<String, i64>,
     rendered: bool,
+    optional: bool,
 ) {
     let last = state.get(key).copied();
     match eventlog::collect(log, id_clause, data_clause, window_ms, last, rendered) {
@@ -357,7 +420,13 @@ fn gather(
                 }
             }
         }
-        Err(e) => config::log(&format!("[{me}] reading '{log}' ({key}) failed: {e}")),
+        // Optional channels (disabled by default) must not spam the log every
+        // cycle just because the admin has not switched them on.
+        Err(e) => {
+            if !optional {
+                config::log(&format!("[{me}] reading '{log}' ({key}) failed: {e}"));
+            }
+        }
     }
 }
 
@@ -650,6 +719,102 @@ fn map_8003(e: &RawEvent) -> Option<Event> {
 /// and domain, PID and name of the calling process.
 /// 4014 (NTLMGetCredentialKeyBlockedByCredGuard) only carries the calling
 /// process name and a service host tag.
+/// Blocks and warnings that come from account policy rather than from the NTLM
+/// restriction settings: Protected Users (100/101) and Authentication Policies
+/// (301). Both live in their own DC-only channels.
+///
+/// 301 is the interesting one: the authentication SUCCEEDED but would fail once
+/// the policy is enforced - a dated warning of the same shape as the October
+/// 2026 NTLMv1-SSO deadline, just from a different direction.
+///
+/// Field layout for these events is not publicly documented, so nothing is read
+/// by position. Only values that identify themselves (by label or by shape) are
+/// taken; the rest stays in the raw message shown in the detail view.
+fn map_auth_policy(e: &RawEvent) -> Option<Event> {
+    let kind = if e.event_id == 301 {
+        "policywarn"
+    } else {
+        "policyblock"
+    };
+    let reason = match e.event_id {
+        100 => "NTLM rejected: account is a member of Protected Users",
+        101 => "NTLM rejected: access control restrictions required",
+        _ => "NTLM succeeded but will fail once the authentication policy is enforced",
+    };
+    // The two channels keep separate record-id sequences, both starting at 1,
+    // so they must not share a log name - otherwise deduplication would drop
+    // the second channel's first events as "already seen".
+    let log = if e.event_id == 301 {
+        "Authentication/AuthPolicy"
+    } else {
+        "Authentication/ProtectedUser"
+    };
+    let p = &e.positional;
+    let pos = |i: usize| {
+        p.get(i)
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty() && *s != "-")
+            .map(|s| s.to_string())
+    };
+    // Labels first (works whatever the field order), position as a fallback.
+    let account = from_message(e, L_ACCOUNT)
+        .or_else(|| from_message(e, L_USER))
+        .or_else(|| pos(0));
+    let device = from_message(e, L_DEVICE)
+        .or_else(|| from_message(e, L_CLIENT_MACHINE))
+        .or_else(|| pos(1));
+    let errcode = from_message(e, L_ERRCODE).or_else(|| pos(2));
+    let raw_proc = sniff_process_raw(e, usize::MAX);
+    Some(Event {
+        record_id: e.record_id,
+        log: log.to_string(),
+        event_id: e.event_id,
+        kind: kind.to_string(),
+        event_time: e.time.clone(),
+        user: account,
+        domain: from_message(e, L_DOMAIN),
+        workstation: device,
+        target_server: from_message(e, L_TARGET_MACHINE).or_else(|| from_message(e, L_TARGET_RES)),
+        process: raw_proc.as_deref().map(base_name),
+        process_path: raw_proc.as_deref().and_then(full_path),
+        auth_method: Some("Blocked".to_string()),
+        // NT status code (e.g. 0xC000006E = account restriction). The "Why NTLM"
+        // panel only reads krbfail rows, so this cannot pollute it.
+        failure_code: errcode,
+        reason: Some(reason.to_string()),
+        ..Default::default()
+    })
+}
+
+/// NTLM blocks that come from session-security and credential-secret settings
+/// (4010/4011 minimum client/server security, 4012 domain-password fallback,
+/// 4015 a further outgoing block). These IDs exist in the provider manifest but
+/// are not documented anywhere, so - as above - nothing is read by position.
+fn map_sec_block(e: &RawEvent) -> Option<Event> {
+    let reason = match e.event_id {
+        4010 => "Blocked by minimum client session security (NtlmMinClientSec)",
+        4011 => "Blocked by minimum server session security (NtlmMinServerSec)",
+        4012 => "DC-generated NTLM secret failed, client fell back to the domain password",
+        _ => "Outgoing NTLM blocked",
+    };
+    let raw_proc = sniff_process_raw(e, usize::MAX);
+    Some(Event {
+        record_id: e.record_id,
+        log: "NTLM/Operational".to_string(),
+        event_id: e.event_id,
+        kind: "secblock".to_string(),
+        event_time: e.time.clone(),
+        user: from_message(e, L_USER).or_else(|| find_named(e, &["user", "account"])),
+        domain: from_message(e, L_DOMAIN),
+        target_server: from_message(e, L_TARGET_MACHINE).or_else(|| from_message(e, L_TARGET_RES)),
+        process: raw_proc.as_deref().map(base_name),
+        process_path: raw_proc.as_deref().and_then(full_path),
+        auth_method: Some("Blocked".to_string()),
+        reason: Some(reason.to_string()),
+        ..Default::default()
+    })
+}
+
 fn map_credguard(e: &RawEvent) -> Option<Event> {
     let p = &e.positional;
     let nonempty = |i: usize| {
@@ -884,6 +1049,11 @@ const L_REASON: &[&str] = &["Reason", "Grund"];
 const L_REASON_ID: &[&str] = &["Reason ID", "Grund-ID"];
 const L_MIC: &[&str] = &["MIC Status", "MIC-Status"];
 const L_SRV_OS: &[&str] = &["Server OS", "Serverbetriebssystem"];
+// Protected Users / authentication policy events (verified against a real
+// event 100: "Account Name", "Device Name", "Error Code", in that order).
+const L_ACCOUNT: &[&str] = &["Account Name", "Kontoname"];
+const L_DEVICE: &[&str] = &["Device Name", "Gerätename", "Geraetename"];
+const L_ERRCODE: &[&str] = &["Error Code", "Fehlercode"];
 const L_EPA: &[&str] = &["Channel Binding", "Kanalbindung"];
 
 fn map_enhanced(e: &RawEvent) -> Option<Event> {
