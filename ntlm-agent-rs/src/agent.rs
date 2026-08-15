@@ -238,6 +238,21 @@ pub fn run_cycle(cfg: &Config) -> Result<(), String> {
         &mut new_seen,
         false,
     );
+    // Credential Guard blocks: without these a Credential-Guard machine shows
+    // no findings at all, even while NTLM is being attempted and refused.
+    gather(
+        "Microsoft-Windows-NTLM/Operational",
+        "NTLM#cg",
+        "(EventID=4013 or EventID=4014)",
+        "",
+        window_ms,
+        &state,
+        &me,
+        map_credguard,
+        &mut collected,
+        &mut new_seen,
+        false,
+    );
     // Incoming NTLM: 8002 names the local service that accepts it, 8003 the
     // remote account that came in. Both need the "Audit Incoming NTLM Traffic"
     // policy; without it the queries simply return nothing.
@@ -621,6 +636,61 @@ fn map_8003(e: &RawEvent) -> Option<Event> {
         process,
         process_path,
         logon_type: nonempty(5).filter(|s| s.chars().all(|c| c.is_ascii_digit())),
+        ..Default::default()
+    })
+}
+
+/// Credential Guard block events. Credential Guard is on by default on
+/// Server 2025 and Windows 11 24H2, and when it refuses to hand out the
+/// credential key the attempt never reaches the regular NTLM audit path - so
+/// the machine looks clean while NTLM is in fact being attempted. Microsoft
+/// documents both IDs under Credential Guard "considerations and known issues".
+///
+/// 4013 (NTLMv1BlockedByCredGuard) is field-rich: target server, supplied user
+/// and domain, PID and name of the calling process.
+/// 4014 (NTLMGetCredentialKeyBlockedByCredGuard) only carries the calling
+/// process name and a service host tag.
+fn map_credguard(e: &RawEvent) -> Option<Event> {
+    let p = &e.positional;
+    let nonempty = |i: usize| {
+        p.get(i)
+            .cloned()
+            .filter(|s| !s.trim().is_empty() && s != "-")
+    };
+
+    if e.event_id == 4013 {
+        let raw_proc = nonempty(4);
+        return Some(Event {
+            record_id: e.record_id,
+            log: "NTLM/Operational".to_string(),
+            event_id: e.event_id,
+            kind: "cgblock".to_string(),
+            event_time: e.time.clone(),
+            target_server: nonempty(0),
+            user: nonempty(1),
+            domain: nonempty(2),
+            // 4013 fires precisely because NTLMv1 was attempted - recording the
+            // version is a statement of fact, not a guess.
+            ntlm_version: Some("NTLMv1".to_string()),
+            process: raw_proc.as_deref().map(base_name),
+            process_path: raw_proc.as_deref().and_then(full_path),
+            auth_method: Some("Blocked".to_string()),
+            reason: Some("NTLMv1 attempt blocked by Credential Guard".to_string()),
+            ..Default::default()
+        });
+    }
+
+    let raw_proc = nonempty(0);
+    Some(Event {
+        record_id: e.record_id,
+        log: "NTLM/Operational".to_string(),
+        event_id: e.event_id,
+        kind: "cgblock".to_string(),
+        event_time: e.time.clone(),
+        process: raw_proc.as_deref().map(base_name),
+        process_path: raw_proc.as_deref().and_then(full_path),
+        auth_method: Some("Blocked".to_string()),
+        reason: Some("Credential key request blocked by Credential Guard".to_string()),
         ..Default::default()
     })
 }
