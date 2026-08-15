@@ -139,46 +139,107 @@ Watermarks are tracked per source and purpose, so only new events are transferre
 
 ## Screenshots
 
-### Overview: metrics, trend, and the programs to fix
+A walk through the dashboard, in the order it presents itself. The figures come
+from a test environment, so the numbers are examples — the layout and the
+reasoning behind each section are not.
 
-The top of the dashboard. Global filters (time range, machine, hide-done) sit
-above a sticky section bar whose counters show at a glance where findings exist —
-greyed-out chips mean "checked, nothing there". The metric cards separate
-**insecure** (NTLMv1) from **outdated** (NTLMv2), and the *Programs still using
-NTLM* list is the actual shutdown-blocker worklist. Note the red
-**target is an IP** badge: Kerberos needs a name with an SPN, so an IP target
-can never be anything but NTLM.
+### Overview: metrics and trend
 
-![Overview with metrics, trend and the outgoing programs list](screenshots/dashboard_1.png)
+The top of the page answers "how bad is it, and is it getting better?" before
+any detail. A sticky section bar counts findings per area — greyed-out chips
+mean "checked, nothing there" rather than "not looked at". The metric cards keep
+**insecure** (NTLMv1) and **outdated** (NTLMv2) apart, because they need
+different urgency. The trend bars should approach zero over the weeks; that is
+the whole project in one picture.
 
-### Both directions: who goes out, which services accept
+![Header, colour legend, filters, metric cards and the trend chart](screenshots/01-overview.png)
+
+### The worklist: programs still using NTLM
+
+This is where the actual work is. Each row is a program and the server it
+authenticates to, with a **trend line** per row: falling is good, a rising line
+inside a falling overall trend is the row to tackle first. The red
+**target is an IP** badge explains itself — Kerberos needs a name with an SPN,
+so an IP target can never be anything but NTLM. *Generate exception list* turns
+the still-open rows into a paste-ready Group Policy entry.
+
+![Program list with per-row sparklines, blocked badges and the exception-list button](screenshots/02-programs.png)
+
+### When NTLM happens
+
+Weekday against hour of day. Office traffic forms the block in the middle — but
+the bright cell on Sunday at 03:00 is a backup job nobody remembers, and exactly
+the kind of straggler that breaks a shutdown. As a single number it would vanish
+into the daily trend; as a pattern it is unmissable.
+
+![Timing heatmap with a Sunday night batch job standing out](screenshots/03-timing.png)
+
+### Why NTLM was used
+
+On Server 2025 and Windows 11 24H2 Windows reports the *reason* for each
+fallback, and on older systems failed Kerberos requests supply it instead. Each
+cause comes with its concrete remedy — a missing SPN, a clock out of sync, an
+RC4-only account against an AES-only policy. This is the shortest path from
+finding to fix.
+
+![Cause analysis with remediation advice per reason](screenshots/04-why.png)
+
+### Both directions
 
 *Who uses NTLM – and where to* comes from the domain controller and is the most
 reliable overall view, even when no program name can be determined.
-*Services accepting NTLM* is the opposite direction — the local service that
-**accepts** incoming NTLM. That section only appears once the
-*Audit Incoming NTLM Traffic* policy is active.
 
-![Domain-wide NTLM usage and the services accepting incoming NTLM](screenshots/dashboard_2.png)
+![Domain-wide view: which computer connects to which server](screenshots/05-domain.png)
 
-### The safe side, and machine readiness
+*Services accepting NTLM* is the opposite direction: the local service that
+**accepts** incoming authentication. It only fills once the
+*Audit Incoming NTLM Traffic* policy is active — the section says so itself
+rather than looking empty.
 
-What already runs over Kerberos, shown for contrast rather than as a to-do.
-Below it, the machine list: heartbeat, which auditing is enabled, each machine's
-**NTLM level** (`LmCompatibilityLevel`; 5 = NTLMv2 only) and the **Oct 2026**
-column — machines with Credential Guard are exempt from the `BlockNtlmv1SSO`
-default flip. The yellow line above the table warns while fewer than 14 days of
-data exist, because an empty findings list means little that early.
+![Services accepting incoming NTLM per machine](screenshots/06-services.png)
 
-![Kerberos services and accounts, plus the machine and auditing status](screenshots/dashboard_3.png)
+### The insecure ones, and a deadline
+
+NTLMv1 is the part to replace first, broken down by account so you know whom to
+talk to.
+
+![Insecure logons ranked by user](screenshots/07-insecure-users.png)
+
+The NTLMv1-SSO panel is a countdown rather than a finding: in October 2026
+Microsoft flips the default to blocking, so whatever appears here breaks on its
+own — regardless of your own policies.
+
+![NTLMv1 SSO panel with the October 2026 deadline](screenshots/08-v1sso.png)
+
+### The safe side
+
+What already runs over Kerberos, shown for contrast rather than as a to-do —
+useful both for reassurance and for spotting weak encryption (`RC4/DES` instead
+of `AES`).
+
+![Services already authenticating over Kerberos](screenshots/09-kerberos-services.png)
+
+![Accounts already authenticating over Kerberos, with the services they use](screenshots/10-kerberos-accounts.png)
+
+### Machine readiness
+
+Which agents report, and whether the auditing they need is actually on. Each
+machine shows its OS build — anything below 26100 carries a **no 40xx** hint, so
+an empty findings list there is understood as "cannot report that" rather than
+"nothing to find". Red badges flag Credential Guard blocks (whose attempts never
+reach the normal audit path), a too-small event log, and machines already
+running in **deny** mode. The **Oct 2026** column marks who is affected by the
+`BlockNtlmv1SSO` flip; Credential Guard machines are exempt.
+
+![Machine list with OS builds, auditing state, restriction policies and readiness](screenshots/12-machines.png)
 
 ### Event list with per-event detail
 
-Every collected event, filterable by kind, NTLM version, account type (people vs.
-computers) and free-text search, exportable as CSV. Expanding a row shows the raw
-field values as Windows reported them.
+Every collected event, filterable by kind, NTLM version and account type
+(people vs. computers), searchable, exportable as CSV. Expanding a row shows the
+raw field values as Windows reported them, including the full program path.
 
-![Recent events with an expanded event detail view](screenshots/dashboard_4.png)
+![Recent events with filters and badges](screenshots/11-events.png)
 
 ---
 
