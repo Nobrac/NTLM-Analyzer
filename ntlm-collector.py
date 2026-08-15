@@ -615,7 +615,7 @@ class Handler(BaseHTTPRequestHandler):
                 "total":  c.execute(f"SELECT COUNT(*) FROM events WHERE {tf}", tp).fetchone()[0],
                 "v1":     c.execute(f"SELECT COUNT(*) FROM events WHERE ntlm_version='NTLMv1' AND {tf}", tp).fetchone()[0],
                 "v2":     c.execute(f"SELECT COUNT(*) FROM events WHERE ntlm_version='NTLMv2' AND {tf}", tp).fetchone()[0],
-                "outbound": c.execute(f"SELECT COUNT(*) FROM events WHERE event_id IN (8001,4020,4021) AND {tf}", tp).fetchone()[0],
+                "outbound": c.execute(f"SELECT COUNT(*) FROM events WHERE event_id IN (8001,4001,4020,4021,4013) AND {tf}", tp).fetchone()[0],
                 "sources": c.execute(f"SELECT COUNT(DISTINCT source) FROM events WHERE {tf}", tp).fetchone()[0],
                 "procs":   c.execute(f"SELECT COUNT(DISTINCT process) FROM events "
                                      f"WHERE process IS NOT NULL AND process NOT LIKE '(%' AND {tf}", tp).fetchone()[0],
@@ -660,7 +660,7 @@ class Handler(BaseHTTPRequestHandler):
             # by day so a short range still yields a usable line.
             spark_rows = c.execute(
                 f"SELECT process, date(event_time), COUNT(*) "
-                f"FROM events WHERE event_id IN (8001,4001,4020,4021) "
+                f"FROM events WHERE event_id IN (8001,4001,4020,4021,4013) "
                 f"AND process IS NOT NULL AND {tf} "
                 f"GROUP BY 1, 2 ORDER BY 2", tp).fetchall()
             spark = {}
@@ -679,9 +679,9 @@ class Handler(BaseHTTPRequestHandler):
                              dict(process=r[0], target=r[1], n=r[2], blocked=r[3],
                              users=r[4], sources=r[5], last_seen=r[6], who=r[7])) for r in c.execute(
                 f"SELECT COALESCE(process,'(unbekannt)'), COALESCE(target_server,'(unbekannt)'), "
-                f"COUNT(*), SUM(CASE WHEN event_id IN (4001,4002,4003,4004,4005,4006) THEN 1 ELSE 0 END), COUNT(DISTINCT user), COUNT(DISTINCT source), MAX(event_time), "
+                f"COUNT(*), SUM(CASE WHEN event_id IN (4001,4002,4003,4004,4005,4006,4013) THEN 1 ELSE 0 END), COUNT(DISTINCT user), COUNT(DISTINCT source), MAX(event_time), "
                 f"GROUP_CONCAT(DISTINCT user) "
-                f"FROM events WHERE event_id IN (8001,4001,4020,4021) AND {tf} "
+                f"FROM events WHERE event_id IN (8001,4001,4020,4021,4013) AND {tf} "
                 f"GROUP BY process, target_server ORDER BY COUNT(*) DESC LIMIT 50", tp).fetchall()]
             # "Why NTLM?" - grouped by the Usage ID of the enhanced 40xx events.
             # This is the actual worklist: each cause has its own remediation,
@@ -720,7 +720,14 @@ class Handler(BaseHTTPRequestHandler):
             # signal, so they are counted and badged rather than mixed in.
             stats["blocked"] = c.execute(
                 f"SELECT COUNT(*) FROM events WHERE {tf} AND "
-                f"event_id IN (4001,4002,4003,4004,4005,4006)", tp).fetchone()[0]
+                f"event_id IN (4001,4002,4003,4004,4005,4006,4013)", tp).fetchone()[0]
+            # Credential Guard blocks (4013/4014): these never reach the regular
+            # NTLM audit path, so a machine producing them looks clean while NTLM
+            # is in fact being attempted. Counted per machine to flag that.
+            cg_by_src = dict(c.execute(
+                f"SELECT source, COUNT(*) FROM events WHERE kind='cgblock' AND {tf} "
+                f"GROUP BY source", tp).fetchall())
+            stats["cg_blocked"] = sum(cg_by_src.values())
 
             relay = c.execute(
                 f"SELECT COUNT(*) FROM events WHERE {tf} AND "
@@ -787,7 +794,7 @@ class Handler(BaseHTTPRequestHandler):
                            ntlm_log_kb=r[13], os_version=r[14],
                            restrict_out=r[15], restrict_in=r[16],
                            restrict_dom=r[17], exc_client=r[18],
-                           exc_dc=r[19]) for r in c.execute(
+                           exc_dc=r[19], cg=cg_by_src.get(r[0], 0)) for r in c.execute(
                 "SELECT a.source, a.is_dc, a.agent_version, a.outgoing_audit, a.incoming_audit, "
                 "a.domain_audit, a.last_seen, "
                 "(SELECT COUNT(*) FROM events e WHERE e.source=a.source), "
@@ -1407,6 +1414,10 @@ de: {
   d_mon:'Mo', d_tue:'Di', d_wed:'Mi', d_thu:'Do', d_fri:'Fr', d_sat:'Sa', d_sun:'So',
   th_trend2:'Verlauf', spark_tt:'Verlauf über {n} Tage – fallend ist gut, steigend heißt: hier kommt Neues dazu.',
   tt_th_trend:'Entwicklung dieser Zeile über den gewählten Zeitraum. Eine steigende Linie trotz sinkendem Gesamttrend ist die Zeile, die man zuerst anfasst.',
+  b_cg:'Credential Guard', b_cg_machine:'{n}× von Credential Guard blockiert',
+  tt_cg_machine:'Credential Guard hat NTLM-Versuche auf dieser Maschine blockiert. Solche Versuche erreichen die normale NTLM-Protokollierung nicht – die Fundliste dieser Maschine ist dadurch unvollständig, nicht leer.',
+  eid_4013:'NTLMv1-Versuch von Credential Guard blockiert – nennt Zielserver, Konto und aufrufenden Prozess. Das Programm versucht NTLMv1 und gehört auf die Liste.',
+  eid_4014:'Credential Guard hat die Herausgabe des Credential Keys verweigert. Nennt nur den aufrufenden Prozess – ein Hinweis, dass hier NTLM versucht wird, ohne dass es regulär protokolliert wird.',
   b_os_old:'keine 40xx', tt_os_old:'Dieses System ist älter als Server 2025 / Windows 11 24H2 und kennt die erweiterten 40xx-Ereignisse nicht. Die Ursachenanalyse läuft hier über fehlgeschlagene Kerberos-Anfragen.',
   r_out:'Ausgehend', r_in:'Eingehend', r_dom:'Domäne',
   tt_restrict:'Eine Deny-Richtlinie ist aktiv – diese Maschine blockiert NTLM bereits. „deny-accounts" betrifft Konten, „deny-all" alles.',
@@ -1596,6 +1607,10 @@ en: {
   d_mon:'Mon', d_tue:'Tue', d_wed:'Wed', d_thu:'Thu', d_fri:'Fri', d_sat:'Sat', d_sun:'Sun',
   th_trend2:'Trend', spark_tt:'Trend across {n} days - falling is good, rising means something new is coming in.',
   tt_th_trend:'How this row developed over the selected range. A rising line despite a falling overall trend is the row to tackle first.',
+  b_cg:'Credential Guard', b_cg_machine:'{n}× blocked by Credential Guard',
+  tt_cg_machine:'Credential Guard blocked NTLM attempts on this machine. Such attempts never reach the regular NTLM audit path - this machine\'s findings are incomplete rather than empty.',
+  eid_4013:'NTLMv1 attempt blocked by Credential Guard - names target server, account and calling process. The program is attempting NTLMv1 and belongs on the list.',
+  eid_4014:'Credential Guard refused to hand out the credential key. Only names the calling process - a hint that NTLM is being attempted here without being logged normally.',
   b_os_old:'no 40xx', tt_os_old:'This system predates Server 2025 / Windows 11 24H2 and does not know the enhanced 40xx events. Cause analysis here runs on failed Kerberos requests instead.',
   r_out:'Outgoing', r_in:'Incoming', r_dom:'Domain',
   tt_restrict:'A deny policy is active - this machine already blocks NTLM. "deny-accounts" covers accounts, "deny-all" covers everything.',
@@ -1744,6 +1759,7 @@ function artBadge(e){
   if(e.auth_method=="Downgrade") fb = ' <span class="badge b-bad" title="'+esc(t('tt_down'))+'"><span class="d"></span>'+t('b_down')+'</span>';
   if(e.ntlm_version=="NTLMv1") return '<span class="badge b-bad"'+ti+'><span class="d"></span>'+t('b_v1')+'</span>'+fb;
   if(e.ntlm_version=="NTLMv2") return '<span class="badge b-old"'+ti+'><span class="d"></span>'+t('b_v2')+'</span>'+fb;
+  if(e.kind=="cgblock")        return '<span class="badge b-bad"'+ti+'><span class="d"></span>'+t('b_cg')+'</span>';
   if(e.kind=="krbfail")        return '<span class="badge b-old" title="'+esc(t('tt_krbfail')+(e.failure_code?' ('+e.failure_code+')':''))+'"><span class="d"></span>'+t('b_krbfail')+'</span>';
   if(e.kind=="kerberos")       return '<span class="badge b-good"'+ti+'><span class="d"></span>'+t('b_krb')+'</span>';
   if(e.kind=="domain")         return '<span class="badge b-neut"'+ti+'><span class="d"></span>'+t('b_dom')+'</span>';
@@ -1808,6 +1824,15 @@ function excBadge(a){
 
 // NTLM/Operational log size: the OS default (~1 MB) rolls over quickly once
 // incoming auditing is on - events would then be lost between two poll cycles.
+// Credential Guard blocked NTLM on this machine: the regular audit events are
+// never written in that case, so the machine's findings are incomplete by
+// design. Saying so is more honest than showing an empty list.
+function cgBadge(a){
+  if(!a.cg) return '';
+  return ' <span class="badge b-bad" title="'+esc(t('tt_cg_machine'))+'"><span class="d"></span>'
+       + t('b_cg_machine').replace('{n}', a.cg) + '</span>';
+}
+
 function logSizeBadge(a){
   const v = a.ntlm_log_kb;
   if (v === null || v === undefined || v === '') return '';
@@ -1968,6 +1993,29 @@ function buildParams(){
   if(state.src) p.set('source', state.src);
   p.set('range', state.r || 'all');
   return p;
+}
+
+// Badge helpers. Declared as hoisted functions on purpose: the render function
+// renders sections top-down, and a const arrow defined further down would be in
+// the temporal dead zone for the sections above it (that bug once killed
+// everything below the incoming table).
+function blockedBadge(v){
+  if (!v) return '';
+  const num = (typeof v === 'number') ? v + ' ' : '';
+  return ' <span class="badge b-bad b-inline" title="'+esc(t('tt_blocked'))+'"><span class="d"></span>'
+    + num + t('b_blocked') + '</span>';
+}
+
+function ipBadge(tgt){
+  return targetIsIp(tgt)
+    ? '<span class="badge b-bad b-inline" title="'+esc(t('tt_ip'))+'"><span class="d"></span>'+t('b_ip')+'</span>'
+    : '';
+}
+
+function tgtCell(tgt){
+  return targetIsIp(tgt)
+    ? '<span class="tgtwrap"><span>'+esc(tgt)+'</span>'+ipBadge(tgt)+'</span>'
+    : esc(tgt);
 }
 
 // Heatmap weekday x hour. Intensity is relative to the busiest cell, so a
@@ -2178,22 +2226,6 @@ async function load(){
   // instead of dangling indented.
   // Blocked events (enforce policy active): shown as a red badge behind the
   // count - these rows are an alarm/success signal, not a to-do anymore.
-  // Accepts a count (aggregates) or a boolean (v1sso panel, where 4025 marks
-  // the blocked variant) - booleans render without a number.
-  const blockedBadge = v => {
-    if (!v) return '';
-    const num = (typeof v === 'number') ? v + ' ' : '';
-    return ' <span class="badge b-bad b-inline" title="'+esc(t('tt_blocked'))+'"><span class="d"></span>'
-      + num + t('b_blocked') + '</span>';
-  };
-
-  const ipBadge = tgt => targetIsIp(tgt)
-    ? '<span class="badge b-bad b-inline" title="'+esc(t('tt_ip'))+'"><span class="d"></span>'+t('b_ip')+'</span>'
-    : '';
-  const tgtCell = tgt => targetIsIp(tgt)
-    ? '<span class="tgtwrap"><span>'+esc(tgt)+'</span>'+ipBadge(tgt)+'</span>'
-    : esc(tgt);
-
   $('#blockers').innerHTML = (d.blockers&&d.blockers.length)
     ? d.blockers.map(b=>`<tr class="${b.st==='erledigt'?'row-done':''}">
         <td class="strong">${esc(b.process)}${hintBtn(b.key)}</td>
@@ -2261,7 +2293,7 @@ async function load(){
         <td class="strong">${esc(a.source)}</td>
         <td class="soft">${a.is_dc?t('type_dc'):t('type_member')}${osLine(a)}</td>
         <td>${heartbeat(a.last_seen)}</td>
-        <td>${auditCell(a)}${logSizeBadge(a)}${restrictBadges(a)}${excBadge(a)}</td>
+        <td>${auditCell(a)}${logSizeBadge(a)}${cgBadge(a)}${restrictBadges(a)}${excBadge(a)}</td>
         <td>${lmCell(a.lm_level)}</td>
         <td>${octCell(a)}</td>
         <td class="num-cell">${a.events}</td>

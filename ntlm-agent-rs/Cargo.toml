@@ -1,6 +1,6 @@
 [package]
 name = "ntlm-agent"
-version = "1.7.0"
+version = "1.7.1"
 edition = "2021"
 description = "NTLM-Analyzer Agent (Windows-Dienst) - sammelt NTLM-Nutzungsdaten fuer den NTLM-Analyzer"
 license = "GPL-3.0-or-later"
