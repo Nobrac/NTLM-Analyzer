@@ -190,7 +190,13 @@ pub fn parse_events(xml: &str) -> Result<Vec<RawEvent>, String> {
                 .children()
                 .filter(|n| n.is_element() && n.tag_name().name() == "Data")
             {
-                let val = d.text().unwrap_or("").to_string();
+                // Event fields are attacker-influenced (a remote client chooses
+                // its own workstation name, account names arrive from the wire).
+                // Cap each value so a crafted oversized event can never push an
+                // ingest batch past the collector's body limit - that would 413
+                // forever and pin the watermark in place. 4 KB keeps every
+                // legitimate value intact (SPNs, paths, messages).
+                let val = cap(d.text().unwrap_or(""));
                 positional.push(val.clone());
                 if let Some(name) = d.attribute("Name") {
                     named.insert(name.to_string(), val);
@@ -199,7 +205,7 @@ pub fn parse_events(xml: &str) -> Result<Vec<RawEvent>, String> {
         } else if let Some(ud) = child_node(&ev, "UserData") {
             if let Some(inner) = ud.children().find(|n| n.is_element()) {
                 for d in inner.children().filter(|n| n.is_element()) {
-                    let val = d.text().unwrap_or("").to_string();
+                    let val = cap(d.text().unwrap_or(""));
                     positional.push(val.clone());
                     named.insert(d.tag_name().name().to_string(), val);
                 }
@@ -235,6 +241,19 @@ fn child_node<'a, 'i>(
 
 fn child_text(parent: &roxmltree::Node, name: &str) -> Option<String> {
     child_node(parent, name).and_then(|n| n.text().map(|t| t.to_string()))
+}
+
+fn cap(s: &str) -> String {
+    const MAX: usize = 4096;
+    if s.len() <= MAX {
+        return s.to_string();
+    }
+    // Cut on a char boundary so multi-byte characters cannot cause a panic.
+    let mut end = MAX;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
 }
 
 fn iso_seconds(s: &str) -> String {

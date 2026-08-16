@@ -459,6 +459,28 @@ authentication` keeps individual servers reachable while the rest is denied, and
 on Windows Server 2025 `Disable-SmbClientNtlmAuth` blocks outbound NTLM for SMB
 only — a targeted lever that leaves other protocols untouched.
 
+## No external resources
+
+The dashboard is a single self-contained page: no CDN, no webfonts, no
+third-party scripts. It renders identically in an isolated network, and viewing
+it does not tell anyone outside that you are looking at it. The
+Content-Security-Policy denies everything except the page's own inline script
+and style.
+
+## Times and timezones
+
+Windows records `SystemTime` in the event XML as **UTC**, and that is what the
+agent sends and the collector stores — unchanged, so the database stays
+comparable across sites in different timezones. Everything you see is converted:
+the event list renders in your browser's timezone, and the trend, the heatmap
+and the per-program sparklines are bucketed by your local day and hour (the
+browser sends its UTC offset with each request). The CSV export deliberately
+keeps raw UTC and says so in its first column header.
+
+Practical consequence: two admins in different timezones see the same data
+correctly, each in their own local time — and "peak on Sunday at 03:00" means
+03:00 where *you* are, which is the hour you would go looking in Task Scheduler.
+
 ## Limitations & notes
 
 - **Not retroactive:** collection starts when auditing is enabled; the first run looks back `--days-back` days (default 1).

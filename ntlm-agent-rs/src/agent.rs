@@ -1280,9 +1280,15 @@ fn map_enc(code: &str) -> String {
 fn post_json(url: &str, api_key: &str, body: &str) -> Result<(), String> {
     // Overall timeout so that a hanging collector cannot block the cycle - and
     // with it a service stop.
-    let mut req = ureq::post(url)
+    // redirects(0): ureq would otherwise re-send the request - including the
+    // X-Api-Key header - to wherever a redirect points. The collector never
+    // legitimately redirects the ingest endpoints, so following one could only
+    // ever hand the key to a third party (DNS tampering, misconfigured proxy).
+    let agent = ureq::AgentBuilder::new()
+        .redirects(0)
         .timeout(std::time::Duration::from_secs(15))
-        .set("Content-Type", "application/json");
+        .build();
+    let mut req = agent.post(url).set("Content-Type", "application/json");
     if !api_key.is_empty() {
         req = req.set("X-Api-Key", api_key);
     }
