@@ -44,7 +44,7 @@ import sqlite3
 import ssl
 import threading
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, timezone
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -63,6 +63,16 @@ LOGIN_LOCK_SECS = 300                 # ... lock this IP for 5 minutes
 SESSION_COOKIE = "ntlm_session"
 SESSION_TTL = 12 * 60 * 60          # 12 Stunden
 SESSIONS_LOCK = threading.Lock()
+
+
+def utc_now():
+    """Wall-clock UTC without tzinfo.
+
+    Windows writes SystemTime in the event XML as UTC, and that is what the
+    agent stores - so every comparison against event_time has to happen in UTC,
+    regardless of which timezone the collector host runs in.
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 def hash_password(password, salt=None):
     """PBKDF2-HMAC-SHA256. Gibt (salt, derived_key) zurueck."""
@@ -230,8 +240,29 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        self._security_headers()
         self.end_headers()
         self.wfile.write(body)
+
+    def _security_headers(self):
+        """Defence in depth. Nothing here is currently exploitable - there are no
+        third-party contents and every value is escaped - but these are free."""
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        # The dashboard is one self-contained file: inline script and style, no
+        # external resources at all. Everything else is denied, so an injected
+        # tag could neither load nor exfiltrate anything.
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'none'; "
+            "script-src 'unsafe-inline'; "
+            "style-src 'unsafe-inline'; "
+            "img-src 'self' data:; "
+            "connect-src 'self'; "
+            "form-action 'self'; "
+            "base-uri 'none'; "
+            "frame-ancestors 'none'")
 
     def log_message(self, fmt, *args):
         pass  # ruhig halten; bei Bedarf entkommentieren
@@ -294,6 +325,7 @@ class Handler(BaseHTTPRequestHandler):
         if clear_cookie:
             self.send_header("Set-Cookie", self._cookie_header("", 0))
         self.send_header("Content-Length", "0")
+        self._security_headers()
         self.end_headers()
 
     def _handle_login(self):
@@ -322,6 +354,10 @@ class Handler(BaseHTTPRequestHandler):
         if hmac.compare_digest(got, want):
             with LOGIN_FAILS_LOCK:
                 LOGIN_FAILS.pop(ip, None)          # success resets the counter
+                # Expired lockouts of other IPs are dropped here too, so the map
+                # cannot grow without bound from many distinct source addresses.
+                for k in [k for k, v in LOGIN_FAILS.items() if v[1] and v[1] <= now]:
+                    del LOGIN_FAILS[k]
             self._redirect("/", set_cookie=self._new_session())
         else:
             with LOGIN_FAILS_LOCK:
@@ -426,18 +462,47 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, {"error": f"bad json: {exc}"})
             return
 
-        source = (payload.get("source") or "unknown").strip()
+        # A broken or hostile client must get a clean 400, not a dropped
+        # connection with a traceback in the log: validate shape before use.
+        if not isinstance(payload, dict):
+            self._send(400, {"error": "payload must be a JSON object"})
+            return
+        source = payload.get("source")
+        source = source.strip() if isinstance(source, str) and source.strip() else "unknown"
         if u.path == "/status":
-            self._send(200, {"ok": self._upsert_agent(source, payload)})
+            try:
+                ok = self._upsert_agent(source, payload)
+            except (TypeError, ValueError) as exc:
+                self._send(400, {"error": f"bad status shape: {exc}"})
+                return
+            self._send(200, {"ok": ok})
             return
         events = payload.get("events") or []
         if isinstance(events, dict):      # Single-Event-Push -> in Liste wandeln
             events = [events]
-        inserted = self._insert(source, events)
+        if not isinstance(events, list):
+            self._send(400, {"error": "events must be a list"})
+            return
+        try:
+            inserted = self._insert(source, events)
+        except (TypeError, ValueError) as exc:
+            self._send(400, {"error": f"bad event shape: {exc}"})
+            return
         self._send(200, {"received": len(events), "inserted": inserted})
 
     def _upsert_agent(self, source, p):
         now = datetime.now(timezone.utc).isoformat()
+
+        def g(key):
+            """Status fields are display strings; a nested value from a broken
+            client must not raise InterfaceError inside the UPSERT."""
+            v = p.get(key)
+            if v is None or isinstance(v, (int, float, str)):
+                return v
+            if isinstance(v, bool):
+                return int(v)
+            return str(v)[:200]
+
         with DB_LOCK:
             self.server.conn.execute(
                 "INSERT INTO agents (source,is_dc,agent_version,outgoing_audit,"
@@ -454,20 +519,34 @@ class Handler(BaseHTTPRequestHandler):
                 "restrict_in=excluded.restrict_in, restrict_dom=excluded.restrict_dom, "
                 "exc_client=excluded.exc_client, exc_dc=excluded.exc_dc, "
                 "last_seen=excluded.last_seen",
-                (source, 1 if p.get("is_dc") else 0, p.get("agent_version"),
-                 p.get("outgoing_audit"), p.get("incoming_audit"),
-                 p.get("domain_audit"), p.get("lm_level"), p.get("block_v1sso"),
-                 p.get("cred_guard"), p.get("ntlm_log_kb"),
-                 p.get("os_version"), p.get("restrict_out"), p.get("restrict_in"),
-                 p.get("restrict_dom"), p.get("exc_client"), p.get("exc_dc"), now))
+                (source, 1 if p.get("is_dc") else 0, g("agent_version"),
+                 g("outgoing_audit"), g("incoming_audit"),
+                 g("domain_audit"), g("lm_level"), g("block_v1sso"),
+                 g("cred_guard"), g("ntlm_log_kb"),
+                 g("os_version"), g("restrict_out"), g("restrict_in"),
+                 g("restrict_dom"), g("exc_client"), g("exc_dc"), now))
             self.server.conn.commit()
         return True
 
     # ---- DB ---------------------------------------------------------------
     def _insert(self, source, events):
         now = datetime.now(timezone.utc).isoformat()
+
+        def scalar(v):
+            """SQLite accepts None/int/float/str. Anything nested (a dict or list
+            in a field) would raise InterfaceError mid-batch - stringify instead
+            of letting one malformed field kill the whole push."""
+            if v is None or isinstance(v, (int, float, str)):
+                return v
+            if isinstance(v, bool):
+                return int(v)
+            return json.dumps(v, ensure_ascii=False)[:500]
+
         rows = []
         for e in events:
+            if not isinstance(e, dict):
+                continue                     # skip garbage entries, keep the rest
+            e = {k: scalar(v) for k, v in e.items()}
             rows.append((
                 source,
                 e.get("record_id"),
@@ -518,7 +597,7 @@ class Handler(BaseHTTPRequestHandler):
                   "30d": timedelta(days=30)}
         cutoff = None
         if rng in deltas:
-            cutoff = (datetime.now() - deltas[rng]).strftime("%Y-%m-%dT%H:%M:%S")
+            cutoff = (utc_now() - deltas[rng]).strftime("%Y-%m-%dT%H:%M:%S")
 
         where, params = [], []
         if cutoff:
@@ -564,11 +643,11 @@ class Handler(BaseHTTPRequestHandler):
         def cell(v):
             s = "" if v is None else str(v)
             # Schutz vor Formel-Injektion in Tabellenkalkulationen
-            return "'" + s if s[:1] in ("=", "+", "-", "@") else s
+            return "'" + s if s[:1] in ("=", "+", "-", "@", "\t", "\r") else s
 
         buf = io.StringIO()
         w = csv.writer(buf, delimiter=";", lineterminator="\r\n")
-        w.writerow(["Time", "Machine", "Kind", "EventID", "NTLM version",
+        w.writerow(["Time (UTC)", "Machine", "Kind", "EventID", "NTLM version",
                     "Auth path", "User", "Domain", "Process", "Target",
                     "Source/Workstation", "IP", "Logon type", "Encryption",
                     "Reason", "Reason ID", "MIC", "Channel binding", "Server OS",
@@ -582,6 +661,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Disposition",
                          'attachment; filename="ntlm-events.csv"')
         self.send_header("Content-Length", str(len(data)))
+        self._security_headers()
         self.end_headers()
         self.wfile.write(data)
 
@@ -592,6 +672,16 @@ class Handler(BaseHTTPRequestHandler):
         # wirkt hier auch die Maschinenauswahl - dadurch filtert sie global und
         # nicht nur die Ereignisliste. Die Klausel bleibt ein fester String,
         # Benutzereingaben gehen ausschliesslich als Parameter hinein.
+        # Browser UTC offset in minutes (east positive). Everything is stored in
+        # UTC; the day/hour buckets below have to be shifted into the viewer's
+        # local time, otherwise "peak on Sunday at 03:00" names the wrong hour.
+        try:
+            tzoff = int(one("tzoff") or 0)
+        except (TypeError, ValueError):
+            tzoff = 0
+        tzoff = max(-840, min(840, tzoff))          # -14h .. +14h
+        tzmod = f"{tzoff:+d} minutes"               # built from an int, never from input
+
         tf_parts, tp = [], []
         if cutoff:
             tf_parts.append("event_time >= ?"); tp.append(cutoff)
@@ -629,7 +719,11 @@ class Handler(BaseHTTPRequestHandler):
             }
             # Trend: NTLM events per time bucket (24h -> hourly, otherwise daily).
             # Buckets via substr on the ISO string; kerberos separate, for context only.
-            bucket = "substr(event_time,1,13)" if rng == "24h" else "substr(event_time,1,10)"
+            # Buckets in the viewer's local time, same reason as the heatmap:
+            # a "day" that runs 02:00-02:00 would put evening events on the
+            # wrong bar. datetime(...) applies the offset, substr then cuts.
+            bucket = ("substr(datetime(event_time, ?),1,13)" if rng == "24h"
+                      else "substr(datetime(event_time, ?),1,10)")
             trend_rows = c.execute(
                 f"SELECT {bucket} AS b, "
                 f"SUM(CASE WHEN ntlm_version='NTLMv1' THEN 1 ELSE 0 END), "
@@ -637,7 +731,7 @@ class Handler(BaseHTTPRequestHandler):
                 f"SUM(CASE WHEN kind!='kerberos' AND ntlm_version IS NULL THEN 1 ELSE 0 END), "
                 f"SUM(CASE WHEN kind='kerberos' THEN 1 ELSE 0 END) "
                 f"FROM events WHERE event_time IS NOT NULL AND event_time!='' AND {tf} "
-                f"GROUP BY b ORDER BY b DESC LIMIT 60", tp).fetchall()
+                f"GROUP BY b ORDER BY b DESC LIMIT 60", [tzmod] + tp).fetchall()
             trend = [dict(b=r[0], v1=r[1] or 0, v2=r[2] or 0,
                           other=r[3] or 0, krb=r[4] or 0) for r in reversed(trend_rows)]
             # Heatmap weekday x hour: batch jobs and maintenance windows are the
@@ -645,10 +739,10 @@ class Handler(BaseHTTPRequestHandler):
             # pattern over time - the daily trend averages them away.
             # SQLite %w: 0=Sunday..6=Saturday -> shifted to 0=Monday for display.
             heat_rows = c.execute(
-                f"SELECT CAST(strftime('%w', event_time) AS INTEGER), "
-                f"CAST(strftime('%H', event_time) AS INTEGER), COUNT(*) "
+                f"SELECT CAST(strftime('%w', event_time, ?) AS INTEGER), "
+                f"CAST(strftime('%H', event_time, ?) AS INTEGER), COUNT(*) "
                 f"FROM events WHERE kind != 'kerberos' AND {tf} "
-                f"GROUP BY 1, 2", tp).fetchall()
+                f"GROUP BY 1, 2", [tzmod, tzmod] + tp).fetchall()
             heat = [[0] * 24 for _ in range(7)]
             for wd, hr, n in heat_rows:
                 if wd is None or hr is None:
@@ -659,10 +753,10 @@ class Handler(BaseHTTPRequestHandler):
             # programs that actually appear in the blocker table, and bucketed
             # by day so a short range still yields a usable line.
             spark_rows = c.execute(
-                f"SELECT process, date(event_time), COUNT(*) "
+                f"SELECT process, date(event_time, ?), COUNT(*) "
                 f"FROM events WHERE event_id IN (8001,4001,4020,4021,4013) "
                 f"AND process IS NOT NULL AND {tf} "
-                f"GROUP BY 1, 2 ORDER BY 2", tp).fetchall()
+                f"GROUP BY 1, 2 ORDER BY 2", [tzmod] + tp).fetchall()
             spark = {}
             for proc, day, n in spark_rows:
                 spark.setdefault(proc, []).append([day, n])
@@ -813,7 +907,7 @@ class Handler(BaseHTTPRequestHandler):
             if first_all:
                 try:
                     d0 = datetime.strptime(first_all[:19], "%Y-%m-%dT%H:%M:%S")
-                    coverage_days = max(0, (datetime.now() - d0).days)
+                    coverage_days = max(0, (utc_now() - d0).days)
                 except ValueError:
                     coverage_days = None
             stats["coverage_days"] = coverage_days
@@ -839,9 +933,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title data-i18n-doc="1">NTLM-Analyzer</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
   :root{
     --bg:#0b0d11; --panel:#13161d; --panel-2:#171b23; --line:#222834; --line-2:#2c3340;
@@ -852,8 +943,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     --good:#56bd8c; --good-bg:rgba(86,189,140,.13); --good-bd:rgba(86,189,140,.32);
     --neut:#94a0b3; --neut-bg:rgba(148,160,179,.10);--neut-bd:rgba(148,160,179,.24);
     --still:#9b8b67;
-    --sans:'IBM Plex Sans','Segoe UI',system-ui,-apple-system,sans-serif;
-    --mono:'IBM Plex Mono',ui-monospace,'Cascadia Code',Consolas,monospace;
+    /* No webfonts on purpose: the collector has to work in isolated networks,
+       and a security tool should not phone home to a font CDN on every page
+       view. IBM Plex is still used when it happens to be installed locally. */
+    --sans:'IBM Plex Sans','Segoe UI Variable Text','Segoe UI',system-ui,
+           -apple-system,'Helvetica Neue',Arial,sans-serif;
+    --mono:'IBM Plex Mono',ui-monospace,'Cascadia Mono','Cascadia Code',
+           Consolas,'SF Mono',Menlo,'DejaVu Sans Mono',monospace;
   }
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);
@@ -1760,7 +1856,24 @@ function targetIsIp(v){
   const host = raw.split(':')[0];
   return /^\d{1,3}(\.\d{1,3}){3}$/.test(host);
 }
-const when = s => esc((s||"").replace("T"," ").slice(0,16));
+// Stored timestamps are UTC without a marker (that is what Windows puts in the
+// event XML). Appending Z makes the browser parse them correctly and render in
+// the viewer's own timezone - previously they were shown as if already local.
+function toLocal(s){
+  if(!s) return null;
+  const d = new Date(String(s).replace(" ", "T") + "Z");
+  return isNaN(d.getTime()) ? null : d;
+}
+function when(s){
+  const d = toLocal(s);
+  if(!d) return esc((s||"").replace("T"," ").slice(0,16));
+  const p = n => String(n).padStart(2,'0');
+  return esc(d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())
+             +' '+p(d.getHours())+':'+p(d.getMinutes()));
+}
+// Minutes east of UTC, e.g. +120 during CEST. Sent with every request so the
+// server can bucket days and hours the way the viewer experiences them.
+const TZOFF = () => -new Date().getTimezoneOffset();
 function userList(who){
   if(!who) return dash;
   const arr = String(who).split(',').map(s=>s.trim()).filter(Boolean);
@@ -1775,6 +1888,9 @@ function artBadge(e){
   if(e.auth_method=="Downgrade") fb = ' <span class="badge b-bad" title="'+esc(t('tt_down'))+'"><span class="d"></span>'+t('b_down')+'</span>';
   if(e.ntlm_version=="NTLMv1") return '<span class="badge b-bad"'+ti+'><span class="d"></span>'+t('b_v1')+'</span>'+fb;
   if(e.ntlm_version=="NTLMv2") return '<span class="badge b-old"'+ti+'><span class="d"></span>'+t('b_v2')+'</span>'+fb;
+  if(e.kind=="policywarn")     return '<span class="badge b-old"'+ti+'><span class="d"></span>'+t('b_policywarn')+'</span>';
+  if(e.kind=="policyblock")    return '<span class="badge b-bad"'+ti+'><span class="d"></span>'+t('b_policyblock')+'</span>';
+  if(e.kind=="secblock")       return '<span class="badge b-bad"'+ti+'><span class="d"></span>'+t('b_secblock')+'</span>';
   if(e.kind=="cgblock")        return '<span class="badge b-bad"'+ti+'><span class="d"></span>'+t('b_cg')+'</span>';
   if(e.kind=="krbfail")        return '<span class="badge b-old" title="'+esc(t('tt_krbfail')+(e.failure_code?' ('+e.failure_code+')':''))+'"><span class="d"></span>'+t('b_krbfail')+'</span>';
   if(e.kind=="kerberos")       return '<span class="badge b-good"'+ti+'><span class="d"></span>'+t('b_krb')+'</span>';
@@ -1927,7 +2043,8 @@ function evDetailRow(e, id){
     ['d_log',   e.log],
     ['d_eid',   e.event_id + (eidText(e.event_id) ? ' – ' + eidText(e.event_id) : '')],
     ['d_rid',   e.record_id],
-    ['d_time',  (e.event_time||'').replace('T',' ')],
+    ['d_time',  (() => { const d = toLocal(e.event_time);
+                         return d ? d.toLocaleString(LOCALE()) : (e.event_time||''); })()],
     ['d_comp',  e.source],
     ['d_user',  e.user],
     ['d_dom',   e.domain],
@@ -2008,6 +2125,7 @@ function buildParams(){
   if(state.a && state.a!="all") p.set('acct', state.a);
   if(state.src) p.set('source', state.src);
   p.set('range', state.r || 'all');
+  p.set('tzoff', String(TZOFF()));
   return p;
 }
 
@@ -2561,6 +2679,10 @@ def main():
         ap.error("--cert and --tlskey must be given together.")
 
     conn = init_db(args.db)
+    # Per-connection timeout: without it a client that opens a socket and never
+    # sends (or trickles bytes) pins a thread forever - enough such connections
+    # and the thread pool starves (slowloris). 30s is generous for LAN agents.
+    Handler.timeout = 30
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
 
     scheme = "http"
@@ -2584,7 +2706,7 @@ def main():
     if args.retention_days > 0:
         def _retention_loop():
             while True:
-                cutoff = (datetime.now() - timedelta(days=args.retention_days)
+                cutoff = (utc_now() - timedelta(days=args.retention_days)
                           ).strftime("%Y-%m-%dT%H:%M:%S")
                 try:
                     with DB_LOCK:
