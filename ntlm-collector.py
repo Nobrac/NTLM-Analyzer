@@ -389,7 +389,10 @@ class Handler(BaseHTTPRequestHandler):
             if self._login_required():
                 self._redirect("/login")
             else:
-                self._send(200, DASHBOARD_HTML, "text/html; charset=utf-8")
+                page = DASHBOARD_HTML
+                if self.server.pw_hash:   # only show logout when there is a login
+                    page = page.replace('id="logout" hidden', 'id="logout"', 1)
+                self._send(200, page, "text/html; charset=utf-8")
         elif u.path == "/api/export.csv":
             if self._login_required():
                 self._send(401, {"error": "login required"})
@@ -711,6 +714,9 @@ class Handler(BaseHTTPRequestHandler):
                 "procs":   c.execute(f"SELECT COUNT(DISTINCT process) FROM events "
                                      f"WHERE process IS NOT NULL AND process NOT LIKE '(%' AND {tf}", tp).fetchone()[0],
                 "krb":     c.execute(f"SELECT COUNT(DISTINCT target_server) FROM events WHERE kind='kerberos' AND {tf}", tp).fetchone()[0],
+                # Kerberos ticket count (not services): the dashboard needs it to
+                # state what share of authentication still runs over NTLM.
+                "krb_ev":  c.execute(f"SELECT COUNT(*) FROM events WHERE kind='kerberos' AND {tf}", tp).fetchone()[0],
                 "fallback": c.execute(f"SELECT COUNT(*) FROM events WHERE auth_method='Fallback' AND {tf}", tp).fetchone()[0],
                 # Enhanced audits (Server 2025): NTLMv1-derived SSO credentials.
                 # From October 2026 Windows blocks these by itself (BlockNtlmv1SSO).
@@ -933,485 +939,292 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title data-i18n-doc="1">NTLM-Analyzer</title>
+<title>NTLM-Analyzer</title>
 <style>
-  :root{
-    --bg:#0b0d11; --panel:#13161d; --panel-2:#171b23; --line:#222834; --line-2:#2c3340;
-    --ink:#e7eaf0; --soft:#8a93a3; --faint:#5b6373;
-    --accent:#46b3c4; --accent-dim:rgba(70,179,196,.14);
-    --bad:#e76f6a;  --bad-bg:rgba(231,111,106,.12); --bad-bd:rgba(231,111,106,.32);
-    --old:#dba63f;  --old-bg:rgba(219,166,63,.12);  --old-bd:rgba(219,166,63,.32);
-    --good:#56bd8c; --good-bg:rgba(86,189,140,.13); --good-bd:rgba(86,189,140,.32);
-    --neut:#94a0b3; --neut-bg:rgba(148,160,179,.10);--neut-bd:rgba(148,160,179,.24);
-    --still:#9b8b67;
-    /* No webfonts on purpose: the collector has to work in isolated networks,
-       and a security tool should not phone home to a font CDN on every page
-       view. IBM Plex is still used when it happens to be installed locally. */
-    --sans:'IBM Plex Sans','Segoe UI Variable Text','Segoe UI',system-ui,
-           -apple-system,'Helvetica Neue',Arial,sans-serif;
-    --mono:'IBM Plex Mono',ui-monospace,'Cascadia Mono','Cascadia Code',
-           Consolas,'SF Mono',Menlo,'DejaVu Sans Mono',monospace;
-  }
-  *{box-sizing:border-box}
-  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);
-    font-size:14.5px;line-height:1.55;-webkit-font-smoothing:antialiased;
-    background-image:radial-gradient(rgba(255,255,255,.022) 1px, transparent 1px);
-    background-size:22px 22px;background-position:-1px -1px;}
-  ::selection{background:var(--accent-dim);color:#fff}
-  .wrap{max-width:1160px;margin:0 auto;padding:30px 22px 72px}
+:root{
+  --void:#080b14; --card:#111827; --card2:#141c2e;
+  --edge:rgba(148,170,220,.10); --edge2:rgba(148,170,220,.20);
+  --ink:#e8edf7; --dim:#93a2bd; --faint:#5d6b87;
+  --v1:#ff6b6b; --v2:#f5b841; --krb:#3ddc97; --pol:#a78bfa; --grey:#4a5872;
+  --disp:'Segoe UI Variable Display','Segoe UI',system-ui,-apple-system,sans-serif;
+  --text:'Segoe UI Variable Text','Segoe UI',system-ui,-apple-system,sans-serif;
+  --mono:'Cascadia Mono','IBM Plex Mono',ui-monospace,Consolas,'SF Mono',monospace;
+  --r:14px; --pad:clamp(16px,2.2vw,38px);
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--void);color:var(--ink);font-family:var(--text);font-size:13.5px;
+  line-height:1.5;-webkit-font-smoothing:antialiased;overflow-x:hidden}
+body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:0;
+  background:radial-gradient(1200px 600px at 10% -8%,rgba(255,107,107,.05),transparent 62%),
+             radial-gradient(1200px 700px at 90% 108%,rgba(61,220,151,.042),transparent 62%)}
+.stage{position:relative;z-index:1}
+::selection{background:rgba(61,220,151,.25)}
+:focus-visible{outline:2px solid var(--krb);outline-offset:2px;border-radius:6px}
+button{font:inherit}
+a{color:inherit}
 
-  header.top{padding-bottom:18px;margin-bottom:22px;border-bottom:1px solid var(--line);position:relative}
-  .langbar{position:absolute;top:2px;right:0;display:flex;gap:6px}
-  .lchip{cursor:pointer;font-family:var(--mono);font-size:11.5px;color:var(--soft);
-    border:1px solid var(--line-2);border-radius:7px;padding:5px 10px;user-select:none;transition:all .12s}
-  .lchip:hover{color:var(--ink);border-color:var(--faint)}
-  .lchip.on{background:var(--accent-dim);color:var(--accent);border-color:var(--accent)}
-  .top h1{font-weight:600;font-size:25px;letter-spacing:-.2px;margin:0 0 7px;
-    display:flex;align-items:center;gap:11px}
-  .top h1::before{content:"";width:8px;height:19px;border-radius:2px;
-    background:linear-gradient(180deg,var(--accent),#2c8f9e);box-shadow:0 0 14px var(--accent-dim)}
-  .top p{margin:0;color:var(--soft);font-size:14px;max-width:74ch}
-  .live{display:inline-flex;align-items:center;gap:9px;margin-top:13px;
-    color:var(--soft);font-size:12px;font-family:var(--mono);letter-spacing:.02em}
-  .live .dot{width:7px;height:7px;border-radius:50%;background:var(--accent);position:relative;flex:none}
-  .live .dot::after{content:"";position:absolute;inset:-4px;border-radius:50%;
-    border:1px solid var(--accent);opacity:.5;animation:pulse 2.4s ease-out infinite}
-  @keyframes pulse{0%{transform:scale(.5);opacity:.6}100%{transform:scale(1.7);opacity:0}}
+header{position:sticky;top:0;z-index:60;backdrop-filter:blur(18px) saturate(1.4);
+  background:rgba(8,11,20,.76);border-bottom:1px solid var(--edge)}
+.hin{padding:0 var(--pad);height:58px;display:flex;align-items:center;gap:16px}
+.logo{display:flex;align-items:center;gap:11px;font-family:var(--disp);font-size:15px;font-weight:600;
+  letter-spacing:-.02em;white-space:nowrap}
+.orb{width:9px;height:9px;border-radius:50%;background:var(--krb);position:relative;flex:none}
+.orb::after{content:"";position:absolute;inset:-5px;border-radius:50%;border:1px solid var(--krb);
+  opacity:.35;animation:ping 3.2s cubic-bezier(.2,.7,.3,1) infinite}
+.orb.stale{background:var(--v2)} .orb.stale::after{border-color:var(--v2)}
+@keyframes ping{0%{transform:scale(.6);opacity:.5}70%,100%{transform:scale(1.5);opacity:0}}
+.tools{display:flex;align-items:center;gap:8px;margin-left:auto;flex-wrap:wrap;justify-content:flex-end}
+.pill{display:flex;background:rgba(255,255,255,.035);border:1px solid var(--edge);border-radius:9px;
+  padding:2px;gap:2px}
+.pill button{background:none;border:0;color:var(--dim);font-family:var(--mono);font-size:11px;
+  padding:5px 11px;border-radius:7px;cursor:pointer;transition:.18s;white-space:nowrap}
+.pill button:hover{color:var(--ink)}
+.pill button[aria-pressed=true]{background:rgba(255,255,255,.08);color:var(--ink)}
+select,.ghost{background:rgba(255,255,255,.035);border:1px solid var(--edge);color:var(--ink);
+  border-radius:9px;padding:6px 10px;font-family:var(--mono);font-size:11px;cursor:pointer;transition:.18s}
+select:hover,.ghost:hover{border-color:var(--edge2);background:rgba(255,255,255,.06)}
+.ghost[aria-pressed=true]{background:rgba(61,220,151,.1);border-color:rgba(61,220,151,.35);color:#9ff0cb}
 
-  .legend{display:flex;flex-wrap:wrap;gap:10px 22px;align-items:center;
-    font-family:var(--mono);font-size:12px;color:var(--soft);
-    border:1px solid var(--line);border-radius:10px;background:var(--panel);
-    padding:11px 16px;margin:20px 0 24px}
-  .legend .goal{font-weight:600;color:var(--ink);margin-right:auto;
-    text-transform:uppercase;letter-spacing:.05em;font-size:11px}
-  .key{display:inline-flex;align-items:center;gap:8px}
-  .swatch{width:9px;height:9px;border-radius:2px;display:inline-block}
-  .s-bad{background:var(--bad)}.s-old{background:var(--old)}.s-good{background:var(--good)}
+.jump{position:sticky;top:58px;z-index:55;backdrop-filter:blur(14px);background:rgba(8,11,20,.7);
+  border-bottom:1px solid var(--edge);padding:9px var(--pad);display:flex;gap:5px;flex-wrap:wrap}
+.jl{background:none;border:1px solid transparent;color:var(--faint);font-family:var(--mono);
+  font-size:10.5px;padding:4px 9px;border-radius:7px;cursor:pointer;transition:.16s;display:flex;
+  gap:6px;align-items:center;white-space:nowrap}
+.jl:hover{color:var(--ink);border-color:var(--edge)}
+.jl b{color:var(--dim);font-weight:400;font-variant-numeric:tabular-nums}
+.jl.nil{opacity:.4}
 
-  .stats{display:grid;grid-template-columns:repeat(6,1fr);gap:1px;
-    background:var(--line);border:1px solid var(--line);border-radius:12px;
-    overflow:hidden;margin-bottom:26px}
-  .stat{background:var(--panel);padding:17px 16px 15px;position:relative;
-    display:flex;flex-direction:column;min-height:106px}
-  .stat::before{content:"";position:absolute;left:0;top:0;height:2px;width:100%;
-    background:var(--neut);opacity:.45}
-  .stat.bad::before{background:var(--bad);opacity:1}
-  .stat.old::before{background:var(--old);opacity:1}
-  .stat.good::before{background:var(--good);opacity:1}
-  .num{font-family:var(--mono);font-weight:600;font-size:30px;line-height:1;
-    letter-spacing:-.5px;font-variant-numeric:tabular-nums;color:var(--ink)}
-  .lab{font-size:12px;font-weight:600;color:var(--ink);margin-top:9px;
-    text-transform:uppercase;letter-spacing:.04em}
-  .sub{font-size:11.5px;color:var(--soft);margin-top:2px}
-  .stat.clickable{cursor:pointer;transition:background .14s}
-  .stat.clickable:hover{background:var(--panel-2)}
-  .stat.clickable:hover .num{color:#fff}
-  .stat.clickable:focus-visible{outline:none;box-shadow:inset 0 0 0 1px var(--accent)}
-  .stat.clickable::after{content:"\203A";position:absolute;right:13px;top:11px;
-    color:var(--faint);opacity:0;font-size:17px;transition:opacity .14s,transform .14s}
-  .stat.clickable:hover::after{opacity:1;transform:translateX(2px)}
+.hero{padding:48px var(--pad) 30px}
+.eyebrow{font-family:var(--mono);font-size:10.5px;letter-spacing:.18em;text-transform:uppercase;
+  color:var(--faint);margin-bottom:16px}
+.thesis{font-family:var(--disp);font-size:clamp(28px,3.5vw,52px);font-weight:340;line-height:1.09;
+  letter-spacing:-.035em;max-width:24ch;margin:0 0 8px}
+.thesis .big{font-weight:640;font-variant-numeric:tabular-nums}
+.thesis .fade{color:var(--faint)}
+.sub{color:var(--dim);font-size:14.5px;max-width:66ch;margin:0 0 30px}
+.handbar{display:flex;height:44px;border-radius:10px;overflow:hidden;gap:2px;background:var(--edge);
+  margin-bottom:12px}
+.seg{position:relative;width:0;transition:width 1.4s cubic-bezier(.16,1,.3,1);overflow:hidden;
+  display:flex;align-items:center;padding:0 14px;cursor:pointer}
+.seg.s1{background:linear-gradient(180deg,rgba(255,107,107,.30),rgba(255,107,107,.16))}
+.seg.s2{background:linear-gradient(180deg,rgba(245,184,65,.28),rgba(245,184,65,.14))}
+.seg.s3{background:linear-gradient(180deg,rgba(61,220,151,.26),rgba(61,220,151,.13))}
+.seg::after{content:"";position:absolute;left:0;top:0;bottom:0;width:2px}
+.seg.s1::after{background:var(--v1)}.seg.s2::after{background:var(--v2)}.seg.s3::after{background:var(--krb)}
+.seg b{font-family:var(--mono);font-size:11.5px;font-weight:500;white-space:nowrap;opacity:0;
+  transition:opacity .5s .8s}
+.seg.s1 b{color:#ffb3b3}.seg.s2 b{color:#ffd894}.seg.s3 b{color:#9ff0cb}
+.seg:hover{filter:brightness(1.3)}
+.handkey{display:flex;gap:20px;flex-wrap:wrap;font-family:var(--mono);font-size:11px;color:var(--faint)}
+.handkey i{display:inline-block;width:7px;height:7px;border-radius:2px;margin-right:7px}
+.deadline{display:flex;align-items:center;gap:16px;margin-top:26px;padding:15px 19px;
+  border:1px solid var(--edge);border-radius:var(--r);background:rgba(255,107,107,.045);max-width:700px}
+.dnum{font-family:var(--disp);font-size:33px;font-weight:620;letter-spacing:-.03em;color:var(--v1);
+  font-variant-numeric:tabular-nums;line-height:1}
+.dtxt{font-size:13px;color:var(--dim)}
+.dtxt b{color:var(--ink);font-weight:600;display:block;font-size:13.5px;margin-bottom:2px}
 
-  section{background:var(--panel);border:1px solid var(--line);border-radius:12px;
-    margin-bottom:18px;overflow:hidden}
-  .head{padding:16px 20px 13px;border-bottom:1px solid var(--line)}
-  .head h2{font-size:15px;font-weight:600;margin:0;letter-spacing:-.1px;
-    display:flex;align-items:center;gap:9px;flex-wrap:wrap}
-  .head p{margin:8px 0 0;color:var(--soft);font-size:13px;line-height:1.5;max-width:90ch}
+.focus{display:flex;gap:10px;flex-wrap:wrap;padding:0 var(--pad) 20px}
+.fc{flex:1 1 210px;border:1px solid var(--edge);border-radius:11px;padding:12px 14px;background:var(--card);
+  cursor:pointer;transition:transform .22s cubic-bezier(.16,1,.3,1),border-color .22s,background .22s;
+  text-align:left;color:inherit}
+.fc:hover{transform:translateY(-3px);border-color:var(--edge2);background:var(--card2)}
+.fc .k{font-family:var(--mono);font-size:9.5px;letter-spacing:.13em;text-transform:uppercase;
+  color:var(--faint);margin-bottom:6px}
+.fc .v{font-family:var(--disp);font-size:15px;font-weight:580;letter-spacing:-.015em;margin-bottom:3px}
+.fc .w{font-family:var(--mono);font-size:10.5px;color:var(--dim)}
 
-  .scroll{overflow-x:auto}
-  .scroll::-webkit-scrollbar{height:8px}
-  .scroll::-webkit-scrollbar-thumb{background:var(--line-2);border-radius:4px}
-  table{width:100%;border-collapse:collapse;font-size:13.5px}
-  thead th{text-align:left;background:var(--panel-2);font-family:var(--mono);
-    font-size:11px;font-weight:500;text-transform:uppercase;letter-spacing:.05em;
-    color:var(--soft);padding:10px 18px;border-bottom:1px solid var(--line);white-space:nowrap}
-  tbody td{padding:11px 18px;border-bottom:1px solid var(--line);vertical-align:middle}
-  tbody tr:last-child td{border-bottom:none}
-  tbody tr{transition:background .1s}
-  tbody tr:hover td{background:rgba(255,255,255,.022)}
-  .strong{font-weight:600;color:var(--ink)}
-  .soft{color:var(--soft)}
-  .mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
-  .num-cell{text-align:right;font-family:var(--mono);font-variant-numeric:tabular-nums;color:var(--ink)}
-  .empty{padding:30px 18px;text-align:center;color:var(--faint);font-size:13px}
+.grid{padding:0 var(--pad) 90px;display:grid;gap:14px;
+  grid-template-columns:repeat(auto-fit,minmax(360px,1fr))}
+.c2{grid-column:span 2}.call{grid-column:1/-1}
+@media(max-width:1150px){.c2,.call{grid-column:span 1}}
+.card{border:1px solid var(--edge);border-radius:var(--r);scroll-margin-top:118px;
+  background:linear-gradient(180deg,rgba(255,255,255,.022),transparent 40%),var(--card);
+  overflow:hidden;opacity:0;transform:translateY(16px);
+  transition:opacity .6s cubic-bezier(.16,1,.3,1),transform .6s cubic-bezier(.16,1,.3,1),border-color .25s}
+.card.in{opacity:1;transform:none}
+.card:hover{border-color:var(--edge2)}
+.ch{display:flex;align-items:center;gap:10px;padding:14px 17px 11px;flex-wrap:wrap}
+.ch h2{margin:0;font-family:var(--disp);font-size:14.5px;font-weight:580;letter-spacing:-.012em}
+.ch .meta{margin-left:auto;font-family:var(--mono);font-size:10.5px;color:var(--faint)}
+.flag{font-family:var(--mono);font-size:9.5px;letter-spacing:.09em;text-transform:uppercase;
+  padding:2px 7px;border-radius:5px;border:1px solid var(--edge2);color:var(--dim)}
+.flag.due{color:var(--v1);border-color:rgba(255,107,107,.35);background:rgba(255,107,107,.07)}
+.flag.ok{color:var(--krb);border-color:rgba(61,220,151,.3);background:rgba(61,220,151,.06)}
+.mini{background:rgba(255,255,255,.04);border:1px solid var(--edge);color:var(--dim);border-radius:7px;
+  padding:3px 9px;font-family:var(--mono);font-size:10px;cursor:pointer;transition:.16s}
+.mini:hover{color:var(--ink);border-color:var(--krb)}
 
-  .heatwrap{display:grid;grid-template-columns:38px repeat(24,1fr);gap:2px;margin-top:4px}
-  .hcell{height:15px;border-radius:2px;background:#171d26}
-  .hhr{font-size:9px;color:#5d6b7c;text-align:center;line-height:12px}
-  .hday{font-size:11px;color:#8fa0b4;line-height:15px}
-  .sparkrow{display:flex;align-items:center;gap:10px}
-  .sparkrow svg{flex:none}
-  .btn{background:#1c2430;border:1px solid #2e3a4a;color:#c6d4e2;border-radius:7px;
-       padding:6px 14px;font:inherit;font-size:13px;cursor:pointer;margin-top:8px}
-  .btn:hover{background:#243044}
-  .excbox{margin-top:10px;background:#0d1218;border:1px solid #2e3a4a;border-radius:9px;padding:12px}
-  .excbox textarea{width:100%;box-sizing:border-box;background:#0a0e13;color:#d8e4ef;
-       border:1px solid #26303d;border-radius:7px;padding:9px;font-family:ui-monospace,monospace;
-       font-size:12.5px;resize:vertical;margin:6px 0}
-  .tgtwrap{display:inline-flex;align-items:center;gap:10px;white-space:nowrap}
-  .badge.b-inline{padding:3px 11px;gap:7px}
-  .badge{display:inline-flex;align-items:center;gap:6px;padding:3px 9px;border-radius:6px;
-    font-size:11.5px;font-weight:500;font-family:var(--mono);letter-spacing:.01em;
-    white-space:nowrap;border:1px solid transparent;line-height:1.45}
-  .badge .d{width:6px;height:6px;border-radius:50%;flex:none}
-  .b-bad{background:var(--bad-bg);color:var(--bad);border-color:var(--bad-bd)} .b-bad .d{background:var(--bad)}
-  .b-old{background:var(--old-bg);color:var(--old);border-color:var(--old-bd)} .b-old .d{background:var(--old)}
-  .b-good{background:var(--good-bg);color:var(--good);border-color:var(--good-bd)} .b-good .d{background:var(--good)}
-  .b-neut{background:var(--neut-bg);color:var(--neut);border-color:var(--neut-bd)} .b-neut .d{background:var(--neut)}
+table{width:100%;border-collapse:collapse}
+th{font-family:var(--mono);font-size:9.5px;letter-spacing:.11em;text-transform:uppercase;color:var(--faint);
+  font-weight:400;text-align:left;padding:6px 17px 9px;white-space:nowrap}
+td{padding:8px 17px;border-top:1px solid rgba(148,170,220,.07);font-size:12.8px}
+tbody tr{transition:background .16s}
+tbody tr.click{cursor:pointer}
+tbody tr.click:hover{background:rgba(148,170,220,.06)}
+.r{text-align:right;font-family:var(--mono);font-variant-numeric:tabular-nums}
+.mn{font-family:var(--mono);font-size:11.5px}
+.dm{color:var(--faint)}
+.nm{font-weight:560}
+.cut{display:inline-block;max-width:30ch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  vertical-align:bottom}
+.tag{display:inline-block;font-family:var(--mono);font-size:10px;padding:1px 6px;border-radius:5px;
+  border:1px solid;line-height:15px;white-space:nowrap}
+.tag.v1{color:var(--v1);border-color:rgba(255,107,107,.32);background:rgba(255,107,107,.07)}
+.tag.v2{color:var(--v2);border-color:rgba(245,184,65,.32);background:rgba(245,184,65,.07)}
+.tag.krb{color:var(--krb);border-color:rgba(61,220,151,.3);background:rgba(61,220,151,.06)}
+.tag.pol{color:var(--pol);border-color:rgba(167,139,250,.32);background:rgba(167,139,250,.07)}
+.tag.n{color:var(--faint);border-color:var(--edge2)}
+.sel-st{background:rgba(255,255,255,.04);border:1px solid var(--edge);color:var(--dim);border-radius:7px;
+  padding:2px 6px;font-family:var(--mono);font-size:10.5px}
+.done td{opacity:.42}
+.empty{padding:30px 17px;text-align:center;color:var(--faint);font-size:12.5px}
+.empty b{display:block;color:var(--dim);font-size:13.5px;margin-bottom:5px;font-weight:500}
 
-  .bars{padding:10px 20px 18px;display:grid;gap:13px}
-  .bar .row{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px;gap:12px}
-  .bar .nm{font-weight:500;color:var(--ink);font-size:13.5px}
-  .bar .ct{font-family:var(--mono);font-size:12px;color:var(--soft);font-variant-numeric:tabular-nums}
-  .track{height:7px;border-radius:4px;background:var(--line-2);overflow:hidden}
-  .fill{height:100%;border-radius:4px}
-  .fill.bad{background:linear-gradient(90deg,#b94a45,var(--bad))}
-  .fill.good{background:linear-gradient(90deg,#3f9d72,var(--good))}
+.bar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:0 17px 12px}
+.search{flex:1 1 240px;min-width:160px;background:rgba(255,255,255,.035);border:1px solid var(--edge);
+  color:var(--ink);border-radius:9px;padding:7px 11px;font-family:var(--mono);font-size:11.5px}
+.search::placeholder{color:var(--faint)}
+.search:focus{outline:none;border-color:var(--edge2);background:rgba(255,255,255,.06)}
+.chipset{display:flex;gap:5px;flex-wrap:wrap}
+.chip{background:rgba(255,255,255,.035);border:1px solid var(--edge);color:var(--dim);border-radius:8px;
+  padding:4px 9px;font-family:var(--mono);font-size:10.5px;cursor:pointer;transition:.16s;white-space:nowrap}
+.chip:hover{color:var(--ink);border-color:var(--edge2)}
+.chip[aria-pressed=true]{background:rgba(255,255,255,.09);color:var(--ink);border-color:var(--edge2)}
+.active{display:flex;gap:6px;flex-wrap:wrap;padding:0 17px 11px}
+.afl{display:inline-flex;align-items:center;gap:7px;background:rgba(61,220,151,.09);
+  border:1px solid rgba(61,220,151,.28);color:#9ff0cb;border-radius:8px;padding:4px 8px;
+  font-family:var(--mono);font-size:10.5px}
+.afl button{background:none;border:0;color:inherit;cursor:pointer;opacity:.7;padding:0 0 0 2px;font-size:13px}
+.afl button:hover{opacity:1}
+.clearall{background:none;border:0;color:var(--faint);font-family:var(--mono);font-size:10.5px;
+  cursor:pointer;text-decoration:underline;text-underline-offset:3px}
+.clearall:hover{color:var(--ink)}
+.more{display:block;width:100%;background:rgba(255,255,255,.03);border:0;border-top:1px solid var(--edge);
+  color:var(--dim);font-family:var(--mono);font-size:11px;padding:11px;cursor:pointer;transition:.16s}
+.more:hover{background:rgba(255,255,255,.06);color:var(--ink)}
 
-  .secnav{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:7px;flex-wrap:wrap;
-    background:var(--panel);border:1px solid var(--line);border-radius:10px;
-    padding:9px 12px;margin:0 0 16px}
-  .navlabel{color:var(--faint);font-family:var(--mono);font-size:10px;letter-spacing:.06em;
-    text-transform:uppercase;margin-right:4px}
-  .navchip{display:inline-flex;align-items:center;gap:7px;padding:4px 11px;border-radius:6px;
-    font-family:var(--mono);font-size:11.5px;color:var(--soft);border:1px solid var(--line-2);
-    cursor:pointer;white-space:nowrap;transition:border-color .12s,color .12s}
-  .navchip:hover{border-color:var(--accent);color:var(--ink)}
-  .navchip .n{background:var(--line);border-radius:9px;padding:0 6px;font-size:10.5px}
-  .navchip.t-bad{color:var(--bad);border-color:var(--bad-bd)}
-  .navchip.t-bad .n{background:var(--bad-bg)}
-  .navchip.t-warn{color:var(--old);border-color:var(--old-bd)}
-  .navchip.t-warn .n{background:var(--old-bg)}
-  .navchip.t-good{color:var(--good);border-color:var(--good-bd)}
-  .navchip.t-good .n{background:var(--good-bg)}
-  .navchip.empty{color:var(--faint);border:1px dashed var(--line);cursor:default}
-  .navchip.empty:hover{border-color:var(--line);color:var(--faint)}
-  .navchip.empty .n{background:none;padding:0}
-  .navchip.active{background:var(--accent-dim);border-color:var(--accent);color:var(--ink)}
-  body.hide-done tr.row-done{display:none}
-  .gsep{display:inline-block;width:1px;height:18px;background:var(--line-2);margin:0 10px;vertical-align:middle}
-  .gsel{background:var(--panel);color:var(--ink);border:1px solid var(--line-2);border-radius:6px;
-    padding:4px 8px;font-family:var(--mono);font-size:11.5px;max-width:230px}
-  .gtoggle{display:inline-flex;align-items:center;gap:6px;margin-left:14px;color:var(--soft);
-    font-size:11.5px;font-family:var(--mono);cursor:pointer;user-select:none}
-  .gtoggle input{accent-color:var(--accent);cursor:pointer}
-  .coverage{margin-top:8px !important;font-family:var(--mono);font-size:11.5px}
-  .coverage .warn{color:var(--old)}
-  .coverage .ok{color:var(--good)}
-  .fsep{width:1px;height:20px;background:var(--line-2);margin:0 4px;display:inline-block;vertical-align:middle}
-.filters{display:flex;flex-wrap:wrap;gap:8px;padding:14px 20px;
-    border-bottom:1px solid var(--line);align-items:center}
-  #q{flex:1;min-width:220px;background:var(--bg);border:1px solid var(--line-2);
-    border-radius:8px;color:var(--ink);padding:9px 12px;font-family:var(--sans);
-    font-size:13.5px;outline:none}
-  #q::placeholder{color:var(--faint)}
-  #q:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-dim)}
-  .chip{cursor:pointer;font-family:var(--mono);font-size:12px;color:var(--soft);
-    border:1px solid var(--line-2);border-radius:7px;padding:6px 11px;
-    user-select:none;transition:all .12s;white-space:nowrap}
-  .chip:hover{color:var(--ink);border-color:var(--faint)}
-  .chip.on{background:var(--accent-dim);color:var(--accent);border-color:var(--accent)}
+.bars{padding:8px 17px 15px}
+.brow{margin-bottom:10px;cursor:pointer}
+.brow:last-child{margin-bottom:0}
+.brow:hover .blab{color:var(--ink)}
+.blab{display:flex;justify-content:space-between;gap:10px;font-size:12.5px;margin-bottom:4px;
+  color:var(--dim);transition:color .16s}
+.blab .bn{font-family:var(--mono);font-size:11px;color:var(--faint);flex:none}
+.blab .btx{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.btr{height:4px;background:rgba(148,170,220,.09);border-radius:3px;overflow:hidden}
+.bfl{height:100%;width:0;border-radius:3px;transition:width 1s cubic-bezier(.16,1,.3,1)}
+.bfl.red{background:linear-gradient(90deg,#c94a4a,var(--v1))}
+.bfl.amb{background:linear-gradient(90deg,#c08b2c,var(--v2))}
 
-  .rangebar{display:flex;align-items:center;gap:8px;margin:0 0 14px}
-  .rlabel{font-family:var(--mono);font-size:11px;font-weight:600;color:var(--soft);
-    text-transform:uppercase;letter-spacing:.05em;margin-right:4px}
-  .rchip{cursor:pointer;font-family:var(--mono);font-size:12px;color:var(--soft);
-    border:1px solid var(--line-2);border-radius:7px;padding:6px 12px;
-    user-select:none;transition:all .12s;white-space:nowrap}
-  .rchip:hover{color:var(--ink);border-color:var(--faint)}
-  .rchip.on{background:var(--accent-dim);color:var(--accent);border-color:var(--accent)}
+.blocks{padding:14px 17px 6px;display:flex;align-items:flex-end;gap:2px;height:150px}
+.bcol{flex:1;display:flex;flex-direction:column;justify-content:flex-end;min-width:0;cursor:default;
+  transition:opacity .16s}
+.bcol:hover{opacity:.7}
+.bcol span{display:block;transition:height .8s cubic-bezier(.16,1,.3,1)}
+.axis{display:flex;justify-content:space-between;padding:4px 17px 14px;font-family:var(--mono);
+  font-size:9.5px;color:var(--faint)}
 
-  .trend{display:flex;align-items:flex-end;gap:5px;padding:20px 20px 12px;min-height:120px}
-  .tcol{flex:1;min-width:6px;display:flex;flex-direction:column;align-items:stretch}
-  .tbar{display:flex;flex-direction:column;justify-content:flex-end;height:130px}
-  .tseg{width:100%}
-  .tseg.s1{background:var(--bad)}
-  .tseg.s2{background:var(--old)}
-  .tseg.s0{background:var(--line-2)}
-  .tbar .tseg:first-child{border-radius:3px 3px 0 0}
-  .tlab{font-family:var(--mono);font-size:10px;color:var(--faint);text-align:center;
-    margin-top:6px;white-space:nowrap;overflow:visible;height:14px}
-  .trend .empty{width:100%}
+.hm{padding:4px 17px 15px}
+.hr{display:grid;grid-template-columns:20px repeat(24,1fr);gap:2px;align-items:center;margin-bottom:2px}
+.hr .lb{font-family:var(--mono);font-size:9px;color:var(--faint)}
+.hc{aspect-ratio:1;border-radius:2px;background:rgba(148,170,220,.05);transform:scale(.4);opacity:0;
+  transition:transform .5s cubic-bezier(.16,1,.3,1),opacity .5s}
+.hc.in{transform:scale(1);opacity:1}
+.hnote{font-family:var(--mono);font-size:10.5px;color:var(--dim);margin-top:11px;padding-top:10px;
+  border-top:1px solid var(--edge)}
+.hnote b{color:var(--v2);font-weight:500}
 
-  .stsel{background:var(--bg);border:1px solid var(--line-2);border-radius:6px;color:var(--soft);
-    font-family:var(--mono);font-size:11.5px;padding:4px 6px;outline:none;cursor:pointer}
-  .stsel.st-arbeit{color:var(--old);border-color:var(--old-bd)}
-  .stsel.st-erledigt{color:var(--good);border-color:var(--good-bd)}
-  tr.row-done td{opacity:.55}
-  .hintbtn{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;
-    border-radius:50%;border:1px solid var(--line-2);color:var(--faint);font-family:var(--mono);
-    font-size:11px;cursor:pointer;user-select:none;margin-left:7px;vertical-align:middle;flex:none}
-  .hintbtn:hover,.hintbtn.on{color:var(--accent);border-color:var(--accent)}
-  tr.hintrow td{background:var(--accent-dim);color:var(--soft);font-size:12.5px;line-height:1.55;
-    padding:12px 18px;border-left:2px solid var(--accent);border-radius:0}
-  tr.hintrow b{color:var(--ink);font-weight:600}
+.scrim{position:fixed;inset:0;background:rgba(4,6,12,.62);backdrop-filter:blur(3px);opacity:0;
+  pointer-events:none;transition:opacity .3s;z-index:70}
+.scrim.on{opacity:1;pointer-events:auto}
+.drawer{position:fixed;top:0;right:0;bottom:0;width:min(540px,100%);background:#0d1422;
+  border-left:1px solid var(--edge2);z-index:80;transform:translateX(100%);
+  transition:transform .42s cubic-bezier(.16,1,.3,1);display:flex;flex-direction:column;
+  box-shadow:-30px 0 70px rgba(0,0,0,.45)}
+.drawer.on{transform:none}
+.dh{padding:20px 22px 15px;border-bottom:1px solid var(--edge);display:flex;align-items:flex-start;gap:12px}
+.dh h3{margin:0 0 5px;font-family:var(--disp);font-size:17px;font-weight:580;letter-spacing:-.02em}
+.dh .when{font-family:var(--mono);font-size:11px;color:var(--faint)}
+.x{background:rgba(255,255,255,.05);border:1px solid var(--edge);color:var(--dim);border-radius:8px;
+  width:30px;height:30px;cursor:pointer;margin-left:auto;flex:none;transition:.16s;font-size:15px}
+.x:hover{color:var(--ink);border-color:var(--edge2)}
+.dbody{overflow-y:auto;padding:4px 0 26px;flex:1}
+.expl{margin:15px 22px;padding:13px 15px;border:1px solid var(--edge);border-radius:11px;
+  background:rgba(148,170,220,.04);font-size:12.5px;color:var(--dim);line-height:1.55}
+.expl b{display:block;color:var(--ink);font-weight:600;margin-bottom:4px}
+.grp{margin:17px 22px 0}
+.grp .gk{font-family:var(--mono);font-size:9.5px;letter-spacing:.13em;text-transform:uppercase;
+  color:var(--faint);padding-bottom:8px;border-bottom:1px solid var(--edge);margin-bottom:4px}
+.fr{display:grid;grid-template-columns:130px 1fr;gap:12px;padding:6px 0;font-size:12.5px;
+  border-bottom:1px solid rgba(148,170,220,.05)}
+.fr:last-child{border-bottom:0}
+.fr .fk{color:var(--faint);font-family:var(--mono);font-size:10.5px;padding-top:2px}
+.fr .fv{font-family:var(--mono);font-size:12px;word-break:break-word}
+.fr .fv.none{color:var(--faint)}
+.dact{display:flex;gap:8px;flex-wrap:wrap;margin:19px 22px 0}
+.dact button{flex:1 1 auto;background:rgba(255,255,255,.04);border:1px solid var(--edge);color:var(--dim);
+  border-radius:9px;padding:8px 12px;font-family:var(--mono);font-size:10.5px;cursor:pointer;transition:.18s}
+.dact button:hover{color:var(--ink);border-color:var(--krb);background:rgba(61,220,151,.07)}
+.code{margin:15px 22px;background:#080d16;border:1px solid var(--edge);border-radius:10px;padding:13px 15px;
+  font-family:var(--mono);font-size:11.5px;color:var(--dim);white-space:pre-wrap;word-break:break-all;
+  max-height:360px;overflow-y:auto}
 
-  tr.evrow{cursor:pointer}
-  tr.evrow:hover td{background:rgba(255,255,255,.018)}
-  tr.evrow .chev{display:inline-block;width:14px;color:var(--faint);font-size:10px;
-    transition:transform .12s}
-  tr.evrow.evopen td{border-bottom:none}
-  tr.detrow td{background:var(--panel-2);padding:14px 18px 16px;
-    border-left:2px solid var(--line-2)}
-  .dhead{font-family:var(--mono);font-size:11px;font-weight:600;color:var(--soft);
-    text-transform:uppercase;letter-spacing:.05em;margin-bottom:10px}
-  .dgrid{display:grid;grid-template-columns:170px 1fr;gap:5px 16px;max-width:720px}
-  .dlab{font-family:var(--mono);font-size:11px;color:var(--faint);
-    text-transform:uppercase;letter-spacing:.04em;padding-top:1px}
-  .dval{font-family:var(--mono);font-size:12.5px;color:var(--ink);word-break:break-all}
-
-  footer{margin-top:24px;text-align:center;color:var(--faint);font-size:12px;font-family:var(--mono)}
-
-  @media(max-width:880px){.stats{grid-template-columns:repeat(3,1fr)}}
-  @media(max-width:520px){.stats{grid-template-columns:repeat(2,1fr)}.wrap{padding:22px 14px 56px}}
+@media(prefers-reduced-motion:reduce){
+  *,*::before,*::after{animation:none!important;transition:none!important}
+  .card{opacity:1;transform:none}.hc{opacity:1;transform:none}
+}
+@media(max-width:720px){
+  .hin{gap:10px;overflow-x:auto}.hero{padding:30px var(--pad) 20px}
+  .fr{grid-template-columns:1fr;gap:2px}.jump{overflow-x:auto;flex-wrap:nowrap}
+}
 </style>
 </head>
 <body>
-<div class="wrap">
-
-  <header class="top">
-    <div class="langbar"><span class="lchip on" data-l="de">DE</span><span class="lchip" data-l="en">EN</span></div>
-    <h1 data-i18n="h1">NTLM-Analyzer</h1>
-    <p data-i18n="intro">Who on the network still uses the legacy NTLM authentication – and what already runs securely over Kerberos. The goal is to phase NTLM out step by step.</p>
-    <div class="live"><span class="dot"></span> <span data-i18n="live">Refreshes automatically · last</span> <span id="updated">–</span></div>
-  </header>
-
-  <div class="legend">
-    <span class="goal" data-i18n="leg_goal">Color legend</span>
-    <span class="key"><span class="swatch s-bad"></span> <span data-i18n="leg_bad">Red = insecure (NTLMv1)</span></span>
-    <span class="key"><span class="swatch s-old"></span> <span data-i18n="leg_old">Yellow = outdated (NTLMv2)</span></span>
-    <span class="key"><span class="swatch s-good"></span> <span data-i18n="leg_good">Green = secure (Kerberos)</span></span>
+<div class="stage">
+<header><div class="hin">
+  <div class="logo"><span class="orb" id="orb"></span><span id="brand">NTLM-Analyzer</span></div>
+  <div class="tools">
+    <div class="pill" id="range"></div>
+    <select id="mach"></select>
+    <button class="ghost" id="hide"></button>
+    <button class="ghost" id="csv">CSV</button>
+    <button class="ghost" id="logout" hidden>Logout</button>
+    <div class="pill" id="lang"><button data-l="de">DE</button><button data-l="en">EN</button></div>
   </div>
+</div></header>
 
-  <div class="rangebar">
-    <span class="rlabel" data-i18n="range">Time range</span>
-    <span class="rchip" data-r="24h">24 h</span>
-    <span class="rchip on" data-r="7d" data-i18n="r7d">7 days</span>
-    <span class="rchip" data-r="30d" data-i18n="r30d">30 days</span>
-    <span class="rchip" data-r="all" data-i18n="rall">All</span>
-    <span class="gsep"></span>
-    <span class="rlabel" data-i18n="g_machine">Machine</span>
-    <select id="srcsel" class="gsel"><option value="" data-i18n="g_all_mach">All machines</option></select>
-    <label class="gtoggle"><input type="checkbox" id="hidedone"><span data-i18n="g_hidedone">Hide done</span></label>
+<div class="jump" id="jump"></div>
+
+<section class="hero">
+  <div class="eyebrow" id="eyebrow"></div>
+  <h1 class="thesis" id="thesis"></h1>
+  <p class="sub" id="subline"></p>
+  <div class="handbar" id="handbar"></div>
+  <div class="handkey" id="handkey"></div>
+  <div class="deadline">
+    <div class="dnum" id="days">0</div>
+    <div class="dtxt"><b id="ddl_t"></b><span id="ddl_b"></span></div>
   </div>
+</section>
 
-  <nav class="secnav" id="secnav">
-    <span class="navlabel" data-i18n="nav_label">Sections</span>
-    <span class="navchip" data-sec="sec-programs"   data-tone="warn" data-i18n="nav_prog">Programs</span>
-    <span class="navchip" data-sec="sec-heat"       data-tone="neut" data-i18n="nav_heat">Timing</span>
-    <span class="navchip" data-sec="sec-why"        data-tone="warn" data-i18n="nav_why">Why NTLM</span>
-    <span class="navchip" data-sec="sec-incoming"   data-tone="neut" data-i18n="nav_inc">Services</span>
-    <span class="navchip" data-sec="sec-v1sso"      data-tone="bad"  data-i18n="nav_v1sso">NTLMv1 SSO</span>
-    <span class="navchip" data-sec="sec-v1"         data-tone="bad"  data-i18n="nav_v1">NTLMv1</span>
-    <span class="navchip" data-sec="sec-domain"     data-tone="neut" data-i18n="nav_dom">Domain</span>
-    <span class="navchip" data-sec="sec-kerberos-accounts" data-tone="good" data-i18n="nav_krb">Kerberos</span>
-    <span class="navchip" data-sec="sec-agents"     data-tone="neut" data-i18n="nav_mach">Machines</span>
-    <span class="navchip" data-sec="sec-events"     data-tone="neut" data-i18n="nav_ev">Events</span>
-  </nav>
-
-  <div class="stats">
-    <div class="stat clickable" tabindex="0" data-filter="all" data-scroll="#sec-events"
-         data-i18n-title="tt_total" title="Show all events"><div class="num" id="s-total">–</div><div class="lab" data-i18n="lab_total">NTLM total</div><div class="sub" data-i18n="sub_total">recorded events</div></div>
-    <div class="stat bad clickable" tabindex="0" data-filter="v1" data-scroll="#sec-events"
-         data-i18n-title="tt_v1" title="Jump to insecure logons"><div class="num" id="s-v1">–</div><div class="lab" data-i18n="lab_v1">Insecure</div><div class="sub" data-i18n="sub_v1">NTLMv1 – replace first</div></div>
-    <div class="stat old clickable" tabindex="0" data-filter="v2" data-scroll="#sec-events"
-         data-i18n-title="tt_v2" title="Jump to outdated logons"><div class="num" id="s-v2">–</div><div class="lab" data-i18n="lab_v2">Outdated</div><div class="sub" data-i18n="sub_v2">NTLMv2 – better, but old</div></div>
-    <div class="stat good clickable" tabindex="0" data-scroll="#sec-kerberos"
-         data-i18n-title="tt_krb" title="Jump to the Kerberos overview"><div class="num" id="s-krb">–</div><div class="lab" data-i18n="lab_krb">Already secure</div><div class="sub" data-i18n="sub_krb">services via Kerberos</div></div>
-    <div class="stat clickable" tabindex="0" data-scroll="#sec-domain"
-         data-i18n-title="tt_src" title="Jump to the domain overview"><div class="num" id="s-src">–</div><div class="lab" data-i18n="lab_src">Computers involved</div><div class="sub" data-i18n="sub_src">sources & servers</div></div>
-    <div class="stat clickable" tabindex="0" data-scroll="#sec-programs"
-         data-i18n-title="tt_proc" title="Jump to programs"><div class="num" id="s-proc">–</div><div class="lab" data-i18n="lab_proc">Programs detected</div><div class="sub" data-i18n="sub_proc">that trigger NTLM</div></div>
-  </div>
-
-  <!-- Verlauf: NTLM ueber Zeit -->
-  <section id="sec-trend">
-    <div class="head">
-      <h2 data-i18n="trend_h">Trend</h2>
-      <p data-i18n="trend_p">NTLM activity in the selected time range – these bars should approach zero over the weeks. Red = NTLMv1, yellow = NTLMv2, gray = NTLM without version info (domain/outgoing). Kerberos is shown in the tooltip for context.</p>
-    </div>
-    <div class="trend" id="trend"></div>
-  </section>
-
-  <section id="sec-heat">
-    <div class="head">
-      <h2 data-i18n="heat_h">When NTLM happens</h2>
-      <p data-i18n="heat_p">Weekday against hour of day. Batch jobs, maintenance windows and weekend scripts are the stragglers that break a shutdown — as a single figure they hide in the daily trend, as a pattern they stand out.</p>
-    </div>
-    <div id="heatwrap" class="heatwrap"></div>
-    <p id="heathint" class="coverage"></p>
-  </section>
-
-  <!-- NTLMv1 SSO: hard October 2026 deadline (Server 2025 / Win11 24H2) -->
-  <section id="sec-v1sso" style="display:none">
-    <div class="head">
-      <h2><span class="badge b-bad"><span class="d"></span><span data-i18n="b_deadline">Deadline</span></span> <span data-i18n="v1sso_h">NTLMv1 SSO – stops working in October 2026</span></h2>
-      <p data-i18n="v1sso_p">Windows reports the use of NTLMv1-derived credentials here. In October 2026 Microsoft switches the default to blocking – these will then break on their own, regardless of your own policies.</p>
-    </div>
-    <div class="scroll">
-      <table>
-        <thead><tr><th data-i18n="th_user4">User</th><th data-i18n="th_target4">Target</th><th data-i18n="th_count4">Count</th><th data-i18n="th_state4">State</th><th data-i18n="th_status4">Status</th><th data-i18n="th_last5">Last seen</th></tr></thead>
-        <tbody id="v1sso"></tbody>
-      </table>
-    </div>
-  </section>
-
-  <!-- Programs using NTLM -->
-  <section id="sec-programs">
-    <div class="head">
-      <h2><span class="badge b-bad"><span class="d"></span></span> <span data-i18n="prog_h">Programs still using NTLM</span></h2>
-      <p data-i18n="prog_p">These programs authenticate outward via NTLM. Before disabling NTLM they should be reviewed or reconfigured. "Kernel: SMB/HTTP.sys" means the request came from kernel mode (PID 4) – file shares, but also WinRM, ADWS, SSRS or the Remote Desktop Gateway. No single program can be named there.</p>
-      <button class="btn" onclick="toggleExc('out')" data-i18n="btn_exc">Generate exception list</button>
-      <div id="excbox-out" class="excbox" style="display:none">
-        <p class="soft"><span data-i18n="exc_gpo_out">Paste into: Network security: Restrict NTLM: Add remote server exceptions for NTLM authentication</span> · <span class="exc-count mono">0</span> <span data-i18n="exc_entries">entries (open items only)</span></p>
-        <textarea rows="6" readonly spellcheck="false"></textarea>
-        <button class="btn" onclick="copyExc('out', this)" data-i18n="exc_copy">Copy</button>
-        <p class="soft" data-i18n="exc_note">An exception is a stay of execution, not a fix — keep working the list down.</p>
-      </div>
-    </div>
-    <div class="scroll">
-      <table>
-        <thead><tr><th data-i18n="th_prog">Program</th><th data-i18n="th_target">Target server</th><th data-i18n="th_count">Count</th><th data-i18n="th_trend2" data-i18n-title="tt_th_trend" title="">Trend</th><th data-i18n="th_users">Users</th><th data-i18n="th_comps">Computers (no.)</th><th data-i18n="th_status">Status</th><th data-i18n="th_last">Last seen</th></tr></thead>
-        <tbody id="blockers"></tbody>
-      </table>
-    </div>
-  </section>
-
-  <!-- Wer nutzt NTLM, wohin (8004) -->
-  <section id="sec-domain">
-    <div class="head">
-      <h2 data-i18n="dom_h">Who uses NTLM – and where to</h2>
-      <p data-i18n="dom_p">Reported by the domain controller: which computer connects to which server via NTLM. The most reliable overall view – even when no program name can be determined.</p>
-      <button class="btn" onclick="toggleExc('dom')" data-i18n="btn_exc">Generate exception list</button>
-      <div id="excbox-dom" class="excbox" style="display:none">
-        <p class="soft"><span data-i18n="exc_gpo_dom">Paste into: Network security: Restrict NTLM: Add server exceptions in this domain (on the DCs)</span> · <span class="exc-count mono">0</span> <span data-i18n="exc_entries">entries (open items only)</span></p>
-        <textarea rows="6" readonly spellcheck="false"></textarea>
-        <button class="btn" onclick="copyExc('dom', this)" data-i18n="exc_copy">Copy</button>
-        <p class="soft" data-i18n="exc_note">An exception is a stay of execution, not a fix — keep working the list down.</p>
-      </div>
-    </div>
-    <div class="scroll">
-      <table>
-        <thead><tr><th data-i18n="th_srccomp">Computer (source)</th><th data-i18n="th_target2">Target server</th><th data-i18n="th_users2">Users</th><th data-i18n="th_count2">Count</th><th data-i18n="th_status2">Status</th><th data-i18n="th_last2">Last seen</th></tr></thead>
-        <tbody id="domain"></tbody>
-      </table>
-    </div>
-  </section>
-
-  <!-- Warum NTLM? Gruppierung nach Usage-ID der 40xx-Ereignisse -->
-  <section id="sec-why" style="display:none">
-    <div class="head">
-      <h2 data-i18n="why_h">Why NTLM was used</h2>
-      <p data-i18n="why_p">Windows reports the reason for every fallback (Server 2025 / Windows 11 24H2 only). Each cause has its own fix — this is the shortest path from finding to remedy.</p>
-      <p id="relayline" class="coverage"></p>
-    </div>
-    <div class="scroll">
-      <table>
-        <thead><tr><th data-i18n="th_reason">Reason</th><th data-i18n="th_fix">What helps</th><th data-i18n="th_count6">Count</th><th data-i18n="th_progs">Programs</th><th data-i18n="th_machines2">Machines</th><th data-i18n="th_last7">Last seen</th></tr></thead>
-        <tbody id="reasons"></tbody>
-      </table>
-    </div>
-  </section>
-
-  <!-- Eingehender NTLM: welcher Dienst nimmt an (8002/8003) -->
-  <section id="sec-incoming" style="display:none">
-    <div class="head">
-      <h2 data-i18n="inc_h">Services accepting NTLM</h2>
-      <p data-i18n="inc_p">The other direction: which service on these machines accepts incoming NTLM. Needs the "Audit Incoming NTLM Traffic" policy — without it this section stays empty.</p>
-    </div>
-    <div class="scroll">
-      <table>
-        <thead><tr><th data-i18n="th_mach2">Machine</th><th data-i18n="th_svc">Service / process</th><th data-i18n="th_count5">Count</th><th data-i18n="th_users5">Accounts</th><th data-i18n="th_status5">Status</th><th data-i18n="th_last6">Last seen</th></tr></thead>
-        <tbody id="incoming"></tbody>
-      </table>
-    </div>
-  </section>
-
-  <!-- NTLMv1 by user -->
-  <section id="sec-v1">
-    <div class="head">
-      <h2><span class="badge b-bad"><span class="d"></span><span data-i18n="b_insec">insecure</span></span> <span data-i18n="v1_h">Insecure logons by user</span></h2>
-      <p data-i18n="v1_p">NTLMv1 is considered insecure and should be replaced first. These users or accounts still logged on with it.</p>
-    </div>
-    <div class="bars" id="v1-users"></div>
-  </section>
-
-  <!-- Kerberos -->
-  <section id="sec-kerberos">
-    <div class="head">
-      <h2><span class="badge b-good"><span class="d"></span><span data-i18n="b_sec">secure</span></span> <span data-i18n="krb_h">Already running over Kerberos</span></h2>
-      <p data-i18n="krb_p">These services already use modern, secure Kerberos – all good here. For information only. "RC4/DES" would be weaker encryption, "AES" is good.</p>
-    </div>
-    <div class="scroll">
-      <table>
-        <thead><tr><th data-i18n="th_service">Service</th><th data-i18n="th_accounts">Accounts</th><th data-i18n="th_count3">Count</th><th data-i18n="th_enc">Encryption</th><th data-i18n="th_last3">Last seen</th></tr></thead>
-        <tbody id="kerb"></tbody>
-      </table>
-    </div>
-  </section>
-
-  <!-- Kerberos by account: the safe side -->
-  <section id="sec-kerberos-accounts">
-    <div class="head">
-      <h2><span class="badge b-good"><span class="d"></span><span data-i18n="b_sec2">secure</span></span> <span data-i18n="krba_h">Accounts already using Kerberos</span></h2>
-      <p data-i18n="krba_p">The "safe side": these accounts have already authenticated successfully via Kerberos – with the services they use and the encryption. "AES" is good, "RC4/DES" would be weaker. For information only.</p>
-    </div>
-    <div class="scroll">
-      <table>
-        <thead><tr><th data-i18n="th_account">Account</th><th data-i18n="th_services">Services</th><th data-i18n="th_tickets" data-i18n-title="tt_th_tickets" title="">Tickets</th><th data-i18n="th_enc2">Encryption</th><th data-i18n="th_last4">Last seen</th></tr></thead>
-        <tbody id="kerb-accounts"></tbody>
-      </table>
-    </div>
-  </section>
-
-  <!-- Maschinen / Heartbeat + Auditing-Status -->
-  <section id="sec-agents">
-    <div class="head">
-      <h2 data-i18n="ag_h">Machines & auditing status</h2>
-      <p data-i18n="ag_p">Which agents report – and whether the required auditing is enabled there. A green dot means "reported recently". Red auditing badges explain why a machine may not deliver data.</p>
-      <p id="coverage" class="coverage"></p>
-    </div>
-    <div class="scroll">
-      <table>
-        <thead><tr><th data-i18n="th_machine">Machine</th><th data-i18n="th_type">Type</th><th data-i18n="th_status3">Status</th><th data-i18n-title="tt_th_aud" title="">Auditing</th><th data-i18n="th_lm" data-i18n-title="tt_th_lm" title="">NTLM level</th><th data-i18n="th_oct" data-i18n-title="tt_th_oct" title="">Oct 2026</th><th>Events</th><th data-i18n="th_lastrep">Last reported</th></tr></thead>
-        <tbody id="agents"></tbody>
-      </table>
-    </div>
-  </section>
-
-  <!-- Letzte Ereignisse -->
-  <section id="sec-events">
-    <div class="head">
-      <h2 data-i18n="ev_h">Recent events</h2>
-      <p data-i18n="ev_p">The latest recorded activity. "Kerberos fallback" on a logon means Kerberos was attempted but failed – usually an SPN, DNS or clock-skew issue. Filter with the buttons or search above.</p>
-    </div>
-    <div class="filters">
-      <input id="q" data-i18n-ph="search_ph" placeholder="Search: user, program, server, computer …">
-      <span class="chip on" data-f="all" data-i18n="f_all">All</span>
-      <span class="chip" data-f="v1" data-i18n="f_v1">Insecure only</span>
-      <span class="chip" data-f="v2" data-i18n="f_v2">Outdated only</span>
-      <span class="chip" data-f="outgoing" data-i18n="f_out">Programs</span>
-      <span class="chip" data-f="domain" data-i18n="f_dom">Domain</span>
-      <span class="fsep"></span>
-      <span class="chip achip on" data-a="all" data-i18n="f_a_all"
-            data-i18n-title="f_a_t" title="Filters the event list and the CSV export (not the metric cards above)">All accounts</span>
-      <span class="chip achip" data-a="user" data-i18n="f_a_user">People only</span>
-      <span class="chip achip" data-a="machine" data-i18n="f_a_mach">Computers only</span>
-      <span class="rchip" id="csvbtn" data-i18n="csv" data-i18n-title="csv_t" title="Download the current selection as CSV">CSV-Export</span>
-    </div>
-    <div class="scroll">
-      <table>
-        <thead><tr><th data-i18n="th_time">Time</th><th data-i18n="th_kind">Kind</th><th data-i18n="th_users3">User</th><th data-i18n="th_prog2">Program</th><th data-i18n="th_tgtsrc">Target / source</th><th data-i18n="th_comp">Computer</th></tr></thead>
-        <tbody id="rows"></tbody>
-      </table>
-    </div>
-  </section>
-
-  <footer id="foot"></footer>
+<div class="focus" id="focus"></div>
+<div class="grid" id="grid"></div>
 </div>
 
+<div class="scrim" id="scrim"></div>
+<aside class="drawer" id="drawer" role="dialog" aria-modal="true">
+  <div class="dh"><div><h3 id="dtitle"></h3><div class="when" id="dwhen"></div></div>
+    <button class="x" id="dclose">&#10005;</button></div>
+  <div class="dbody" id="dbody"></div>
+</aside>
 <script>
-// ---------------- Sprache / i18n ----------------
+const calm = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const $ = s => document.querySelector(s);
+const esc = s => (s == null ? "" : String(s)).replace(/[&<>"]/g,
+  c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
 const I18N = {
 de: {
   doc_title:'NTLM-Analyzer', h1:'NTLM-Analyzer',
@@ -1579,6 +1392,7 @@ de: {
   f_a_all:'Alle Konten', f_a_user:'Nur Personen', f_a_mach:'Nur Computer',
   f_all:'Alle', f_v1:'Nur unsicher', f_v2:'Nur veraltet', f_out:'Programme', f_dom:'Domäne',
   csv:'CSV-Export', csv_t:'Aktuelle Auswahl als CSV herunterladen',
+  g_logout:'Abmelden', g_logout_t:'Sitzung auf dem Server beenden',
   more:'weitere', b_v1:'NTLMv1 · unsicher', b_v2:'NTLMv2 · veraltet', b_krb:'Kerberos · sicher',
   b_dom:'NTLM (Domäne)', b_out:'NTLM ausgehend', b_fb:'Kerberos-Fallback',
   hb_on:'aktiv', hb_off:'still',
@@ -1612,7 +1426,20 @@ de: {
   d_auth:'Auth-Weg', d_proc:'Prozess', d_target:'Zielserver',
   d_ws:'Arbeitsstation', d_ip:'IP-Adresse', d_lt:'Anmeldetyp',
   d_enc:'Verschlüsselung',
-  as_of:'Stand: '
+  as_of:'Stand: ',
+  hero_eyebrow:'{m} Agenten · {n} Tage Datenbasis',
+  hero_thesis:'Noch {p} % aller Anmeldungen <span class="fade">laufen über NTLM.</span>',
+  hero_down:'Zu Beginn des Zeitraums waren es {was} %.',
+  hero_up:'Zu Beginn waren es {was} % — der Anteil steigt gerade.',
+  hero_flat:'Der Anteil bewegt sich im Zeitraum kaum.',
+  hero_tail:'{p} Programme und {u} Konten halten den Rest — angeführt von {top}.',
+  hero_ddl_t:'Tage bis Oktober 2026',
+  hero_ddl_b:'Dann stellt Windows NTLMv1-SSO standardmäßig auf Blockieren um. Was dann noch NTLMv1 spricht, bricht von selbst.',
+  foc_big:'Größter Posten', foc_big_w:'{n}× · {m} Maschinen',
+  foc_win:'Schnellster Gewinn', foc_win_w:'{n}× · Ziel ist eine IP-Adresse',
+  foc_due:'Vor der Frist', foc_due_w:'{n}× NTLMv1 · bricht im Oktober',
+  foc_odd:'Unerwartet', foc_odd_w:'{n}× außerhalb der Bürozeiten',
+  top_h:'Meistgenutzte Ziele',
 },
 en: {
   doc_title:'NTLM-Analyzer', h1:'NTLM-Analyzer',
@@ -1780,6 +1607,7 @@ en: {
   f_a_all:'All accounts', f_a_user:'People only', f_a_mach:'Computers only',
   f_all:'All', f_v1:'Insecure only', f_v2:'Outdated only', f_out:'Programs', f_dom:'Domain',
   csv:'CSV export', csv_t:'Download the current selection as CSV',
+  g_logout:'Log out', g_logout_t:'End the session on the server',
   more:'more', b_v1:'NTLMv1 · insecure', b_v2:'NTLMv2 · outdated', b_krb:'Kerberos · secure',
   b_dom:'NTLM (domain)', b_out:'NTLM outgoing', b_fb:'Kerberos fallback',
   hb_on:'active', hb_off:'quiet',
@@ -1813,782 +1641,526 @@ en: {
   d_auth:'Auth path', d_proc:'Process', d_target:'Target server',
   d_ws:'Workstation', d_ip:'IP address', d_lt:'Logon type',
   d_enc:'Encryption',
-  as_of:'As of: '
+  as_of:'As of: ',
+  hero_eyebrow:'{m} agents · {n} days of data',
+  hero_thesis:'Still {p} % of all logons <span class="fade">go through NTLM.</span>',
+  hero_down:'At the start of the period it was {was} %.',
+  hero_up:'It was {was} % at the start — the share is rising.',
+  hero_flat:'The share has barely moved over the period.',
+  hero_tail:'{p} programs and {u} accounts hold the rest — led by {top}.',
+  hero_ddl_t:'days until October 2026',
+  hero_ddl_b:'Windows then switches NTLMv1 SSO to blocking by default. Whatever still speaks NTLMv1 breaks on its own.',
+  foc_big:'Largest item', foc_big_w:'{n}× · {m} machines',
+  foc_win:'Quickest win', foc_win_w:'{n}× · target is an IP address',
+  foc_due:'Before the deadline', foc_due_w:'{n}× NTLMv1 · breaks in October',
+  foc_odd:'Unexpected', foc_odd_w:'{n}× outside office hours',
+  top_h:'Most-used targets',
 }};
-let LANG = 'de';
-try { LANG = localStorage.getItem('ntlm_lang') || 'de'; } catch(e) {}
-if (!I18N[LANG]) LANG = 'de';
-const t = k => (I18N[LANG] && I18N[LANG][k]) || I18N.de[k] || k;
-// Like t(), but falls back to a caller-supplied string instead of the key -
-// used for reason IDs, where an undocumented ID must not render as "rid_99".
-const tOr = (k, fb) => (I18N[LANG] && I18N[LANG][k]) || I18N.de[k] || fb;
+
+let LANG = (navigator.language || 'de').toLowerCase().startsWith('de') ? 'de' : 'en';
+const t = (k, v) => { let s = (I18N[LANG] && I18N[LANG][k]) || (I18N.de[k]) || k;
+  if(v) for(const a in v) s = s.split('{' + a + '}').join(v[a]);
+  return s; };
 const LOCALE = () => LANG === 'de' ? 'de-DE' : 'en-GB';
 
-function applyStatic(){
-  document.documentElement.lang = LANG;
-  document.title = t('doc_title');
-  document.querySelectorAll('[data-i18n]').forEach(el => { el.textContent = t(el.dataset.i18n); });
-  document.querySelectorAll('[data-i18n-ph]').forEach(el => { el.placeholder = t(el.dataset.i18nPh); });
-  document.querySelectorAll('[data-i18n-title]').forEach(el => { el.title = t(el.dataset.i18nTitle); });
-  document.querySelectorAll('.lchip').forEach(c => c.classList.toggle('on', c.dataset.l === LANG));
-}
-function setLang(l){
-  if (!I18N[l] || l === LANG) return;
-  LANG = l;
-  try { localStorage.setItem('ntlm_lang', l); } catch(e) {}
-  applyStatic();
-  load();
-}
-document.querySelectorAll('.lchip').forEach(c => c.addEventListener('click', () => setLang(c.dataset.l)));
-
-// ---------------- Zustand & Helfer ----------------
-const state = {f:"all", q:"", r:"7d", a:"all", src:"", hidedone:false};
-const $ = s => document.querySelector(s);
-const esc = s => (s==null?"":String(s)).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
-const dash = '<span class="soft">–</span>';
-// True when the target is (or contains) a bare IP address - also inside an SPN
-// such as "TERMSRV/10.0.0.5" or "cifs/192.168.1.9".
-function targetIsIp(v){
-  if(!v) return false;
-  const part = String(v).includes('/') ? String(v).split('/').pop() : String(v);
-  const raw = part.replace(/^\\\\/,'').trim();
-  // IPv6 first - it contains colons itself, so the port split below would ruin it
-  if(/^\[?[0-9a-fA-F]*:[0-9a-fA-F:]*\]?$/.test(raw) && raw.includes('::') || /^\[[0-9a-fA-F:]+\]/.test(raw)) return true;
-  const host = raw.split(':')[0];
-  return /^\d{1,3}(\.\d{1,3}){3}$/.test(host);
-}
-// Stored timestamps are UTC without a marker (that is what Windows puts in the
-// event XML). Appending Z makes the browser parse them correctly and render in
-// the viewer's own timezone - previously they were shown as if already local.
-function toLocal(s){
-  if(!s) return null;
-  const d = new Date(String(s).replace(" ", "T") + "Z");
-  return isNaN(d.getTime()) ? null : d;
-}
-function when(s){
-  const d = toLocal(s);
-  if(!d) return esc((s||"").replace("T"," ").slice(0,16));
-  const p = n => String(n).padStart(2,'0');
-  return esc(d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())
-             +' '+p(d.getHours())+':'+p(d.getMinutes()));
-}
-// Minutes east of UTC, e.g. +120 during CEST. Sent with every request so the
-// server can bucket days and hours the way the viewer experiences them.
+// Stored timestamps are UTC without a marker; append Z so the browser converts.
+function toLocal(s){ if(!s) return null;
+  const d = new Date(String(s).replace(' ', 'T') + (/[Z+]/.test(String(s).slice(10)) ? '' : 'Z'));
+  return isNaN(d.getTime()) ? null : d; }
+function when(s){ const d = toLocal(s);
+  if(!d) return esc((s || '').replace('T', ' ').slice(0, 16));
+  const p = n => String(n).padStart(2, '0');
+  return esc(d.getFullYear() + '-' + p(d.getMonth()+1) + '-' + p(d.getDate())
+    + ' ' + p(d.getHours()) + ':' + p(d.getMinutes())); }
 const TZOFF = () => -new Date().getTimezoneOffset();
-function userList(who){
-  if(!who) return dash;
-  const arr = String(who).split(',').map(s=>s.trim()).filter(Boolean);
-  if(arr.length<=3) return esc(arr.join(', '));
-  return esc(arr.slice(0,3).join(', ')) + ' <span class="soft">+'+(arr.length-3)+' '+t('more')+'</span>';
-}
 
-function artBadge(e){
-  // Hovering the kind column explains the underlying event ID in one sentence.
-  const ti = eidText(e.event_id) ? ' title="'+esc(e.event_id+' – '+eidText(e.event_id))+'"' : '';
-  let fb = (e.auth_method=="Fallback") ? ' <span class="badge b-old" title="'+esc(t('tt_fb'))+'"><span class="d"></span>'+t('b_fb')+'</span>' : '';
-  if(e.auth_method=="Downgrade") fb = ' <span class="badge b-bad" title="'+esc(t('tt_down'))+'"><span class="d"></span>'+t('b_down')+'</span>';
-  if(e.ntlm_version=="NTLMv1") return '<span class="badge b-bad"'+ti+'><span class="d"></span>'+t('b_v1')+'</span>'+fb;
-  if(e.ntlm_version=="NTLMv2") return '<span class="badge b-old"'+ti+'><span class="d"></span>'+t('b_v2')+'</span>'+fb;
-  if(e.kind=="policywarn")     return '<span class="badge b-old"'+ti+'><span class="d"></span>'+t('b_policywarn')+'</span>';
-  if(e.kind=="policyblock")    return '<span class="badge b-bad"'+ti+'><span class="d"></span>'+t('b_policyblock')+'</span>';
-  if(e.kind=="secblock")       return '<span class="badge b-bad"'+ti+'><span class="d"></span>'+t('b_secblock')+'</span>';
-  if(e.kind=="cgblock")        return '<span class="badge b-bad"'+ti+'><span class="d"></span>'+t('b_cg')+'</span>';
-  if(e.kind=="krbfail")        return '<span class="badge b-old" title="'+esc(t('tt_krbfail')+(e.failure_code?' ('+e.failure_code+')':''))+'"><span class="d"></span>'+t('b_krbfail')+'</span>';
-  if(e.kind=="kerberos")       return '<span class="badge b-good"'+ti+'><span class="d"></span>'+t('b_krb')+'</span>';
-  if(e.kind=="domain")         return '<span class="badge b-neut"'+ti+'><span class="d"></span>'+t('b_dom')+'</span>';
-  if(e.kind=="outgoing")       return '<span class="badge b-neut"'+ti+'><span class="d"></span>'+t('b_out')+'</span>';
-  if(e.kind=="incoming")       return '<span class="badge b-neut"'+ti+'><span class="d"></span>'+t('b_in')+'</span>';
-  return '<span class="soft"'+ti+'>NTLM</span>';
-}
-// LmCompatibilityLevel: which NTLM versions the machine still permits.
-// 5 = NTLMv2 only (target state), 0-2 still accept the ancient LM/NTLMv1
-// responses, 3/4 (and "unset", which behaves like 3) sit in between: they send
-// NTLMv2 but would still accept weaker answers as a server.
-// October 2026: Microsoft flips BlockNtlmv1SSO from audit to enforce. Machines
-// with Credential Guard enabled are exempt - it already blocks NTLMv1
-// cryptography - and machines already set to enforce have nothing left to come.
-function octCell(a){
-  const b = a.block_v1sso, cg = a.cred_guard;
-  if(b===null || b===undefined || b==='') return dash;
-  if(b==='enforce')
-    return '<span class="badge b-good" title="'+esc(t('tt_oct_enf'))+'"><span class="d"></span>'+t('oct_enf')+'</span>';
-  if(cg==='on')
-    return '<span class="badge b-good" title="'+esc(t('tt_oct_cg'))+'"><span class="d"></span>'+t('oct_cg')+'</span>';
-  if(cg==='off')
-    return '<span class="badge b-old" title="'+esc(t('tt_oct_aff'))+'"><span class="d"></span>'+t('oct_aff')+'</span>';
-  return '<span class="badge b-neut" title="'+esc(t('tt_oct_unk'))+'"><span class="d"></span>'+t('oct_unk')+'</span>';
-}
+const KINDC = {outgoing:'v2', incoming:'v2', domain:'v2', auth:'v2', kerberos:'krb', krbfail:'v2',
+  cgblock:'v1', ntlmv1sso:'v1', policyblock:'pol', policywarn:'pol', secblock:'v1'};
+const KINDK = {outgoing:'b_out', incoming:'b_dom', domain:'b_dom', auth:'b_fb', kerberos:'b_krb',
+  krbfail:'b_krbfail', cgblock:'b_cg', ntlmv1sso:'b_deadline', policyblock:'b_policyblock',
+  policywarn:'b_policywarn', secblock:'b_secblock'};
+const kindName = k => I18N[LANG][KINDK[k]] ? t(KINDK[k]) : k;
+const DN = () => LANG === 'de' ? ['So','Mo','Di','Mi','Do','Fr','Sa']
+                               : ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
 
-// OS line under the machine type. Also decides whether the enhanced 40xx
-// events can exist here at all - build 26100+ (Server 2025 / Win11 24H2).
-function osLine(a){
-  if(!a.os_version) return '';
-  const m = String(a.os_version).match(/\((\d+)\)\s*$/);
-  const build = m ? parseInt(m[1], 10) : null;
-  const old = (build !== null && build < 26100);
-  const hint = old ? ' <span class="badge b-neut" title="'+esc(t('tt_os_old'))+'">'+t('b_os_old')+'</span>' : '';
-  return '<div class="soft mono" style="font-size:11.5px;margin-top:3px">'+esc(a.os_version)+hint+'</div>';
-}
+// ---- Zustand -------------------------------------------------------------
+const S = {range:'30d', mach:'', hideDone:false, q:'', kind:'', acct:'all', shown:60};
+let DATA = null, TIMER = null;
 
-// Restriction (deny) policies - the counterpart to the audit badges. Only shown
-// when something is actually restricted; "allow" everywhere needs no badge.
-function restrictBadges(a){
-  const map = [['restrict_out','r_out'], ['restrict_in','r_in'], ['restrict_dom','r_dom']];
-  let out = '';
-  map.forEach(([k, lbl]) => {
-    const v = a[k];
-    if(!v || v === 'allow') return;
-    const cls = (v === 'deny-all') ? 'b-bad' : 'b-old';
-    out += ' <span class="badge '+cls+'" title="'+esc(t('tt_restrict'))+'"><span class="d"></span>'
-         + t(lbl) + ': ' + esc(v) + '</span>';
-  });
-  return out;
-}
-
-// Exception lists already configured in policy on this machine.
-function excBadge(a){
-  const n = ['exc_client','exc_dc'].reduce((acc, k) =>
-      acc + (a[k] ? String(a[k]).split(',').filter(x => x.trim()).length : 0), 0);
-  if(!n) return '';
-  const all = ['exc_client','exc_dc'].map(k => a[k]).filter(Boolean).join(', ');
-  return ' <span class="badge b-neut" title="'+esc(t('tt_exc_cfg')+' '+all)+'">'
-       + t('b_exc_cfg').replace('{n}', n) + '</span>';
-}
-
-// NTLM/Operational log size: the OS default (~1 MB) rolls over quickly once
-// incoming auditing is on - events would then be lost between two poll cycles.
-// Credential Guard blocked NTLM on this machine: the regular audit events are
-// never written in that case, so the machine's findings are incomplete by
-// design. Saying so is more honest than showing an empty list.
-function cgBadge(a){
-  if(!a.cg) return '';
-  return ' <span class="badge b-bad" title="'+esc(t('tt_cg_machine'))+'"><span class="d"></span>'
-       + t('b_cg_machine').replace('{n}', a.cg) + '</span>';
-}
-
-function logSizeBadge(a){
-  const v = a.ntlm_log_kb;
-  if (v === null || v === undefined || v === '') return '';
-  const kb = (v === 'unset') ? 1028 : parseInt(v, 10);
-  if (isNaN(kb) || kb >= 16384) return '';
-  const label = (v === 'unset') ? t('log_default') : Math.round(kb/1024*10)/10 + ' MB';
-  return ' <span class="badge b-old" title="'+esc(t('tt_logsize'))+'"><span class="d"></span>'+t('b_logsize')+' ('+label+')</span>';
-}
-
-function lmCell(v){
-  if(v===null || v===undefined || v==='') return dash;
-  const n = String(v);
-  if(n==='5')  return '<span class="badge b-good" title="'+esc(t('tt_lm5'))+'"><span class="d"></span>5 · '+t('lm_ok')+'</span>';
-  if(n==='0'||n==='1'||n==='2')
-    return '<span class="badge b-bad" title="'+esc(t('tt_lm_low'))+'"><span class="d"></span>'+esc(n)+' · '+t('lm_bad')+'</span>';
-  if(n==='unset')
-    return '<span class="badge b-old" title="'+esc(t('tt_lm_unset'))+'"><span class="d"></span>'+t('lm_unset')+'</span>';
-  return '<span class="badge b-old" title="'+esc(t('tt_lm_mid'))+'"><span class="d"></span>'+esc(n)+' · '+t('lm_mid')+'</span>';
-}
-
-function heartbeat(lastSeen){
-  if(!lastSeen) return '<span class="soft">–</span>';
-  const ageMin = (Date.now() - new Date(lastSeen).getTime())/60000;
-  const ok = ageMin < 60;   // <1h = alive
-  const col = ok ? 'var(--good)' : 'var(--still)';
-  const txt = ok ? t('hb_on') : t('hb_off');
-  return '<span style="display:inline-flex;align-items:center;gap:6px"><span style="width:8px;height:8px;border-radius:50%;background:'+col+'"></span>'+txt+'</span>';
-}
-function auditCell(a){
-  const ok = '<span class="badge b-good"><span class="d"></span>', bad='<span class="badge b-bad"><span class="d"></span>';
-  const out = ['audit','deny'].includes(a.outgoing_audit) ? ok+t('au_out_on')+'</span>' : bad+t('au_out_off')+'</span>';
-  let dom = '';
-  if(a.is_dc) dom = (a.domain_audit=='an') ? ' '+ok+t('au_dom_on')+'</span>' : ' '+bad+t('au_dom_off')+'</span>';
-  return out+dom;
-}
-function encCell(s){
-  if(!s) return dash;
-  return String(s).split(',').map(x=>{
-    const tt=x.trim();
-    if(/RC4|DES/i.test(tt)) return '<span class="badge b-old"><span class="d"></span>'+esc(tt)+'</span>';
-    if(/AES/i.test(tt))     return '<span class="badge b-good"><span class="d"></span>'+esc(tt)+'</span>';
-    return '<span class="soft">'+esc(tt)+'</span>';
-  }).join(' ');
-}
-function bar(nm,n,max,bad){
-  const w = max ? Math.max(4,Math.round(n/max*100)) : 0;
-  return '<div class="bar"><div class="row"><span class="nm">'+esc(nm||'')+'</span>'+
-    '<span class="ct">'+n+'×</span></div><div class="track"><div class="fill '+(bad?'bad':'good')+
-    '" style="width:'+w+'%"></div></div></div>';
-}
-
-// ---- Bearbeitungsstatus & Was-tun-Hinweise ----
-const openHints = new Set();   // opened hints survive the auto-refresh
-const openEvents = new Set();  // expanded event rows survive the auto-refresh
-
-// Detail view of an event row in the style of the Windows Event Viewer:
-// property on the left, value on the right, everything the event carries.
-// Logon type (4624) in plain text. Numbers alone say little; these are the
-// values Windows documents for the event. 3 and 8 are the network ones that
-// matter for NTLM, 9 is the classic runas /netonly.
-function logonTypeText(v){
-  if(v===null || v===undefined || v==='') return v;
-  const n = String(v).trim();
-  const k = {'2':'lt2','3':'lt3','4':'lt4','5':'lt5','7':'lt7','8':'lt8',
-             '9':'lt9','10':'lt10','11':'lt11','12':'lt12','13':'lt13'}[n];
-  return k ? n + ' – ' + t(k) : n;
-}
-
-// One-sentence explanation per event ID - shown in the detail view and as a
-// hover on the kind badge, so nobody has to look IDs up elsewhere.
-const eidText = id => tOr('eid_' + id, '');
-
-function evDetailRow(e, id){
-  if(!openEvents.has(id)) return '';
-  const rows = [
-    ['d_log',   e.log],
-    ['d_eid',   e.event_id + (eidText(e.event_id) ? ' – ' + eidText(e.event_id) : '')],
-    ['d_rid',   e.record_id],
-    ['d_time',  (() => { const d = toLocal(e.event_time);
-                         return d ? d.toLocaleString(LOCALE()) : (e.event_time||''); })()],
-    ['d_comp',  e.source],
-    ['d_user',  e.user],
-    ['d_dom',   e.domain],
-    ['d_kind',  e.kind],
-    ['d_ver',   e.ntlm_version],
-    ['d_auth',  e.auth_method],
-    ['d_proc',  e.process],
-    ['d_target',e.target_server],
-    ['d_ws',    e.workstation],
-    ['d_ip',    e.ip],
-    ['d_lt',    logonTypeText(e.logon_type)],
-    ['d_enc',   e.enc_type],
-    ['d_reason',e.reason],
-    ['d_mic',   e.mic],
-    ['d_epa',   e.epa],
-    ['d_os',    e.server_os],
-    ['d_fcode', e.failure_code],
-    ['d_ppath', e.process_path],
-  ].filter(r => r[1] !== null && r[1] !== undefined && r[1] !== '');
-  const grid = rows.map(r =>
-    '<div class="dlab">'+t(r[0])+'</div><div class="dval">'+esc(r[1])+'</div>').join('');
-  return '<tr class="detrow"><td colspan="6">'+
-    '<div class="dhead">'+t('d_title')+' — '+esc(e.log)+' / '+esc(e.event_id)+'</div>'+
-    '<div class="dgrid">'+grid+'</div></td></tr>';
-}
-
-function stSel(key, st){
-  return '<select class="stsel st-'+esc(st)+'" data-key="'+esc(key)+'">'+
-    ['offen','arbeit','erledigt'].map(s=>'<option value="'+s+'"'+(s===st?' selected':'')+'>'+t('st_'+s)+'</option>').join('')+
-    '</select>';
-}
-function againBadge(row){
-  if(row.st==='erledigt' && row.st_at && row.last_seen && row.last_seen > row.st_at)
-    return ' <span class="badge b-bad"><span class="d"></span>'+t('again')+'</span>';
-  return '';
-}
-function hintBtn(id){
-  return '<span class="hintbtn'+(openHints.has(id)?' on':'')+'" data-h="'+esc(id)+'" title="'+t('what')+'">?</span>';
-}
-function hintRow(id, cols, text){
-  return openHints.has(id) ? '<tr class="hintrow"><td colspan="'+cols+'">'+text+'</td></tr>' : '';
-}
-function procHint(b){
-  return /SMB|Kernel/i.test(b.process||'') ? t('hint_smb') : t('hint_proc');
-}
-
-function renderTrend(tr, bucket){
-  const el = $('#trend');
-  if(!tr || !tr.length){
-    el.innerHTML = '<div class="empty">'+t('trend_empty')+'</div>';
-    return;
-  }
-  const max = Math.max(1, ...tr.map(x => x.v1 + x.v2 + x.other));
-  const step = Math.max(1, Math.ceil(tr.length / 8));   // max. ~8 Beschriftungen
-  const H = 130;
-  el.innerHTML = tr.map((x, i) => {
-    const h = v => (v ? Math.max(2, Math.round(v / max * H)) : 0);
-    const lab = bucket === 'hour'
-      ? (LANG === 'de' ? x.b.slice(11,13) + ' Uhr' : x.b.slice(11,13) + ':00')
-      : (LANG === 'de' ? x.b.slice(5).replace('-', '.') : x.b.slice(5));
-    const show = (i % step === 0 || i === tr.length - 1) ? lab : '';
-    const tip = x.b + ' — NTLMv1: ' + x.v1 + ' · NTLMv2: ' + x.v2 +
-                ' · ' + t('tip_nover') + ': ' + x.other + ' · Kerberos: ' + x.krb;
-    return '<div class="tcol" title="' + esc(tip) + '"><div class="tbar">' +
-      (x.other ? '<div class="tseg s0" style="height:' + h(x.other) + 'px"></div>' : '') +
-      (x.v2    ? '<div class="tseg s2" style="height:' + h(x.v2)    + 'px"></div>' : '') +
-      (x.v1    ? '<div class="tseg s1" style="height:' + h(x.v1)    + 'px"></div>' : '') +
-      '</div><div class="tlab">' + show + '</div></div>';
-  }).join('');
-}
-
-function buildParams(){
+function params(extra){
   const p = new URLSearchParams();
-  if(state.f=="v1") p.set('version','NTLMv1');
-  else if(state.f=="v2") p.set('version','NTLMv2');
-  else if(state.f=="outgoing"||state.f=="domain") p.set('kind',state.f);
-  if(state.q) p.set('q',state.q);
-  if(state.a && state.a!="all") p.set('acct', state.a);
-  if(state.src) p.set('source', state.src);
-  p.set('range', state.r || 'all');
+  p.set('range', S.range);
+  if(S.mach) p.set('source', S.mach);
   p.set('tzoff', String(TZOFF()));
+  if(extra) for(const k in extra) if(extra[k]) p.set(k, extra[k]);
   return p;
 }
-
-// Badge helpers. Declared as hoisted functions on purpose: the render function
-// renders sections top-down, and a const arrow defined further down would be in
-// the temporal dead zone for the sections above it (that bug once killed
-// everything below the incoming table).
-function blockedBadge(v){
-  if (!v) return '';
-  const num = (typeof v === 'number') ? v + ' ' : '';
-  return ' <span class="badge b-bad b-inline" title="'+esc(t('tt_blocked'))+'"><span class="d"></span>'
-    + num + t('b_blocked') + '</span>';
-}
-
-function ipBadge(tgt){
-  return targetIsIp(tgt)
-    ? '<span class="badge b-bad b-inline" title="'+esc(t('tt_ip'))+'"><span class="d"></span>'+t('b_ip')+'</span>'
-    : '';
-}
-
-function tgtCell(tgt){
-  return targetIsIp(tgt)
-    ? '<span class="tgtwrap"><span>'+esc(tgt)+'</span>'+ipBadge(tgt)+'</span>'
-    : esc(tgt);
-}
-
-// Heatmap weekday x hour. Intensity is relative to the busiest cell, so a
-// quiet environment still shows its pattern instead of a uniformly dark grid.
-function renderHeat(heat){
-  const wrap = document.getElementById('heatwrap');
-  const hint = document.getElementById('heathint');
-  const sec  = document.getElementById('sec-heat');
-  if(!wrap) return;
-  const rows = heat || [];
-  const max = rows.reduce((m,r) => Math.max(m, ...r), 0);
-  sec.style.display = max > 0 ? '' : 'none';
-  if(!max){ wrap.innerHTML = ''; hint.textContent = ''; return; }
-
-  const days = ['d_mon','d_tue','d_wed','d_thu','d_fri','d_sat','d_sun'];
-  let html = '<div></div>';
-  for(let h = 0; h < 24; h++) html += '<div class="hhr">' + (h % 6 === 0 ? h : '') + '</div>';
-  rows.forEach((row, di) => {
-    html += '<div class="hday">' + t(days[di]) + '</div>';
-    row.forEach((n, h) => {
-      const a = n ? (0.16 + (n / max) * 0.84).toFixed(2) : 0;
-      const bg = n ? 'rgba(224,122,95,' + a + ')' : '';
-      const ti = t('heat_cell').replace('{d}', t(days[di]))
-                              .replace('{h}', String(h).padStart(2,'0'))
-                              .replace('{n}', n);
-      html += '<div class="hcell" style="' + (bg ? 'background:' + bg : '') + '" title="' + esc(ti) + '"></div>';
-    });
-  });
-  wrap.innerHTML = html;
-
-  // Name the single busiest slot - that is usually the batch job worth hunting.
-  let bd = 0, bh = 0;
-  rows.forEach((row, di) => row.forEach((n, h) => { if(n > rows[bd][bh]){ bd = di; bh = h; } }));
-  const off = rows[bd][bh];
-  hint.innerHTML = '<span class="warn">' + esc(t('heat_peak')
-      .replace('{d}', t(days[bd])).replace('{h}', String(bh).padStart(2,'0'))
-      .replace('{n}', off)) + '</span>';
-}
-
-// Sparkline for one program: shows whether this specific row is shrinking or
-// growing. A rising line inside a falling overall trend is the row to attack.
-function sparkline(series){
-  if(!series || series.length < 2) return '';
-  const vals = series.map(x => x[1]);
-  const max = Math.max(...vals), w = 96, h = 20;
-  const pts = vals.map((v, i) =>
-      (i * (w / (vals.length - 1))).toFixed(1) + ',' + (h - (max ? v / max : 0) * (h - 3)).toFixed(1)
-  ).join(' ');
-  const delta = vals[vals.length - 1] - vals[0];
-  const col = delta < 0 ? '#4ea87b' : (delta > 0 ? '#e0644f' : '#7c8b9d');
-  const lbl = (delta > 0 ? '+' : '') + delta;
-  const ti = t('spark_tt').replace('{n}', vals.length);
-  return '<span class="sparkrow" title="' + esc(ti) + '">'
-       + '<svg width="' + w + '" height="' + h + '" aria-hidden="true"><polyline fill="none" stroke="' + col
-       + '" stroke-width="1.7" stroke-linejoin="round" stroke-linecap="round" points="' + pts + '"/></svg>'
-       + '<span class="soft mono" style="color:' + col + ';font-size:12px">' + lbl + '</span></span>';
-}
-
-// --- GPO exception-list generator -------------------------------------------
-// Turns the still-open rows into a paste-ready server list for the two
-// "Restrict NTLM" exception policies. An exception is a stay of execution,
-// not a fix - the note in the box says so.
-function excName(target){
-  if(!target) return null;
-  let v = String(target).trim();
-  if(v.startsWith('(')) return null;                 // placeholders
-  const i = v.indexOf('/');
-  if(i > 0) v = v.slice(i + 1);                      // strip SPN class (cifs/, TERMSRV/...)
-  v = v.replace(/\\/g, '').trim();
-  return v || null;
-}
-
-// Entries already present in Group Policy on any reporting machine - proposing
-// them again would just inflate the list.
-function alreadyExcepted(){
-  const set = new Set();
-  ((LAST && LAST.agents) || []).forEach(a => {
-    ['exc_client', 'exc_dc'].forEach(k => {
-      if(!a[k]) return;
-      String(a[k]).split(',').map(x => x.trim().toLowerCase())
-                  .filter(Boolean).forEach(x => set.add(x));
-    });
-  });
-  return set;
-}
-
-function buildExceptions(which){
-  if(!LAST) return [];
-  const rows = (which === 'out') ? (LAST.blockers || []) : (LAST.domain || []);
-  const have = alreadyExcepted();
-  const seen = new Set(); const out = [];
-  rows.forEach(r => {
-    if(r.st === 'erledigt') return;                  // fixed -> no exception needed
-    const n = excName(r.target);
-    if(!n) return;
-    const k = n.toLowerCase();
-    if(seen.has(k) || have.has(k)) return;      // skip what policy already covers
-    seen.add(k); out.push(n);
-  });
-  return out.sort((a, b) => a.localeCompare(b));
-}
-
-function toggleExc(which){
-  const box = document.getElementById('excbox-' + which);
-  if(box.style.display !== 'none'){ box.style.display = 'none'; return; }
-  const list = buildExceptions(which);
-  const ta = box.querySelector('textarea');
-  ta.value = list.length ? list.join('\n') : t('exc_empty');
-  box.querySelector('.exc-count').textContent = list.length;
-  box.style.display = '';
-}
-
-function copyExc(which, btn){
-  const ta = document.querySelector('#excbox-' + which + ' textarea');
-  ta.select();
-  const done = () => { btn.textContent = t('exc_copied');
-                       setTimeout(() => { btn.textContent = t('exc_copy'); }, 1500); };
-  if(navigator.clipboard && navigator.clipboard.writeText){
-    navigator.clipboard.writeText(ta.value).then(done, () => { document.execCommand('copy'); done(); });
-  } else { document.execCommand('copy'); done(); }
-}
-
-// Last successful API payload - the exception-list generator reads from it so
-// it always reflects exactly what the tables show (same filters, same range).
-let LAST = null;
-
 async function load(){
-  // Do not re-render while a status field is being operated
-  const ae = document.activeElement;
-  if(ae && ae.classList && ae.classList.contains('stsel')) return;
-  const p = buildParams();
-
-  let d;
-  try {
-    const r = await fetch('/api/data?'+p.toString());
-    if(r.status===401){ window.location='/login'; return; }
-    d = await r.json();
-  }
+  let r;
+  try { r = await fetch('/api/data?' + params().toString()); }
   catch(e){ return; }
-  LAST = d;
-
-  $('#s-total').textContent = d.stats.total;
-  $('#s-v1').textContent = d.stats.v1;
-  $('#s-v2').textContent = d.stats.v2;
-  $('#s-krb').textContent = d.stats.krb;
-  $('#s-src').textContent = d.stats.sources;
-  $('#s-proc').textContent = d.stats.procs;
-  renderTrend(d.trend, d.trend_bucket);
-  renderHeat(d.heat);
-
-  // NTLMv1-SSO: Sektion nur einblenden, wenn es tatsaechlich Funde gibt
-  const v1s = d.v1sso || [];
-  document.getElementById('sec-v1sso').style.display = v1s.length ? '' : 'none';
-  if (v1s.length) {
-    $('#v1sso').innerHTML = v1s.map(x=>`<tr class="${x.st==='erledigt'?'row-done':''}">
-        <td class="strong">${esc(x.user)}</td>
-        <td>${esc(x.target)}</td>
-        <td class="num-cell">${x.n}${blockedBadge(x.blocked)}</td>
-        <td>${x.blocked
-              ? '<span class="badge b-neut"><span class="d"></span>'+t('st_blocked')+'</span>'
-              : '<span class="badge b-bad"><span class="d"></span>'+t('st_used')+'</span>'}</td>
-        <td>${stSel(x.key,x.st)}${againBadge(x)}</td>
-        <td class="soft mono">${when(x.last_seen)}</td></tr>`).join('');
-  }
-
-  // "Why NTLM?" - each cause gets a concrete remediation hint, because the
-  // reason alone ("target name contains an IP address") does not say what to do.
-  const rs = d.reasons || [];
-  // Relay exposure: only the 40xx events carry MIC and channel-binding status,
-  // so this is always a subset - stating the base makes that explicit.
-  const rel = d.stats.relay || 0, relScope = d.stats.relay_scope || 0;
-  const relEl = document.getElementById('relayline');
-  if (relEl) {
-    relEl.innerHTML = (rel > 0)
-      ? '<span class="warn">'+t('relay_warn').replace('{n}', rel).replace('{t}', relScope)+'</span>'
-      : (relScope > 0 ? '<span class="ok">'+t('relay_ok').replace('{t}', relScope)+'</span>' : '');
-  }
-  document.getElementById('sec-why').style.display = rs.length ? '' : 'none';
-  if (rs.length) {
-    $('#reasons').innerHTML = rs.map(r=>`<tr>
-        <td class="strong">${esc(tOr('rid_'+r.rid, r.text))}</td>
-        <td class="soft">${esc(tOr('fix_'+r.cat, ''))}</td>
-        <td class="num-cell">${r.n}</td>
-        <td class="soft">${r.procs}</td>
-        <td class="soft">${r.machines}</td>
-        <td class="soft mono">${when(r.last_seen)}</td></tr>`).join('');
-  }
-
-  // Incoming NTLM: only show the section when the incoming audit actually
-  // produces events, so it does not sit there empty on every installation.
-  const inc = d.incoming || [];
-  document.getElementById('sec-incoming').style.display = inc.length ? '' : 'none';
-  if (inc.length) {
-    $('#incoming').innerHTML = inc.map(x=>`<tr class="${x.st==='erledigt'?'row-done':''}">
-        <td class="strong">${esc(x.machine)}</td>
-        <td>${esc(x.process)}</td>
-        <td class="num-cell">${x.n}${blockedBadge(x.blocked)}</td>
-        <td class="soft">${x.users}</td>
-        <td>${stSel(x.key,x.st)}${againBadge(x)}</td>
-        <td class="soft mono">${when(x.last_seen)}</td></tr>`).join('');
-  }
-
-  // A target given as an IP address is the single most common reason Kerberos
-  // is skipped: it needs a name to look up an SPN. Works on any Windows
-  // version - unlike the reason field, which only the 40xx events provide.
-  // Target + badge share a flex wrapper: side by side on one line, and when
-  // the cell is too narrow the badge wraps cleanly left-aligned underneath
-  // instead of dangling indented.
-  // Blocked events (enforce policy active): shown as a red badge behind the
-  // count - these rows are an alarm/success signal, not a to-do anymore.
-  $('#blockers').innerHTML = (d.blockers&&d.blockers.length)
-    ? d.blockers.map(b=>`<tr class="${b.st==='erledigt'?'row-done':''}">
-        <td class="strong">${esc(b.process)}${hintBtn(b.key)}</td>
-        <td>${tgtCell(b.target)}</td>
-        <td class="num-cell">${b.n}${blockedBadge(b.blocked)}</td>
-        <td>${sparkline((LAST.spark||{})[b.process])}</td>
-        <td>${userList(b.who)}</td>
-        <td class="soft">${b.sources}</td>
-        <td>${stSel(b.key,b.st)}${againBadge(b)}</td>
-        <td class="soft mono">${when(b.last_seen)}</td></tr>`+hintRow(b.key,7,procHint(b))).join('')
-    : '<tr><td colspan="8" class="empty">'+t('empty_blockers')+'</td></tr>';
-
-  $('#domain').innerHTML = (d.domain&&d.domain.length)
-    ? d.domain.map(x=>`<tr class="${x.st==='erledigt'?'row-done':''}">
-        <td class="strong">${esc(x.workstation)}${hintBtn(x.key)}</td>
-        <td>${tgtCell(x.target)}</td>
-        <td>${userList(x.who)}</td>
-        <td class="num-cell">${x.n}${blockedBadge(x.blocked)}</td>
-        <td>${stSel(x.key,x.st)}${againBadge(x)}</td>
-        <td class="soft mono">${when(x.last_seen)}</td></tr>`+hintRow(x.key,6,t('hint_dom'))).join('')
-    : '<tr><td colspan="6" class="empty">'+t('empty_domain')+'</td></tr>';
-
-  const umax = Math.max(1, ...d.v1_users.map(x=>x.n));
-  $('#v1-users').innerHTML = d.v1_users.length
-    ? d.v1_users.map(x=>bar(x.name,x.n,umax,true)).join('')
-    : '<div class="empty">'+t('empty_v1')+'</div>';
-
-  $('#kerb').innerHTML = (d.kerberos&&d.kerberos.length)
-    ? d.kerberos.map(k=>`<tr>
-        <td class="strong">${esc(k.service)}</td>
-        <td class="soft">${k.accounts}</td>
-        <td class="num-cell">${k.n}</td>
-        <td>${encCell(k.enc)}${/RC4|DES/i.test(k.enc||'')?hintBtn('krbs|'+k.service):''}</td>
-        <td class="soft mono">${when(k.last_seen)}</td></tr>`+
-        (/RC4|DES/i.test(k.enc||'')?hintRow('krbs|'+k.service,5,t('hint_rc4')):'')).join('')
-    : '<tr><td colspan="5" class="empty">'+t('empty_krb')+'</td></tr>';
-
-  $('#kerb-accounts').innerHTML = (d.kerberos_accounts&&d.kerberos_accounts.length)
-    ? d.kerberos_accounts.map(k=>`<tr>
-        <td class="strong">${esc(k.account)}</td>
-        <td>${userList(k.services)}</td>
-        <td class="num-cell">${k.n}</td>
-        <td>${encCell(k.enc)}${/RC4|DES/i.test(k.enc||'')?hintBtn('krba|'+k.account):''}</td>
-        <td class="soft mono">${when(k.last_seen)}</td></tr>`+
-        (/RC4|DES/i.test(k.enc||'')?hintRow('krba|'+k.account,5,t('hint_rc4')):'')).join('')
-    : '<tr><td colspan="5" class="empty">'+t('empty_krba')+'</td></tr>';
-
-  // Data basis: two weeks of normal operation is the widely recommended
-  // minimum, so that weekly scheduled tasks and batch jobs have run at least
-  // once. Below that, an empty finding list means little.
-  const cd = d.stats.coverage_days, ct = d.stats.coverage_target || 14;
-  const covEl = document.getElementById('coverage');
-  if (covEl) {
-    if (cd === null || cd === undefined) covEl.innerHTML = '';
-    else if (cd >= ct)
-      covEl.innerHTML = '<span class="ok">'+t('cov_ok').replace('{d}', cd)+'</span>';
-    else
-      covEl.innerHTML = '<span class="warn">'+t('cov_warn').replace('{d}', cd).replace('{t}', ct)+'</span>';
-  }
-
-  syncNav(d);
-  syncMachines(d.agents);
-  $('#agents').innerHTML = (d.agents&&d.agents.length)
-    ? d.agents.map(a=>`<tr>
-        <td class="strong">${esc(a.source)}</td>
-        <td class="soft">${a.is_dc?t('type_dc'):t('type_member')}${osLine(a)}</td>
-        <td>${heartbeat(a.last_seen)}</td>
-        <td>${auditCell(a)}${logSizeBadge(a)}${cgBadge(a)}${restrictBadges(a)}${excBadge(a)}</td>
-        <td>${lmCell(a.lm_level)}</td>
-        <td>${octCell(a)}</td>
-        <td class="num-cell">${a.events}</td>
-        <td class="soft mono">${when(a.last_seen)}</td></tr>`).join('')
-    : '<tr><td colspan="8" class="empty">'+t('empty_agents')+'</td></tr>';
-
-  $('#rows').innerHTML = d.events.length
-    ? d.events.map(e=>{
-        const fid = 'fb|'+e.source+'|'+e.record_id;
-        const eid = 'ev|'+e.source+'|'+e.log+'|'+e.record_id;
-        const fb = e.auth_method==='Fallback';
-        const open = openEvents.has(eid);
-        return `<tr class="evrow${open?' evopen':''}" data-ev="${esc(eid)}">
-        <td class="soft mono"><span class="chev">${open?'▾':'▸'}</span>${when(e.event_time)}</td>
-        <td>${artBadge(e)}${fb?hintBtn(fid):''}</td>
-        <td>${esc(e.user)||dash}</td>
-        <td>${esc(e.process)||dash}</td>
-        <td>${esc(e.target_server||e.workstation)||dash}</td>
-        <td class="soft">${esc(e.source)}</td></tr>`
-        + evDetailRow(e, eid)
-        + (fb?hintRow(fid,6,t('hint_fb')):'');
-      }).join('')
-    : '<tr><td colspan="6" class="empty">'+t('empty_events')+'</td></tr>';
-
-  const tm = new Date(d.generated_at);
-  $('#updated').textContent = tm.toLocaleTimeString(LOCALE());
-  $('#foot').textContent = t('as_of') + tm.toLocaleString(LOCALE());
+  if(r.status === 401 || r.status === 403){ window.location = '/login'; return; }
+  DATA = await r.json();
+  render();
 }
 
-// Two independent chip groups: kind/version (data-f) and account type (data-a).
-// Each only clears the "on" state within its own group.
-document.querySelectorAll('.chip:not(.achip)').forEach(c=>c.addEventListener('click',()=>{
-  document.querySelectorAll('.chip:not(.achip)').forEach(x=>x.classList.remove('on'));
-  c.classList.add('on'); state.f=c.dataset.f; load();
-}));
-document.querySelectorAll('.achip').forEach(c=>c.addEventListener('click',()=>{
-  document.querySelectorAll('.achip').forEach(x=>x.classList.remove('on'));
-  c.classList.add('on'); state.a=c.dataset.a; load();
-}));
+// ---- Bausteine -----------------------------------------------------------
+const tag = (cls, txt, ti) => '<span class="tag ' + cls + '"' +
+  (ti ? ' title="' + esc(ti) + '"' : '') + '>' + esc(txt) + '</span>';
+const emptyBox = (a, b) => '<div class="empty"><b>' + esc(a) + '</b>' + esc(b || '') + '</div>';
+const tbl = (heads, rows) => '<table><thead><tr>' + heads.map(h =>
+  '<th' + (h[1] ? ' class="' + h[1] + '"' : '') + '>' + esc(h[0]) + '</th>').join('') +
+  '</tr></thead><tbody>' + rows + '</tbody></table>';
+const CARD = (id, title, flag, meta, body, cls, extra) =>
+  '<section class="card ' + (cls || '') + '" id="' + id + '"><div class="ch"><h2>' + esc(title) + '</h2>' +
+  (flag ? '<span class="flag ' + (flag[1] || '') + '">' + esc(flag[0]) + '</span>' : '') +
+  (extra || '') + (meta ? '<span class="meta">' + esc(meta) + '</span>' : '') + '</div>' + body + '</section>';
+const stSel = (key, st) => '<select class="sel-st" data-key="' + esc(key) + '" onclick="event.stopPropagation()">' +
+  ['offen','arbeit','erledigt'].map(v => '<option value="' + v + '"' +
+    ((st || 'offen') === v ? ' selected' : '') + '>' + esc(t('st_' + v)) + '</option>').join('') + '</select>';
+function spark(series){
+  if(!series || series.length < 2) return '<span class="dm mn">&ndash;</span>';
+  const v = series.map(x => x[1]), mx = Math.max.apply(null, v) || 1;
+  const pts = v.map((n, i) => (i / (v.length - 1) * 56).toFixed(1) + ',' + (14 - n / mx * 12).toFixed(1)).join(' ');
+  const d = v[v.length - 1] - v[0];
+  const col = d < 0 ? 'var(--krb)' : d > 0 ? 'var(--v1)' : 'var(--faint)';
+  return '<svg width="58" height="15" viewBox="0 0 58 15" aria-hidden="true"><polyline fill="none" stroke="' +
+    col + '" stroke-width="1.2" points="' + pts + '"/></svg> <span class="mn" style="color:' + col + '">' +
+    (d > 0 ? '+' : '') + d + '</span>';
+}
+function bars(rows, cls, attr){
+  if(!rows.length) return null;
+  const mx = rows[0][1] || 1;
+  return '<div class="bars">' + rows.map(r =>
+    '<div class="brow" ' + attr(r[0]) + ' data-p="' + (r[1] / mx * 100) + '">' +
+    '<div class="blab"><span class="btx">' + esc(r[0]) + '</span><span class="bn">' + r[1] + '&times;</span></div>' +
+    '<div class="btr"><div class="bfl ' + cls + '"></div></div></div>').join('') + '</div>';
+}
+function countTo(el, to){
+  if(!el) return;
+  if(calm){ el.textContent = to; return; }
+  const t0 = performance.now();
+  (function step(n){ const p = Math.min(1, (n - t0) / 900);
+    el.textContent = Math.round(to * (1 - Math.pow(1 - p, 3)));
+    if(p < 1) requestAnimationFrame(step); })(t0);
+}
 
-// Toggle hints and set status: delegated so it survives the 5s refresh
-document.addEventListener('click', e=>{
-  const h = e.target.closest('.hintbtn');
-  if(h){ const id=h.dataset.h; openHints.has(id)?openHints.delete(id):openHints.add(id); load(); return; }
-  const row = e.target.closest('tr.evrow');
-  if(row){
-    const id = row.dataset.ev;
-    openEvents.has(id) ? openEvents.delete(id) : openEvents.add(id);
-    load();
+// ---- Kopfbereich ---------------------------------------------------------
+function renderChrome(){
+  document.documentElement.lang = LANG;
+  document.title = t('doc_title');
+  $('#range').innerHTML = [['24h', t('range')], ['7d', t('r7d')], ['30d', t('r30d')], ['all', t('rall')]]
+    .map(r => '<button data-r="' + r[0] + '"' + (S.range === r[0] ? ' aria-pressed="true"' : '') + '>' +
+      esc(r[1]) + '</button>').join('');
+  const src = (DATA && DATA.sources) || [];
+  $('#mach').innerHTML = '<option value="">' + esc(t('g_all_mach')) + '</option>' +
+    src.map(s => '<option' + (S.mach === s ? ' selected' : '') + '>' + esc(s) + '</option>').join('');
+  $('#hide').textContent = t('g_hidedone');
+  $('#logout').textContent = t('g_logout');
+  $('#logout').title = t('g_logout_t');
+  $('#hide').setAttribute('aria-pressed', S.hideDone);
+  document.querySelectorAll('#lang button').forEach(b =>
+    b.setAttribute('aria-pressed', b.dataset.l === LANG));
+}
+function renderHero(){
+  // stats.total counts every stored event, stats.krb counts Kerberos SERVICES.
+  // The share has to compare NTLM events against Kerberos TICKETS.
+  const st = DATA.stats, krb = st.krb_ev || 0, ntlm = Math.max(0, st.total - krb);
+  const pct = (ntlm + krb) ? Math.round(ntlm / (ntlm + krb) * 100) : 0;
+  $('#eyebrow').textContent = t('hero_eyebrow',
+    {m: (DATA.agents || []).length, n: st.coverage_days});
+  $('#thesis').innerHTML = t('hero_thesis').replace('{p}', '<span class="big" id="pct">0</span>');
+  const tr = DATA.trend || [];
+  let was = pct;
+  if(tr.length > 2){
+    const cut = Math.max(1, Math.round(tr.length / 3));
+    let n = 0, k = 0;
+    tr.slice(0, cut).forEach(b => { n += b.v1 + b.v2 + b.other; k += b.krb || 0; });
+    if(n + k) was = Math.round(n / (n + k) * 100);
   }
-});
-document.addEventListener('change', e=>{
-  const s = e.target.closest('.stsel');
-  if(!s) return;
-  s.blur();
-  fetch('/item-status',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({key:s.dataset.key, status:s.value})})
-    .then(r=>{ if(r.status===401) window.location='/login'; else load(); })
-    .catch(()=>{});
-});
+  const top = (DATA.blockers || [])[0];
+  $('#subline').textContent =
+    t(was > pct ? 'hero_down' : was < pct ? 'hero_up' : 'hero_flat', {was: was}) + ' ' +
+    t('hero_tail', {p: st.procs, u: (DATA.v1_users || []).length, top: top ? top.process : '\u2013'});
+  const tot = st.v1 + st.v2 + krb || 1;
+  $('#handbar').innerHTML = [['s1', st.v1, 'NTLMv1'], ['s2', st.v2, 'NTLMv2'], ['s3', krb, 'Kerberos']]
+    .map(x => '<div class="seg ' + x[0] + '" data-w="' + (x[1] / tot * 100).toFixed(1) +
+      '"><b>' + x[2] + ' &middot; ' + x[1] + '</b></div>').join('');
+  setTimeout(function(){ document.querySelectorAll('.seg').forEach(function(s){
+    s.style.width = s.dataset.w + '%'; s.querySelector('b').style.opacity = 1; }); }, 100);
+  $('#handkey').innerHTML = [['--v1', 'leg_bad'], ['--v2', 'leg_old'], ['--krb', 'leg_good']]
+    .map(x => '<span><i style="background:var(' + x[0] + ')"></i>' + esc(t(x[1])) + '</span>').join('');
+  $('#ddl_t').textContent = t('hero_ddl_t');
+  $('#ddl_b').textContent = t('hero_ddl_b');
+  countTo($('#pct'), pct);
+  countTo($('#days'), Math.max(0, Math.round((new Date(2026, 9, 14) - new Date()) / 864e5)));
+  const orb = $('#orb'); if(orb) orb.className = 'orb';
+}
+function renderFocus(){
+  const bl = DATA.blockers || [], v1u = DATA.v1_users || [], out = [];
+  if(bl.length) out.push('<button class="fc" data-prog="' + esc(bl[0].process) + '"><div class="k">' +
+    esc(t('foc_big')) + '</div><div class="v">' + esc(bl[0].process) + '</div><div class="w">' +
+    esc(t('foc_big_w', {n: bl[0].n, m: bl[0].sources})) + '</div></button>');
+  const ip = bl.filter(b => /\d+\.\d+\.\d+\.\d+/.test(b.target || ''))[0];
+  if(ip) out.push('<button class="fc" data-prog="' + esc(ip.process) + '"><div class="k">' +
+    esc(t('foc_win')) + '</div><div class="v">' + esc(ip.process) + '</div><div class="w">' +
+    esc(t('foc_win_w', {n: ip.n})) + '</div></button>');
+  if(v1u.length) out.push('<button class="fc" data-q="' + esc(v1u[0].name) + '"><div class="k">' +
+    esc(t('foc_due')) + '</div><div class="v">' + esc(v1u[0].name) + '</div><div class="w">' +
+    esc(t('foc_due_w', {n: v1u[0].n})) + '</div></button>');
+  let pd = -1, ph = 0, pv = 0;
+  (DATA.heat || []).forEach((row, d) => row.forEach((v, h) => { if(v > pv){ pv = v; pd = d; ph = h; } }));
+  if(pd >= 0 && (pd === 0 || pd === 6 || ph < 6 || ph > 19))
+    out.push('<button class="fc" data-go="sec-heat"><div class="k">' + esc(t('foc_odd')) +
+      '</div><div class="v">' + esc(DN()[pd] + ', ' + String(ph).padStart(2, '0') + ':00') +
+      '</div><div class="w">' + esc(t('foc_odd_w', {n: pv})) + '</div></button>');
+  $('#focus').innerHTML = out.join('');
+}
 
-document.getElementById('csvbtn').addEventListener('click', ()=>{
-  window.location = '/api/export.csv?' + buildParams().toString();
-});
+// ---- Abschnitte ----------------------------------------------------------
+function secTrend(){
+  const tr = DATA.trend || [];
+  if(!tr.length) return CARD('sec-trend', t('trend_h'), [t('leg_goal')], '',
+    emptyBox(t('trend_empty'), ''), 'c2');
+  const mx = Math.max.apply(null, tr.map(b => b.v1 + b.v2 + b.other)) || 1;
+  const body = '<div class="blocks">' + tr.map(b =>
+    '<div class="bcol" title="' + esc(b.b + ' \u00b7 ' + (b.v1 + b.v2 + b.other)) + '">' +
+    '<span data-h="' + (b.other / mx * 100) + '" style="height:0;background:var(--grey)"></span>' +
+    '<span data-h="' + (b.v2 / mx * 100) + '" style="height:0;background:var(--v2)"></span>' +
+    '<span data-h="' + (b.v1 / mx * 100) + '" style="height:0;background:var(--v1)"></span></div>').join('') +
+    '</div><div class="axis">' + [0, .33, .66, 1].map(p => '<span>' +
+      esc(tr[Math.round(p * (tr.length - 1))].b) + '</span>').join('') + '</div>';
+  return CARD('sec-trend', t('trend_h'), null, DATA.trend_bucket === 'day' ? '' : t('range'), body, 'c2');
+}
+function secPrograms(){
+  let bl = (DATA.blockers || []).slice();
+  if(S.hideDone) bl = bl.filter(b => b.st !== 'erledigt');
+  const body = bl.length ? tbl([[t('th_prog')], [t('th_target')], [t('th_count'), 'r'],
+      [t('th_trend2')], [t('th_users')], [t('th_status')]],
+    bl.map(b => '<tr class="click' + (b.st === 'erledigt' ? ' done' : '') +
+      '" data-prog="' + esc(b.process) + '"><td class="nm">' + esc(b.process) + '</td>' +
+      '<td class="mn dm"><span class="cut">' + esc(b.target || '\u2013') + '</span>' +
+      (/\d+\.\d+\.\d+\.\d+/.test(b.target || '') ? ' ' + tag('v1', t('b_ip')) : '') + '</td>' +
+      '<td class="r">' + b.n + (b.blocked ? ' ' + tag('v1', b.blocked) : '') + '</td>' +
+      '<td>' + spark((DATA.spark || {})[b.process]) + '</td>' +
+      '<td class="dm mn">' + esc(b.who || '\u2013') + '</td>' +
+      '<td>' + stSel(b.key, b.st) + '</td></tr>').join(''))
+    : emptyBox(t('empty_blockers'), '');
+  return CARD('sec-programs', t('prog_h'), [t('nav_label')], t('exc_entries', {n: bl.length}),
+    body, 'c2', '<button class="mini" id="excbtn">' + esc(t('btn_exc')) + '</button>');
+}
+function secTargets(){
+  const m = {};
+  (DATA.blockers || []).forEach(b => { if(b.target) m[b.target] = (m[b.target] || 0) + b.n; });
+  (DATA.domain || []).forEach(d => { if(d.target) m[d.target] = (m[d.target] || 0) + d.n; });
+  const rows = Object.keys(m).map(k => [k, m[k]]).sort((a, b) => b[1] - a[1]).slice(0, 8);
+  return CARD('sec-top', t('top_h'), null, '',
+    bars(rows, 'amb', n => 'data-q="' + esc(n) + '"') || emptyBox(t('empty_blockers'), ''));
+}
+function secV1(){
+  const rows = (DATA.v1_users || []).slice(0, 8).map(u => [u.name, u.n]);
+  return CARD('sec-v1', t('v1_h'), [t('b_deadline'), 'due'], '',
+    bars(rows, 'red', n => 'data-q="' + esc(n) + '"') || emptyBox(t('empty_v1'), ''));
+}
+function secHeat(){
+  return CARD('sec-heat', t('heat_h'), null, '', '<div class="hm" id="hm"></div>');
+}
+function fillHeat(){
+  const el = $('#hm'); if(!el) return;
+  const g = DATA.heat || [], names = DN(), ord = [1,2,3,4,5,6,0];
+  let mx = 0; g.forEach(r => r.forEach(v => { if(v > mx) mx = v; })); mx = mx || 1;
+  let h = '<div class="hr"><div></div>';
+  for(let i = 0; i < 24; i++) h += '<div class="lb" style="text-align:center">' + (i % 6 === 0 ? i : '') + '</div>';
+  h += '</div>';
+  ord.forEach(d => { h += '<div class="hr"><div class="lb">' + names[d] + '</div>';
+    for(let x = 0; x < 24; x++){ const n = (g[d] && g[d][x]) || 0, v = n / mx;
+      h += '<div class="hc" title="' + names[d] + ' ' + x + ':00 \u00b7 ' + n + '"' +
+        (v ? ' style="background:rgba(' + Math.round(190 + v * 65) + ',' + Math.round(120 - v * 13) +
+          ',' + Math.round(95 - v * 30) + ',' + (0.22 + v * 0.72) + ')"' : '') + '></div>'; }
+    h += '</div>'; });
+  let pd = 0, ph = 0, pv = 0;
+  g.forEach((r, d) => r.forEach((v, x) => { if(v > pv){ pv = v; pd = d; ph = x; } }));
+  el.innerHTML = h + (pv ? '<div class="hnote">' + t('heat_peak',
+    {d: names[pd], h: String(ph).padStart(2, '0'), n: pv}) + '</div>' : '');
+  if(!calm && window.IntersectionObserver){
+    new IntersectionObserver(function(es, o){ es.forEach(function(e){ if(!e.isIntersecting) return;
+      el.querySelectorAll('.hc').forEach(function(c, i){ setTimeout(function(){ c.classList.add('in'); }, i * 3); });
+      o.unobserve(e.target); }); }).observe(el);
+  } else el.querySelectorAll('.hc').forEach(c => c.classList.add('in'));
+}
+function secWhy(){
+  const rs = DATA.reasons || [];
+  const body = rs.length ? tbl([[t('th_reason')], [t('th_fix')], [t('th_count2'), 'r']],
+    rs.map(r => '<tr><td class="nm">' + esc(t('rid_' + r.rid)) + '</td>' +
+      '<td class="dm">' + esc(t('fix_' + r.cat)) + '</td><td class="r">' + r.n + '</td></tr>').join(''))
+    : emptyBox(t('empty_events'), '');
+  return CARD('sec-why', t('why_h'), [t('nav_label')], '', body);
+}
+function secDomain(){
+  const d = DATA.domain || [];
+  const body = d.length ? tbl([[t('th_comp')], [t('th_target')], [t('th_users')],
+      [t('th_count3'), 'r'], [t('th_last')]],
+    d.slice(0, 40).map(x => '<tr class="click" data-q="' + esc(x.workstation) + '">' +
+      '<td class="nm">' + esc(x.workstation) + '</td><td class="mn dm">' + esc(x.target) + '</td>' +
+      '<td class="dm mn">' + esc(x.who || '\u2013') + '</td><td class="r">' + x.n + '</td>' +
+      '<td class="mn dm">' + when(x.last_seen) + '</td></tr>').join(''))
+    : emptyBox(t('empty_domain'), '');
+  return CARD('sec-domain', t('dom_h'), [t('nav_label')], String(d.length), body, 'c2');
+}
+function secIncoming(){
+  const i = DATA.incoming || [];
+  const body = i.length ? tbl([[t('th_machine')], [t('th_service')], [t('th_count4'), 'r'],
+      [t('th_accounts'), 'r']],
+    i.map(x => '<tr class="click" data-mach="' + esc(x.machine) + '"><td class="nm">' + esc(x.machine) +
+      '</td><td class="mn dm">' + esc(x.process) + '</td><td class="r">' + x.n + '</td>' +
+      '<td class="r dm">' + x.users + '</td></tr>').join(''))
+    : emptyBox(t('empty_events'), '');
+  return CARD('sec-incoming', t('inc_h'), [t('nav_label')], String(i.length), body);
+}
+function secSso(){
+  const s = DATA.v1sso || [];
+  const body = s.length ? tbl([[t('th_account')], [t('th_target')], [t('th_count5'), 'r'], [t('th_status')]],
+    s.map(x => '<tr class="click" data-q="' + esc(x.user) + '"><td class="nm">' + esc(x.user) + '</td>' +
+      '<td class="mn dm"><span class="cut">' + esc(x.target || '\u2013') + '</span></td>' +
+      '<td class="r">' + x.n + '</td><td>' + stSel(x.key, x.st) + '</td></tr>').join(''))
+    : emptyBox(t('empty_v1'), '');
+  return CARD('sec-v1sso', t('v1sso_h'), [t('b_deadline'), 'due'], '', body);
+}
+function secKrb(){
+  const k = DATA.kerberos || [];
+  const body = k.length ? tbl([[t('th_service')], [t('th_count6'), 'r'], [t('th_enc')]],
+    k.map(x => '<tr><td class="mn"><span class="cut">' + esc(x.service) + '</span></td>' +
+      '<td class="r">' + x.n + '</td><td>' + tag(/RC4|DES/i.test(x.enc || '') ? 'v2' : 'krb',
+        x.enc || '\u2013') + '</td></tr>').join(''))
+    : emptyBox(t('empty_krb'), '');
+  return CARD('sec-kerberos', t('krb_h'), [t('leg_good'), 'ok'], '', body);
+}
+function secKrbAcc(){
+  const k = DATA.kerberos_accounts || [];
+  const body = k.length ? tbl([[t('th_account')], [t('th_services'), 'r'], [t('th_count6'), 'r'], [t('th_enc2')]],
+    k.slice(0, 12).map(x => '<tr class="click" data-q="' + esc(x.account) + '">' +
+      '<td class="mn"><span class="cut">' + esc(x.account) + '</span></td>' +
+      '<td class="r dm">' + x.svc_count + '</td><td class="r">' + x.n + '</td>' +
+      '<td>' + tag(/RC4|DES/i.test(x.enc || '') ? 'v2' : 'krb', x.enc || '\u2013') + '</td></tr>').join(''))
+    : emptyBox(t('empty_krba'), '');
+  return CARD('sec-kacc', t('krba_h'), [t('leg_good'), 'ok'], '', body);
+}
+function secAgents(){
+  const a = DATA.agents || [];
+  const AU = {audit: t('au_out_on'), deny: t('au_out_on'), aus: t('au_out_off'), an: t('au_dom_on')};
+  const body = a.length ? tbl([[t('th_machine')], [t('th_type')], [t('th_status2')], ['LmCompat'],
+      [t('th_oct')], [t('th_count'), 'r'], [t('th_last')]],
+    a.map(m => {
+      const au = [];
+      if(m.outgoing_audit && m.outgoing_audit !== 'aus') au.push(tag('krb', t('r_out')));
+      if(m.incoming_audit && m.incoming_audit !== 'aus') au.push(tag('krb', t('r_in')));
+      if(m.domain_audit === 'an') au.push(tag('krb', t('r_dom')));
+      if(m.cg) au.push(tag('v1', t('b_cg_machine', {n: m.cg})));
+      if(m.ntlm_log_kb && +m.ntlm_log_kb < 20480) au.push(tag('v2', t('b_logsize')));
+      const lm = m.lm_level;
+      const oct = m.cred_guard === 'on' ? tag('krb', t('oct_cg'))
+        : m.block_v1sso === 'deny' ? tag('krb', t('oct_enf'))
+        : lm && +lm >= 4 ? tag('v2', t('oct_aff')) : tag('n', t('oct_unk'));
+      return '<tr class="click" data-mach="' + esc(m.source) + '"><td class="nm">' + esc(m.source) +
+        ' ' + (m.is_dc ? tag('n', t('type_dc')) : '') + '</td>' +
+        '<td class="mn dm">' + esc(m.os_version || '\u2013') +
+        (m.os_version && !/2600\d|2[6-9]\d{3}/.test(m.os_version) ? ' ' + tag('n', t('b_os_old')) : '') + '</td>' +
+        '<td>' + (au.join(' ') || '<span class="dm">\u2013</span>') + '</td>' +
+        '<td>' + (lm ? tag(+lm >= 5 ? 'krb' : +lm >= 3 ? 'v2' : 'v1', lm) : '<span class="dm">\u2013</span>') + '</td>' +
+        '<td>' + oct + '</td><td class="r">' + (m.events || 0) + '</td>' +
+        '<td class="mn dm">' + when(m.last_seen) + '</td></tr>'; }).join(''))
+    : emptyBox(t('empty_agents'), '');
+  return CARD('sec-agents', t('ag_h'), null,
+    t('cov_ok', {n: DATA.stats.coverage_days}), body, 'c2');
+}
+function secEvents(){
+  return CARD('sec-events', t('ev_h'), null, '<span id="evmeta"></span>',
+    '<div class="bar"><input class="search" id="q" placeholder="' + esc(t('search_ph')) + '">' +
+    '<div class="chipset" id="kinds"></div></div><div class="active" id="active"></div>' +
+    '<div id="events"></div>', 'call');
+}
+function renderEvents(){
+  const all = DATA.events || [];
+  const ql = S.q.toLowerCase();
+  const list = all.filter(e =>
+    (!S.kind || e.kind === S.kind) &&
+    (S.acct === 'all' || (S.acct === 'comp') === /\$/.test(e.user || '')) &&
+    (!ql || [e.user, e.process, e.target_server, e.workstation, e.source, e.process_path]
+      .join(' ').toLowerCase().indexOf(ql) >= 0));
+  const m = $('#evmeta'); if(m) m.textContent = list.length + ' / ' + all.length;
+  const kinds = [''].concat(Object.keys(KINDC).filter(k => all.some(e => e.kind === k)));
+  $('#kinds').innerHTML = kinds.map(k => '<button class="chip" data-k="' + k + '" aria-pressed="' +
+    (S.kind === k) + '">' + esc(k ? kindName(k) : t('f_all')) + '</button>').join('') +
+    ['all','people','comp'].map(a => '<button class="chip" data-a="' + a + '" aria-pressed="' +
+      (S.acct === a) + '">' + esc(t(a === 'all' ? 'f_a_all' : a === 'people' ? 'f_a_user' : 'f_a_mach')) +
+      '</button>').join('');
+  const act = [];
+  if(S.q) act.push(['q', t('search_ph').split(':')[0] + ': ' + S.q]);
+  if(S.kind) act.push(['kind', kindName(S.kind)]);
+  if(S.mach) act.push(['mach', S.mach]);
+  $('#active').innerHTML = act.length ? act.map(a => '<span class="afl">' + esc(a[1]) +
+    '<button data-clr="' + a[0] + '">&times;</button></span>').join('') +
+    '<button class="clearall" data-clr="all">' + esc(t('again')) + '</button>' : '';
+  if(!list.length){ $('#events').innerHTML = emptyBox(t('empty_events'), ''); return; }
+  $('#events').innerHTML = tbl([[t('th_time')], [t('th_kind')], [t('th_users')], [t('th_prog')],
+      [t('th_target')], [t('th_comp')], ['ID', 'r']],
+    list.slice(0, S.shown).map((e, i) => '<tr class="click" data-ev="' + i + '">' +
+      '<td class="mn dm">' + when(e.event_time) + '</td>' +
+      '<td>' + tag(KINDC[e.kind] || 'n', kindName(e.kind)) +
+        (e.ntlm_version ? ' ' + tag(e.ntlm_version === 'NTLMv1' ? 'v1' : 'v2', e.ntlm_version) : '') + '</td>' +
+      '<td>' + esc(e.user || '\u2013') + '</td>' +
+      '<td class="mn dm">' + esc(e.process || '\u2013') + '</td>' +
+      '<td class="mn dm"><span class="cut">' + esc(e.target_server || e.workstation || '\u2013') + '</span></td>' +
+      '<td class="mn dm">' + esc(e.source) + '</td>' +
+      '<td class="r dm">' + e.event_id + '</td></tr>').join('')) +
+    (list.length > S.shown ? '<button class="more" id="more">' + esc(t('more')) + '</button>' : '');
+  window.__EVLIST = list;
+}
+function renderJump(){
+  const items = [['sec-trend', 'trend_h', null], ['sec-programs', 'nav_prog', (DATA.blockers || []).length],
+    ['sec-top', 'top_h', null], ['sec-v1', 'nav_v1', (DATA.v1_users || []).length],
+    ['sec-heat', 'nav_heat', null], ['sec-why', 'nav_why', (DATA.reasons || []).length],
+    ['sec-domain', 'nav_dom', (DATA.domain || []).length],
+    ['sec-incoming', 'nav_inc', (DATA.incoming || []).length],
+    ['sec-v1sso', 'nav_v1sso', (DATA.v1sso || []).length],
+    ['sec-kerberos', 'nav_krb', (DATA.kerberos || []).length],
+    ['sec-kacc', 'krba_h', (DATA.kerberos_accounts || []).length],
+    ['sec-agents', 'nav_mach', (DATA.agents || []).length],
+    ['sec-events', 'nav_ev', (DATA.events || []).length]];
+  $('#jump').innerHTML = items.map(x => '<button class="jl' + (x[2] === 0 ? ' nil' : '') +
+    '" data-go="' + x[0] + '">' + esc(t(x[1])) +
+    (x[2] === null ? '' : ' <b>' + x[2] + '</b>') + '</button>').join('');
+}
 
-// Section nav: one chip per section with its finding count. Sections with no
-// findings stay visible but greyed out - "checked, nothing there" is the good
-// news and worth showing, unlike hiding it entirely.
-const NAV_COUNTS = {
-  'sec-programs':          d => (d.blockers||[]).length,
-  'sec-heat':              d => (d.heat||[]).reduce((a,r)=>a+r.reduce((x,y)=>x+(y>0?1:0),0),0),
-  'sec-why':               d => (d.reasons||[]).length,
-  'sec-incoming':          d => (d.incoming||[]).length,
-  'sec-v1sso':             d => (d.v1sso||[]).length,
-  'sec-v1':                d => (d.v1_users||[]).length,
-  'sec-domain':            d => (d.domain||[]).length,
-  'sec-kerberos-accounts': d => (d.kerberos_accounts||[]).length,
-  'sec-agents':            d => (d.agents||[]).length,
-  'sec-events':            d => (d.events||[]).length,
-};
-function syncNav(d){
-  document.querySelectorAll('.navchip').forEach(c=>{
-    const id = c.dataset.sec;
-    const fn = NAV_COUNTS[id];
-    const n = fn ? fn(d) : 0;
-    const tone = c.dataset.tone || 'neut';
-    c.classList.remove('t-bad','t-warn','t-good','empty');
-    if(n > 0 && tone !== 'neut') c.classList.add('t-'+tone);
-    if(n === 0) c.classList.add('empty');
-    let badge = c.querySelector('.n');
-    if(!badge){ badge = document.createElement('span'); badge.className = 'n'; c.appendChild(badge); }
-    badge.textContent = n;
+// ---- Schublade -----------------------------------------------------------
+function openEvent(i){
+  const e = (window.__EVLIST || [])[i]; if(!e) return;
+  $('#dtitle').innerHTML = tag(KINDC[e.kind] || 'n', kindName(e.kind)) +
+    '<span style="margin-left:8px">' + esc(t('d_eid')) + ' ' + e.event_id + '</span>';
+  const d = toLocal(e.event_time);
+  $('#dwhen').textContent = (d ? d.toLocaleString(LOCALE(), {weekday:'long', day:'2-digit',
+    month:'long', hour:'2-digit', minute:'2-digit', second:'2-digit'}) : e.event_time) + ' \u00b7 ' + e.source;
+  const row = (k, v, hint) => '<div class="fr"><div class="fk">' + esc(k) + '</div><div class="fv' +
+    (v ? '' : ' none') + '">' + (v ? esc(v) : '\u2013') + (hint ? '<div style="color:var(--faint);' +
+    'font-family:var(--text);font-size:11.5px;margin-top:3px">' + esc(hint) + '</div>' : '') + '</div></div>';
+  const grp = (title, rows) => rows.join('').length ? '<div class="grp"><div class="gk">' + esc(title) +
+    '</div>' + rows.join('') + '</div>' : '';
+  const eidKey = 'eid_' + e.event_id, eidTxt = I18N[LANG][eidKey] ? t(eidKey) : '';
+  const fk = e.failure_code ? ('rid_k' + String(e.failure_code).toLowerCase()) : '';
+  const fhint = fk && I18N[LANG][fk] ? t(fk) : '';
+  $('#dbody').innerHTML =
+    (eidTxt ? '<div class="expl"><b>' + esc(t('d_eid')) + ' ' + e.event_id + '</b>' + esc(eidTxt) + '</div>' : '') +
+    grp(t('d_comp'), [row(t('d_user'), e.user), row(t('d_dom'), e.domain),
+      row(t('d_ws'), e.workstation), row(t('d_ip'), e.ip)]) +
+    grp(t('th_target'), [row(t('d_target'), e.target_server), row(t('d_os'), e.server_os)]) +
+    grp(t('th_prog'), [row(t('d_proc'), e.process), row(t('d_ppath'), e.process_path)]) +
+    grp(t('d_kind'), [row(t('d_ver'), e.ntlm_version), row(t('d_auth'), e.auth_method),
+      row(t('d_lt'), e.logon_type), row(t('d_enc'), e.enc_type), row(t('d_mic'), e.mic),
+      row(t('d_epa'), e.epa)]) +
+    grp(t('th_reason'), [row(t('d_reason'), e.reason), row(t('d_fcode'), e.failure_code, fhint),
+      row(t('d_log'), e.log), row(t('d_rid'), e.record_id)]) +
+    '<div class="dact">' +
+      (e.process ? '<button data-prog="' + esc(e.process) + '">' + esc(e.process) + '</button>' : '') +
+      (e.user ? '<button data-q="' + esc(e.user) + '">' + esc(e.user) + '</button>' : '') +
+      '<button data-mach="' + esc(e.source) + '">' + esc(e.source) + '</button>' +
+      '<button data-kind="' + esc(e.kind) + '">' + esc(kindName(e.kind)) + '</button></div>';
+  openDrawer();
+}
+function openExceptions(){
+  const rows = (DATA.blockers || []).filter(b => b.st !== 'erledigt' && b.target);
+  const seen = {}, list = [];
+  rows.forEach(b => { const n = String(b.target).replace(/^[A-Za-z]+\//, '');
+    if(!seen[n]){ seen[n] = 1; list.push(n); } });
+  list.sort();
+  $('#dtitle').textContent = t('exc_gpo_out');
+  $('#dwhen').textContent = t('exc_entries', {n: list.length});
+  $('#dbody').innerHTML = '<div class="expl">' + esc(t('exc_note')) + '</div>' +
+    (list.length ? '<div class="code">' + list.map(esc).join('\n') + '</div>'
+                 : emptyBox(t('exc_empty'), ''));
+  openDrawer();
+}
+const openDrawer = () => { $('#drawer').classList.add('on'); $('#scrim').classList.add('on');
+  $('#dclose').focus(); };
+const closeDrawer = () => { $('#drawer').classList.remove('on'); $('#scrim').classList.remove('on'); };
+
+// ---- Zeichnen ------------------------------------------------------------
+function render(){
+  if(!DATA) return;
+  renderChrome(); renderHero(); renderFocus();
+  $('#grid').innerHTML = [secTrend(), secPrograms(), secTargets(), secV1(), secHeat(), secWhy(),
+    secDomain(), secIncoming(), secSso(), secKrb(), secKrbAcc(), secAgents(), secEvents()].join('');
+  fillHeat(); renderEvents(); renderJump();
+  const qi = $('#q'); if(qi) qi.value = S.q;
+  requestAnimationFrame(function(){
+    document.querySelectorAll('.bfl').forEach(function(b){
+      b.style.width = b.parentNode.parentNode.dataset.p + '%'; });
+    document.querySelectorAll('.bcol span').forEach(function(s){ s.style.height = s.dataset.h + '%'; });
   });
-}
-document.querySelectorAll('.navchip').forEach(c=>c.addEventListener('click',()=>{
-  const el = document.getElementById(c.dataset.sec);
-  // Hidden sections (v1sso / incoming without findings) cannot be scrolled to
-  if(!el || el.offsetParent === null) return;
-  el.scrollIntoView({behavior:'smooth', block:'start'});
-}));
-
-// Highlight the section currently in view
-if('IntersectionObserver' in window){
-  const obs = new IntersectionObserver(entries=>{
-    entries.forEach(e=>{
-      const chip = document.querySelector('.navchip[data-sec="'+e.target.id+'"]');
-      if(chip) chip.classList.toggle('active', e.isIntersecting);
-    });
-  }, {rootMargin:'-15% 0px -70% 0px'});
-  document.querySelectorAll('section[id]').forEach(sec=>obs.observe(sec));
+  const cards = document.querySelectorAll('.card');
+  if(calm || !window.IntersectionObserver){ cards.forEach(c => c.classList.add('in')); }
+  else { const io = new IntersectionObserver(function(es, o){ es.forEach(function(e, i){
+      if(!e.isIntersecting) return;
+      setTimeout(function(){ e.target.classList.add('in'); }, i * 55); o.unobserve(e.target); });
+    }, {rootMargin: '-30px'}); cards.forEach(c => io.observe(c)); }
 }
 
-// Machine picker: filters every panel, not just the event list. The option list
-// is rebuilt from the agent list on each load, keeping the current choice.
-function syncMachines(agents){
-  const sel = document.getElementById('srcsel');
-  if(!sel) return;
-  const names = (agents||[]).map(a=>a.source).sort();
-  const sig = names.join('|');
-  if(sel.dataset.sig === sig) return;
-  sel.dataset.sig = sig;
-  const cur = state.src;
-  sel.innerHTML = '<option value="">'+t('g_all_mach')+'</option>' +
-    names.map(n=>'<option value="'+esc(n)+'">'+esc(n)+'</option>').join('');
-  sel.value = cur;
-}
-const srcsel = document.getElementById('srcsel');
-if(srcsel) srcsel.addEventListener('change', ()=>{ state.src = srcsel.value; load(); });
-const hd = document.getElementById('hidedone');
-if(hd) hd.addEventListener('change', ()=>{
-  state.hidedone = hd.checked;
-  document.body.classList.toggle('hide-done', state.hidedone);
+// ---- Ereignisse ----------------------------------------------------------
+document.addEventListener('click', function(ev){
+  const el = ev.target;
+  if(el.id === 'scrim' || el.id === 'dclose'){ closeDrawer(); return; }
+  if(el.id === 'excbtn'){ openExceptions(); return; }
+  if(el.id === 'more'){ S.shown += 60; renderEvents(); return; }
+  if(el.id === 'csv'){ window.location = '/api/export.csv?' + params({q: S.q, kind: S.kind}).toString(); return; }
+  if(el.id === 'logout'){ window.location = '/logout'; return; }
+  if(el.id === 'hide'){ S.hideDone = !S.hideDone; render(); return; }
+  const lang = el.closest('[data-l]');
+  if(lang){ LANG = lang.dataset.l; render(); return; }
+  const r = el.closest('[data-r]');
+  if(r){ S.range = r.dataset.r; load(); return; }
+  const go = el.closest('[data-go]');
+  if(go){ const c = document.getElementById(go.dataset.go);
+    if(c) c.scrollIntoView({behavior: 'smooth', block: 'start'}); return; }
+  const evrow = el.closest('[data-ev]');
+  if(evrow){ openEvent(+evrow.dataset.ev); return; }
+  const clr = el.closest('[data-clr]');
+  if(clr){ const k = clr.dataset.clr;
+    if(k === 'all'){ S.q = ''; S.kind = ''; S.mach = ''; load(); }
+    else if(k === 'mach'){ S.mach = ''; load(); }
+    else { S[k] = ''; render(); }
+    return; }
+  const chip = el.closest('.chip');
+  if(chip){ if(chip.dataset.k !== undefined) S.kind = chip.dataset.k;
+    if(chip.dataset.a) S.acct = chip.dataset.a;
+    S.shown = 60; renderEvents(); return; }
+  const jd = el.closest('[data-prog],[data-q],[data-mach],[data-kind]');
+  if(jd){
+    if(jd.dataset.mach){ S.mach = jd.dataset.mach; closeDrawer(); load(); return; }
+    if(jd.dataset.prog) S.q = jd.dataset.prog;
+    if(jd.dataset.q) S.q = jd.dataset.q;
+    if(jd.dataset.kind) S.kind = jd.dataset.kind;
+    S.shown = 60; closeDrawer(); render();
+    const c = document.getElementById('sec-events');
+    if(c) setTimeout(function(){ c.scrollIntoView({behavior: 'smooth', block: 'start'}); }, 50);
+  }
 });
+document.addEventListener('input', function(e){
+  if(e.target.id === 'q'){ S.q = e.target.value; S.shown = 60; renderEvents(); } });
+document.addEventListener('change', function(e){
+  if(e.target.id === 'mach'){ S.mach = e.target.value; load(); return; }
+  const k = e.target.dataset && e.target.dataset.key;
+  if(k){ const v = e.target.value;
+    fetch('/item-status', {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({key: k, status: v})}).then(function(){ load(); }).catch(function(){});
+  } });
+addEventListener('keydown', function(e){ if(e.key === 'Escape') closeDrawer(); });
 
-document.querySelectorAll('.rchip[data-r]').forEach(c=>c.addEventListener('click',()=>{
-  document.querySelectorAll('.rchip[data-r]').forEach(x=>x.classList.remove('on'));
-  c.classList.add('on'); state.r=c.dataset.r; load();
-}));
+load();
+TIMER = setInterval(load, 60000);
 
-// Metric cards: apply the filter (if any) and jump to the matching section
-function applyFilter(f){
-  state.f = f;
-  document.querySelectorAll('.chip:not(.achip)').forEach(x=>x.classList.toggle('on', x.dataset.f===f));
-  load();
-}
-function activateStat(c){
-  if(c.dataset.filter) applyFilter(c.dataset.filter);
-  const sel = c.dataset.scroll;
-  if(sel){ const el=document.querySelector(sel); if(el) el.scrollIntoView({behavior:'smooth', block:'start'}); }
-}
-document.querySelectorAll('.stat.clickable').forEach(c=>{
-  c.addEventListener('click', ()=>activateStat(c));
-  c.addEventListener('keydown', e=>{ if(e.key==='Enter'||e.key===' '){ e.preventDefault(); activateStat(c); } });
-});
-$('#q').addEventListener('input',e=>{ state.q=e.target.value; clearTimeout(window._t); window._t=setTimeout(load,300); });
-applyStatic();
-load(); setInterval(load,5000);
 </script>
 </body>
-</html>"""
+</html>
+"""
 
 
 LOGIN_HTML = r"""<!doctype html>
