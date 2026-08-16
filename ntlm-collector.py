@@ -110,7 +110,7 @@ CREATE TABLE IF NOT EXISTS agents (
     source          TEXT PRIMARY KEY,
     is_dc           INTEGER,
     agent_version   TEXT,
-    outgoing_audit  TEXT,          -- aus/audit/deny/unbekannt
+    outgoing_audit  TEXT,          -- aus/audit/deny/unknown
     incoming_audit  TEXT,
     domain_audit    TEXT,          -- nur DC
     lm_level        TEXT,          -- LmCompatibilityLevel: welche NTLM-Versionen erlaubt sind
@@ -130,7 +130,7 @@ CREATE TABLE IF NOT EXISTS agents (
 # Kerberos-Fehlercodes aus fehlgeschlagenen 4769-Anfragen: auf Systemen ohne
 # die 40xx-Ereignisse (2016/2019/2022) die einzige Fruehwarnung fuer die
 # Ursachen hinter NTLM-Fallback. Kategorie -> dieselben Abhilfe-Texte wie beim
-# Warum-Panel; unbekannte Codes laufen als "unklar" mit rohem Code durch.
+# Why-panel; unknown codes pass through as "unclear" with the raw code.
 KRB_FAIL = {
     "0x6":  ("Kerberos: client account unknown", "unklar"),
     "0x7":  ("Kerberos: SPN not found (service principal unknown)", "spn"),
@@ -230,6 +230,7 @@ def init_db(path):
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "NtlmCollector/1.0"
+    sys_version = ""   # keep the Python version out of every response header
 
     # ---- Helpers ----------------------------------------------------------
     def _send(self, code, body, ctype="application/json"):
@@ -772,7 +773,7 @@ class Handler(BaseHTTPRequestHandler):
             blockers = [with_status("proc", r[0], r[1],
                              dict(process=r[0], target=r[1], n=r[2], blocked=r[3],
                              users=r[4], sources=r[5], last_seen=r[6], who=r[7])) for r in c.execute(
-                f"SELECT COALESCE(process,'(unbekannt)'), COALESCE(target_server,'(unbekannt)'), "
+                f"SELECT COALESCE(process,'(unknown)'), COALESCE(target_server,'(unknown)'), "
                 f"COUNT(*), SUM(CASE WHEN event_id IN (4001,4002,4003,4004,4005,4006,4013) THEN 1 ELSE 0 END), COUNT(DISTINCT user), COUNT(DISTINCT source), MAX(event_time), "
                 f"GROUP_CONCAT(DISTINCT user) "
                 f"FROM events WHERE event_id IN (8001,4001,4020,4021,4013) AND {tf} "
@@ -846,7 +847,7 @@ class Handler(BaseHTTPRequestHandler):
             v1sso = [with_status("v1sso", r[0], r[1],
                           dict(user=r[0], target=r[1], n=r[2], sources=r[3],
                                last_seen=r[4], blocked=bool(r[5]))) for r in c.execute(
-                f"SELECT COALESCE(user,'(unbekannt)'), COALESCE(target_server,'(unbekannt)'), "
+                f"SELECT COALESCE(user,'(unknown)'), COALESCE(target_server,'(unknown)'), "
                 f"COUNT(*), COUNT(DISTINCT source), MAX(event_time), "
                 f"MAX(CASE WHEN event_id=4025 THEN 1 ELSE 0 END) "
                 f"FROM events WHERE kind='ntlmv1sso' AND {tf} "
@@ -855,7 +856,7 @@ class Handler(BaseHTTPRequestHandler):
             domain = [with_status("dom", r[0], r[1],
                            dict(workstation=r[0], target=r[1], users=r[2],
                            n=r[3], blocked=r[4], last_seen=r[5], who=r[6])) for r in c.execute(
-                f"SELECT COALESCE(workstation,'(unbekannt)'), COALESCE(target_server,'(unbekannt)'), "
+                f"SELECT COALESCE(workstation,'(unknown)'), COALESCE(target_server,'(unknown)'), "
                 f"COUNT(DISTINCT user), COUNT(*), "
                 f"SUM(CASE WHEN event_id IN (4004,4005,4006) THEN 1 ELSE 0 END), "
                 f"MAX(event_time), GROUP_CONCAT(DISTINCT user) "
@@ -864,14 +865,14 @@ class Handler(BaseHTTPRequestHandler):
             # Kerberos (informational): which services/SPNs already use Kerberos
             kerberos = [dict(service=r[0], accounts=r[1], n=r[2],
                              enc=r[3], last_seen=r[4]) for r in c.execute(
-                f"SELECT COALESCE(target_server,'(unbekannt)'), COUNT(DISTINCT user), COUNT(*), "
+                f"SELECT COALESCE(target_server,'(unknown)'), COUNT(DISTINCT user), COUNT(*), "
                 f"       GROUP_CONCAT(DISTINCT enc_type), MAX(event_time) "
                 f"FROM events WHERE kind='kerberos' AND {tf} "
                 f"GROUP BY target_server ORDER BY COUNT(*) DESC LIMIT 50", tp).fetchall()]
             # Kerberos by account: the "safe side" - which accounts already use Kerberos
             kerberos_accounts = [dict(account=r[0], services=r[1], svc_count=r[2], n=r[3],
                                       enc=r[4], last_seen=r[5]) for r in c.execute(
-                f"SELECT COALESCE(user,'(unbekannt)'), GROUP_CONCAT(DISTINCT target_server), "
+                f"SELECT COALESCE(user,'(unknown)'), GROUP_CONCAT(DISTINCT target_server), "
                 f"       COUNT(DISTINCT target_server), COUNT(*), "
                 f"       GROUP_CONCAT(DISTINCT enc_type), MAX(event_time) "
                 f"FROM events WHERE kind='kerberos' AND user IS NOT NULL AND user<>'' AND {tf} "
@@ -2653,6 +2654,23 @@ LOGIN_HTML = r"""<!doctype html>
 </body></html>
 """
 
+def _tighten_file_permissions(db_path):
+    """The database stores who authenticates to what - that is reconnaissance
+    gold and must not be world-readable. A restrictive umask covers every file
+    this process creates (DB, -wal, -shm, TLS temp files); the explicit chmod
+    additionally fixes databases that already exist from earlier runs. On
+    Windows both calls are effectively no-ops; NTFS ACLs govern there."""
+    try:
+        os.umask(0o077)
+    except OSError:
+        pass
+    for suffix in ("", "-wal", "-shm"):
+        try:
+            os.chmod(db_path + suffix, 0o600)
+        except OSError:
+            pass
+
+
 def main():
     ap = argparse.ArgumentParser(description="NTLM-Analyzer - Collector + Dashboard")
     ap.add_argument("--port", type=int, default=8080)
@@ -2678,6 +2696,7 @@ def main():
     if bool(args.cert) != bool(args.tlskey):
         ap.error("--cert and --tlskey must be given together.")
 
+    _tighten_file_permissions(args.db)
     conn = init_db(args.db)
     # Per-connection timeout: without it a client that opens a socket and never
     # sends (or trickles bytes) pins a thread forever - enough such connections
@@ -2687,6 +2706,17 @@ def main():
 
     scheme = "http"
     if args.cert:
+        try:
+            mode = os.stat(args.tlskey).st_mode
+            # World bits only: group access is common practice (Debian's
+            # ssl-cert group) and POSIX ACLs mirror their mask into the group
+            # bits - warning on those would false-alarm on every clean
+            # setfacl-based install.
+            if os.name == "posix" and mode & 0o007:
+                print("[NTLM-Analyzer] WARNING: TLS key file is world-readable "
+                      "- consider: chmod o= " + args.tlskey)
+        except OSError:
+            pass
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         try:

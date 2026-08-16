@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// Version reported with every status push (shown in the dashboard).
-pub const AGENT_VERSION: &str = "1.8.1";
+pub const AGENT_VERSION: &str = "1.8.2";
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Config {
@@ -88,6 +88,48 @@ pub fn log_path() -> PathBuf {
 /// search path or the working directory (protection against binary planting).
 /// Assumes a 64-bit build (the MSVC toolchain default) - then System32 is the
 /// real 64-bit directory without WOW64 redirection.
+/// Reads a line from stdin with terminal echo turned off (Windows console
+/// API, declared directly to avoid pulling in another crate). Falls back to a
+/// visible read with a warning when no console is attached (e.g. piped input).
+pub fn prompt_password(prompt: &str) -> Result<String, String> {
+    use std::io::Write;
+    print!("{prompt}");
+    let _ = std::io::stdout().flush();
+
+    #[cfg(windows)]
+    {
+        type Handle = *mut core::ffi::c_void;
+        const STD_INPUT_HANDLE: u32 = 0xFFFF_FFF6; // (DWORD)-10
+        const ENABLE_ECHO_INPUT: u32 = 0x0004;
+        extern "system" {
+            fn GetStdHandle(kind: u32) -> Handle;
+            fn GetConsoleMode(h: Handle, mode: *mut u32) -> i32;
+            fn SetConsoleMode(h: Handle, mode: u32) -> i32;
+        }
+        unsafe {
+            let h = GetStdHandle(STD_INPUT_HANDLE);
+            let mut mode: u32 = 0;
+            if !h.is_null() && GetConsoleMode(h, &mut mode) != 0 {
+                SetConsoleMode(h, mode & !ENABLE_ECHO_INPUT);
+                let line = read_trimmed_line();
+                SetConsoleMode(h, mode); // always restore, even on empty input
+                println!();
+                return line;
+            }
+        }
+        eprintln!("(no console detected - input will be visible)");
+    }
+    read_trimmed_line()
+}
+
+fn read_trimmed_line() -> Result<String, String> {
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .map_err(|e| format!("reading input: {e}"))?;
+    Ok(line.trim_end_matches(['\r', '\n']).to_string())
+}
+
 pub fn system32(exe: &str) -> PathBuf {
     let root = std::env::var("SystemRoot").unwrap_or_else(|_| String::from(r"C:\Windows"));
     PathBuf::from(root).join("System32").join(exe)
@@ -151,13 +193,27 @@ impl Config {
                 }
                 "--service-password" => {
                     i += 1;
-                    c.service_password = Some(
-                        args.get(i)
-                            .cloned()
-                            .ok_or("--service-password requires a value")?,
-                    );
+                    let v = args
+                        .get(i)
+                        .cloned()
+                        .ok_or("--service-password requires a value")?;
+                    // "*" = prompt without echo. A password given inline would
+                    // end up in the admin's PowerShell history and - where
+                    // command-line auditing (4688) is on - in the Security log.
+                    // For an NTLM auditing tool of all things, that would be an
+                    // own goal; gMSA (trailing '$', no password) avoids the
+                    // question entirely and stays the recommended path.
+                    let pw = if v == "*" {
+                        prompt_password("Password for the service account: ")?
+                    } else {
+                        v
+                    };
+                    if pw.is_empty() {
+                        return Err("empty password - aborting".into());
+                    }
+                    c.service_password = Some(pw);
                 }
-                other => return Err(format!("unbekanntes Argument: {other}")),
+                other => return Err(format!("unknown argument: {other}")),
             }
             i += 1;
         }
@@ -166,7 +222,7 @@ impl Config {
         }
         // Validate the service account early instead of failing at the SCM call.
         if c.service_password.is_some() && c.service_account.is_none() {
-            return Err("--service-password ohne --service-account ergibt keinen Sinn".into());
+            return Err("--service-password without --service-account makes no sense".into());
         }
         if let Some(acct) = &c.service_account {
             let passwordless = acct.trim_end().ends_with('$')

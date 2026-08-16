@@ -130,12 +130,12 @@ fn decode_output(bytes: &[u8]) -> String {
         return decode_utf16(&bytes[2..], false); // UTF-16BE with BOM
     }
     if bytes.len() >= 2 && bytes[0] == 0x3C && bytes[1] == 0x00 {
-        return decode_utf16(bytes, true); // "<\0..." = UTF-16LE ohne BOM
+        return decode_utf16(bytes, true); // "<\0..." = UTF-16LE without BOM
     }
     if bytes.len() >= 2 && bytes[0] == 0x00 && bytes[1] == 0x3C {
-        return decode_utf16(bytes, false); // "\0<..." = UTF-16BE ohne BOM
+        return decode_utf16(bytes, false); // "\0<..." = UTF-16BE without BOM
     }
-    String::from_utf8_lossy(bytes).into_owned() // Standardfall: UTF-8
+    String::from_utf8_lossy(bytes).into_owned() // default case: UTF-8
 }
 
 fn decode_utf16(bytes: &[u8], little_endian: bool) -> String {
