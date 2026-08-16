@@ -223,7 +223,7 @@ mod windows_impl {
         let current = std::env::current_exe()?;
         if !same_file(&current, &target_exe) {
             std::fs::create_dir_all(install_dir())
-                .map_err(|e| format!("Zielordner {} anlegen: {e}", install_dir().display()))?;
+                .map_err(|e| format!("creating target dir {}: {e}", install_dir().display()))?;
             std::fs::copy(&current, &target_exe).map_err(|e| {
                 format!(
                     "copying the EXE to {} failed: {e} \
@@ -246,7 +246,7 @@ mod windows_impl {
             let state = existing
                 .query_status()
                 .map(|s| format!("{:?}", s.current_state))
-                .unwrap_or_else(|_| String::from("unbekannt"));
+                .unwrap_or_else(|_| String::from("unknown"));
             return Err(format!(
                 "The service '{SERVICE_NAME}' already exists (state: {state}). \
                  Please run 'ntlm-agent.exe uninstall' first, then install again. \

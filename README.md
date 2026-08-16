@@ -374,7 +374,7 @@ One command does everything: copies the EXE to `C:\Program Files\NtlmAgent\`, ha
 
 | Command | Purpose |
 | --- | --- |
-| `install --collector-url <URL> [--api-key K] [--interval MIN] [--days-back N] [--skip-kerberos] [--enable-outgoing-audit] [--service-account A [--service-password P]]` | Writes the config, installs and starts the service. Default account: LocalSystem; a trailing `$` marks a gMSA (no password). See the agent README for the required rights. |
+| `install --collector-url <URL> [--api-key K] [--interval MIN] [--days-back N] [--skip-kerberos] [--enable-outgoing-audit] [--service-account A [--service-password P|*]]` | Writes the config, installs and starts the service. Default account: LocalSystem; a trailing `$` marks a gMSA (no password). `--service-password *` prompts with hidden input, keeping the password out of the shell history and out of command-line auditing (event 4688). See the agent README for the required rights. |
 | `uninstall` | Stops and removes the service |
 | `run` | One-off collect/push cycle in the console (for testing) |
 | `service` | Internal — invoked by the service control manager |

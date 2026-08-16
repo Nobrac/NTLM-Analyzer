@@ -134,7 +134,7 @@ Usage:
   ntlm-agent.exe install --collector-url <URL> [--api-key <KEY>]
                          [--interval <MIN>] [--days-back <N>]
                          [--skip-kerberos] [--enable-outgoing-audit]
-                         [--service-account <ACCOUNT> [--service-password <PW>]]
+                         [--service-account <ACCOUNT> [--service-password <PW|*>]]
         Writes the configuration (C:\\ProgramData\\NtlmAgent\\config.json),
         creates the service (auto-start) and starts it.
         Without --service-account the service runs as LocalSystem.

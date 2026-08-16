@@ -358,7 +358,7 @@ pub fn run_cycle(cfg: &Config) -> Result<(), String> {
     if collected.is_empty() {
         merge_watermarks(&mut state, new_seen);
         config::save_state(&state)?;
-        config::log(&format!("[{me}] Keine neuen NTLM-Events."));
+        config::log(&format!("[{me}] no new NTLM events."));
         return Ok(());
     }
 
