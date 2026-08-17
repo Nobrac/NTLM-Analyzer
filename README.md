@@ -6,6 +6,12 @@
 
 A Windows agent plus a central collector with a web dashboard that shows exactly **who still authenticates over NTLM**, what already runs securely over Kerberos, and whether usage is trending toward zero.
 
+**[▶ Live demo](https://nobrac.github.io/NTLM-Analyzer/)** — the real dashboard,
+frozen against synthetic data from a lab domain. Search, the kind and account
+filters, the language toggle and the per-event detail view all work; time range,
+machine picker, CSV and the chart drill-downs need the collector behind them and
+are disabled there.
+
 ![Collector: Python 3.7+](https://img.shields.io/badge/collector-Python%203.7%2B-3776AB?logo=python&logoColor=white)
 &nbsp;
 ![Agent: Rust](https://img.shields.io/badge/agent-Rust-CE422B?logo=rust&logoColor=white)
