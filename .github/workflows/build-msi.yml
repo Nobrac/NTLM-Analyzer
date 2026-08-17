@@ -48,7 +48,11 @@ jobs:
       - name: Verify icon and version resource
         shell: pwsh
         run: |
-          $exe = "ntlm-agent-rs/target/release/ntlm-agent.exe"
+          # Anchored at the workspace root, not relative: this workflow sets a
+          # default working-directory of ntlm-agent-rs and the other does not,
+          # so a relative path resolves differently in each and doubled the
+          # folder in one of them.
+          $exe = Join-Path $env:GITHUB_WORKSPACE "ntlm-agent-rs/target/release/ntlm-agent.exe"
           $vi = (Get-Item $exe).VersionInfo
           Write-Host "FileVersion:  '$($vi.FileVersion)'"
           Write-Host "ProductName:  '$($vi.ProductName)'"
