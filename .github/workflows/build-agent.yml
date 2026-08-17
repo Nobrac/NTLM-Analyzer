@@ -1,4 +1,4 @@
-name: Build agent
+name: Build agent EXE
 
 # Builds the Windows agent so you get a ready-made ntlm-agent.exe without
 # needing a local Rust toolchain. The binary appears under the workflow run's
@@ -11,6 +11,13 @@ on:
     tags: ['v*']
   pull_request:
   workflow_dispatch:
+
+# Several pushes in a row would otherwise queue up full runs of this and
+# cancel nothing. Only the newest commit per ref is worth building, and
+# fewer parallel runs also means fewer throttled action downloads.
+concurrency:
+  group: build-agent-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -80,7 +87,9 @@ jobs:
       - name: Upload ntlm-agent.exe
         uses: actions/upload-artifact@v4
         with:
-          name: ntlm-agent-windows-x64
+          # Named so it cannot be mistaken for the installer: this is the bare
+          # console binary, and double-clicking it only flashes a window.
+          name: agent-exe-only-not-the-installer
           path: ntlm-agent-rs/target/release/ntlm-agent.exe
           if-no-files-found: error
 
