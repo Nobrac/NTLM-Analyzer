@@ -92,6 +92,40 @@ ntlm-agent.exe install --collector-url https://collector.example.local:8443 ^
 :: stop and remove the service
 ntlm-agent.exe uninstall
 
+### The API key and the installer
+
+The MSI deliberately does **not** handle the API key. Two attempts to keep it out
+of the verbose install log failed - the value reaches the log through the helper
+action that runs the configuration command, not through the property table - and
+on an `msiexec` command line it would be visible in the process list regardless,
+where nothing can hide it.
+
+So the installer sets everything that is not secret, and the key is set once
+afterwards in an elevated prompt:
+
+```cmd
+:: 1) install - wizard, or silent for Intune
+msiexec /i ntlm-agent.msi /qn COLLECTORURL=https://collector.example.local:8443
+
+:: 2) add the key, once
+"C:\Program Files\NtlmAgent\ntlm-agent.exe" configure ^
+    --collector-url https://collector.example.local:8443 --api-key SECRET123
+sc stop NtlmAgent && sc start NtlmAgent
+```
+
+For an unattended rollout, run step 2 from the same script that deploys the MSI
+so the key never sits in a stored install command. If the collector runs without
+`--key`, skip step 2 entirely - no key is checked then.
+
+```cmd
+:: install without the key, then set it once, interactively
+msiexec /i ntlm-agent.msi /qn COLLECTORURL=https://collector.example.local:8443
+ntlm-agent.exe configure --collector-url https://collector.example.local:8443 --api-key SECRET123
+```
+
+Or deploy a per-machine key that is worth little on its own. The collector only
+checks the key at all when it was started with `--key`.
+
 :: write or change the configuration only - no file copy, no service changes.
 :: Useful to correct the collector URL or the API key on a machine that is
 :: already installed.

@@ -91,7 +91,7 @@ jobs:
           $log = "install.log"
           $p = Start-Process msiexec -Wait -PassThru -ArgumentList `
             "/i","ntlm-agent.msi","/qn","/l*v",$log,`
-            "COLLECTORURL=https://collector.invalid:8443","APIKEY=ci-test-key"
+            "COLLECTORURL=https://collector.invalid:8443"
           if ($p.ExitCode -ne 0) { Get-Content $log -Tail 40; throw "install failed: $($p.ExitCode)" }
           if (-not (Get-Service NtlmAgent -ErrorAction SilentlyContinue)) { throw "service missing" }
           $cfg = "$env:ProgramData\NtlmAgent\config.json"
@@ -100,13 +100,17 @@ jobs:
           if ($j.collector_url -ne "https://collector.invalid:8443") {
             throw "collector_url not applied: $($j.collector_url)"
           }
-          if (Select-String -Path $log -Pattern "ci-test-key" -Quiet) {
-            throw "API key leaked into the MSI log"
+          # The installer must never handle the API key: two attempts to hide
+          # it in the log failed, because the helper action logs the command it
+          # runs. The key is set separately instead - this guards against
+          # anyone putting it back.
+          if (Select-String -Path $log -Pattern "--api-key" -Quiet) {
+            throw "the installer passes an API key - it must not; see installer/Package.wxs"
           }
           $p = Start-Process msiexec -Wait -PassThru -ArgumentList "/x","ntlm-agent.msi","/qn"
           if ($p.ExitCode -ne 0) { throw "uninstall failed: $($p.ExitCode)" }
           if (Get-Service NtlmAgent -ErrorAction SilentlyContinue) { throw "service survived uninstall" }
-          Write-Host "install/uninstall OK, key not in log"
+          Write-Host "install/uninstall OK, no secret in the log"
 
       - name: Upload MSI
         uses: actions/upload-artifact@v4
