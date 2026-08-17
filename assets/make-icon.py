@@ -141,8 +141,10 @@ def msi_art(out, tile):
     banner = Image.new("RGB", (493, 58), PAPER)
     d = ImageDraw.Draw(banner)
     d.rectangle([0, 56, 493, 58], fill=RULE)
-    ico = tile.resize((40, 40), Image.LANCZOS)
-    banner.paste(ico, (493 - 40 - 16, 8), ico)
+    # Pushed to the edge and kept small: the banner is 493 px wide but the
+    # dialog is 370 units, so every pixel here costs 0.75 units of text space.
+    ico = tile.resize((34, 34), Image.LANCZOS)
+    banner.paste(ico, (493 - 34 - 10, 11), ico)
     banner.save(os.path.join(out, "msi-banner.bmp"))
     print("wrote %s" % os.path.join(out, "msi-banner.bmp"))
 

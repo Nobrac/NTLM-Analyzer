@@ -202,9 +202,12 @@
               Title="[ProductName] Setup">
         <Control Id="Title" Type="Text" X="15" Y="6" Width="200" Height="15"
                  Transparent="yes" NoPrefix="yes" Text="{\WixUI_Font_Title}Collector connection" />
-        <Control Id="Description" Type="Text" X="25" Y="23" Width="330" Height="20"
+        <!-- Width stops at 305 units: the mark in the banner bitmap starts at
+             about 330 once its pixel position is scaled to dialog units, and a
+             wider description ran straight under it. -->
+        <Control Id="Description" Type="Text" X="25" Y="23" Width="280" Height="20"
                  Transparent="yes" NoPrefix="yes"
-                 Text="This machine will report which accounts and programs still use NTLM. Nothing is changed on it." />
+                 Text="Where this machine sends what it finds. Nothing else is changed." />
         <!-- A Bitmap control takes the id of a Binary row, not a localisation
              variable. WixUI_Bmp_Banner is the one WixUIBannerBmp replaces, so
              this picks up our own artwork. -->
