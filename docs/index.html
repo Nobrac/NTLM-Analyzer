@@ -394,6 +394,16 @@ tbody tr.on{background:rgba(61,220,151,.10);box-shadow:inset 3px 0 0 var(--krb)}
     toast._t = setTimeout(function(){ t.classList.remove('on'); }, 2600);
   }
 
+  // The dashboard polls the collector once a minute so a wall display stays
+  // current. Here that only re-fetches the same file and rebuilds every panel,
+  // which shows up as the page flickering for no reason. Swallow exactly that
+  // one timer - anything shorter is a real animation and must keep working.
+  var realSetInterval = window.setInterval.bind(window);
+  window.setInterval = function(fn, ms){
+    if(ms >= 30000) return 0;
+    return realSetInterval.apply(null, arguments);
+  };
+
   var realFetch = window.fetch.bind(window);
   window.fetch = function(url, opts){
     var u = String(url);
