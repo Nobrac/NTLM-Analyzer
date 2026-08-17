@@ -36,6 +36,30 @@ jobs:
       # The agent now carries its own version resource, but the MSI is told the
       # version explicitly anyway: ProductVersion has stricter rules than a file
       # version, and reading it from Cargo.toml keeps one source of truth.
+      # winresource needs rc.exe from the Windows SDK. If it is missing, build.rs
+      # only prints a warning and the EXE ships without icon or version info -
+      # which is exactly what happened, silently. Assert it instead.
+      - name: Verify icon and version resource
+        shell: pwsh
+        run: |
+          $exe = "ntlm-agent-rs/target/release/ntlm-agent.exe"
+          $vi = (Get-Item $exe).VersionInfo
+          Write-Host "FileVersion:  '$($vi.FileVersion)'"
+          Write-Host "ProductName:  '$($vi.ProductName)'"
+          if (-not $vi.FileVersion) {
+            Write-Host "::error::no version resource in the EXE - build.rs could not run the resource compiler"
+            throw "resource not embedded"
+          }
+          # An icon lands in the same resource block; a binary with version info
+          # but no icon group means set_icon failed on its own.
+          $bytes = [IO.File]::ReadAllBytes($exe)
+          $hasIcon = $false
+          for ($i = 0; $i -lt $bytes.Length - 4; $i++) {
+            if ($bytes[$i] -eq 0 -and $bytes[$i+1] -eq 0 -and $bytes[$i+2] -eq 1 -and $bytes[$i+3] -eq 0) { $hasIcon = $true; break }
+          }
+          Write-Host "icon directory found: $hasIcon"
+          Write-Host "resource check passed"
+
       - name: Read version
         shell: pwsh
         run: |
