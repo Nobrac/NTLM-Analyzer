@@ -1,4 +1,4 @@
-name: Build MSI
+name: Build MSI installer
 
 # Deliberately a separate workflow from "Build agent". The MSI depends on WiX,
 # a resource compiler and a working dialog set - if any of that breaks it must
@@ -8,12 +8,18 @@ on:
   push:
     branches: [main]
     tags: ['v*']
-    paths:
-      - 'installer/**'
-      - 'assets/**'
-      - 'ntlm-agent-rs/**'
-      - '.github/workflows/build-msi.yml'
+    # No paths filter on purpose. It applies to tag pushes as well, so tagging a
+    # commit that happened to touch none of those paths would produce a release
+    # with no MSI attached - the same trap the agent workflow already avoids.
+    # Duplicate runs are handled by the concurrency group below instead.
   workflow_dispatch:
+
+# Several pushes in a row would otherwise queue up full runs of this and
+# cancel nothing. Only the newest commit per ref is worth building, and
+# fewer parallel runs also means fewer throttled action downloads.
+concurrency:
+  group: build-msi-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   msi:
@@ -150,7 +156,8 @@ jobs:
       - name: Upload MSI
         uses: actions/upload-artifact@v4
         with:
-          name: ntlm-agent-msi
+          # This is the one to download and double-click.
+          name: installer-msi-double-click-this
           path: ntlm-agent.msi
           if-no-files-found: error
 
