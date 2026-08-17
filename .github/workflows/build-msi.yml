@@ -108,13 +108,16 @@ jobs:
           if ($j.collector_url -ne "https://collector.invalid:8443") {
             throw "collector_url not applied: $($j.collector_url)"
           }
-          # The installer must never handle the API key: two attempts to hide
-          # it in the log failed, because the helper action logs the command it
-          # runs. The key is set separately instead - this guards against
-          # anyone putting it back.
-          if (Select-String -Path $log -Pattern "--api-key" -Quiet) {
-            throw "the installer passes an API key - it must not; see installer/Package.wxs"
+          # This is the recommended silent path: no key on the command line.
+          # Assert that nothing key-shaped ends up in the log for it - an empty
+          # --api-key "" is expected and fine, a filled one would mean someone
+          # hardcoded a secret. Note this cannot prove the interactive path is
+          # log-clean; two attempts to hide a supplied key failed, and the agent
+          # README says so plainly.
+          if (Select-String -Path $log -Pattern '--api-key "[^"]+"' -Quiet) {
+            throw "a non-empty API key reached the install log"
           }
+          if ($j.api_key -ne "") { throw "api_key should be empty here: '$($j.api_key)'" }
           $p = Start-Process msiexec -Wait -PassThru -ArgumentList "/x","ntlm-agent.msi","/qn"
           if ($p.ExitCode -ne 0) { throw "uninstall failed: $($p.ExitCode)" }
           if (Get-Service NtlmAgent -ErrorAction SilentlyContinue) { throw "service survived uninstall" }

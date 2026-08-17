@@ -94,24 +94,31 @@ ntlm-agent.exe uninstall
 
 ### The API key and the installer
 
-The MSI deliberately does **not** handle the API key. Two attempts to keep it out
-of the verbose install log failed - the value reaches the log through the helper
-action that runs the configuration command, not through the property table - and
-on an `msiexec` command line it would be visible in the process list regardless,
-where nothing can hide it.
+The wizard has a masked field for it and the property is marked hidden, so it
+stays out of the property table in a log. **That is not the same as safe.** Two
+attempts to keep a supplied key out of a verbose install log failed: the value
+reaches the log through the helper action that runs the configuration command,
+not through the property table. So:
 
-So the installer sets everything that is not secret, and the key is set once
-afterwards in an elevated prompt:
+- **Interactive install, no verbose log** - fine. A plain double-click writes no
+  verbose log at all.
+- **`msiexec /l*v`** - assume the key is in that log file. Delete it afterwards.
+- **Silent install with `APIKEY=` on the command line** - the key is visible in
+  the process list while the installer runs, and on machines with command-line
+  auditing it lands in event 4688. Nothing in the installer can prevent that.
+
+For an unattended rollout, leave the key out of the MSI and set it separately:
 
 ```cmd
-:: 1) install - wizard, or silent for Intune
 msiexec /i ntlm-agent.msi /qn COLLECTORURL=https://collector.example.local:8443
-
-:: 2) add the key, once
 "C:\Program Files\NtlmAgent\ntlm-agent.exe" configure ^
     --collector-url https://collector.example.local:8443 --api-key SECRET123
 sc stop NtlmAgent && sc start NtlmAgent
 ```
+
+If the collector runs without `the key switch`, leave the field empty - nothing is
+checked then.
+
 
 For an unattended rollout, run step 2 from the same script that deploys the MSI
 so the key never sits in a stored install command. If the collector runs without

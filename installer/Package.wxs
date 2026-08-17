@@ -44,6 +44,9 @@
          finish pages. -->
     <WixVariable Id="WixUIBannerBmp" Value="$(var.BannerBmp)" />
     <WixVariable Id="WixUIDialogBmp" Value="$(var.DialogBmp)" />
+    <!-- Without this the licence page shows WiX's placeholder text. Generated
+         from LICENSE at build time so the two cannot drift apart. -->
+    <WixVariable Id="WixUILicenseRtf" Value="$(var.LicenseRtf)" />
 
     <!-- ============================================================ -->
     <!-- Properties. Public (upper-case) so msiexec can set them:          -->
@@ -54,7 +57,13 @@
          It still travels on the msiexec command line if passed that way, which
          is why the README recommends an Intune app secret or a script that
          builds the line at run time rather than a stored command. -->
-    <!-- Deliberately no APIKEY property.
+    <!-- Optional. Hidden keeps it out of a verbose install log as far as the
+         property table goes; see the note in the agent README for what that
+         does and does not cover. Empty is valid - a collector started without
+         the key switch checks nothing. -->
+    <Property Id="APIKEY" Secure="yes" Hidden="yes" />
+
+    <!-- Note on the earlier removal of this property.
          Two attempts to hide it failed: the value reaches the log through the
          helper action that runs the command, not through the property table, so
          Property/@Hidden and MsiHiddenProperties both missed it. Rather than
@@ -71,6 +80,11 @@
     <!-- ARPNOMODIFY is not declared here: WixUI_InstallDir already sets it,
          and Property ids must be unique across the whole package. -->
     <Property Id="ARPHELPLINK" Value="https://github.com/Nobrac/NTLM-Analyzer" />
+
+    <!-- Shown on the last page of the wizard. The one thing the installer
+         deliberately does not do is the one thing worth saying at the end. -->
+    <Property Id="WIXUI_EXITDIALOGOPTIONALTEXT"
+              Value="The NtlmAgent service is running and reporting. Settings can be changed later with: ntlm-agent.exe configure --collector-url ... --api-key ..." />
 
     <!-- ============================================================ -->
     <!-- Payload and service                                              -->
@@ -127,7 +141,7 @@
     <SetProperty Id="WriteConfig"
                  Before="WriteConfig"
                  Sequence="execute"
-                 Value="&quot;[INSTALLFOLDER]ntlm-agent.exe&quot; configure --collector-url &quot;[COLLECTORURL]&quot; --interval [INTERVAL]" />
+                 Value="&quot;[INSTALLFOLDER]ntlm-agent.exe&quot; configure --collector-url &quot;[COLLECTORURL]&quot; --api-key &quot;[APIKEY]&quot; --interval [INTERVAL]" />
 
     <CustomAction Id="WriteConfig"
                   BinaryRef="Wix4UtilCA_X64"
@@ -139,7 +153,7 @@
     <SetProperty Id="EnableAudit"
                  Before="EnableAudit"
                  Sequence="execute"
-                 Value="&quot;[INSTALLFOLDER]ntlm-agent.exe&quot; configure --collector-url &quot;[COLLECTORURL]&quot; --interval [INTERVAL] --enable-outgoing-audit" />
+                 Value="&quot;[INSTALLFOLDER]ntlm-agent.exe&quot; configure --collector-url &quot;[COLLECTORURL]&quot; --api-key &quot;[APIKEY]&quot; --interval [INTERVAL] --enable-outgoing-audit" />
 
     <CustomAction Id="EnableAudit"
                   BinaryRef="Wix4UtilCA_X64"
@@ -150,10 +164,19 @@
 
     <!-- A missing collector URL is a broken install, not a warning: the service
          would start and fail forever. Catch it in both UI and silent mode. -->
-    <Launch Condition="Installed OR (COLLECTORURL AND COLLECTORURL &lt;&gt; &quot;https://&quot;)"
-            Message="Please supply the collector URL, e.g. COLLECTORURL=https://collector.example.local:8443" />
+    <!-- The mandatory-URL check lives in the *execute* sequence, not in a
+         Launch condition. A Launch condition is evaluated in the UI sequence as
+         well, before the first dialog is usable, so it aborted a double-click
+         before the user could type the URL it was asking for. Gating it on
+         UILevel did not help either.
+         By the time InstallExecuteSequence runs, the wizard has already set
+         COLLECTORURL - so the interactive path passes and only a silent install
+         without the property is stopped, with a message that says how. -->
+    <CustomAction Id="NoCollectorUrl" Error="No collector URL was supplied. Run: msiexec /i ntlm-agent.msi /qn COLLECTORURL=https://collector.example.local:8443" />
 
     <InstallExecuteSequence>
+      <Custom Action="NoCollectorUrl" Before="InstallInitialize"
+              Condition="NOT Installed AND (NOT COLLECTORURL OR COLLECTORURL = &quot;https://&quot;)" />
       <!-- After the files are on disk, before the service is started. -->
       <Custom Action="WriteConfig" After="InstallFiles"
               Condition="NOT Installed AND ENABLEAUDIT &lt;&gt; &quot;1&quot;" />
@@ -198,19 +221,21 @@
                  NoPrefix="yes"
                  Text="Example: https://collector.example.local:8443 - use HTTPS, otherwise the API key travels in clear text." />
 
-        <Control Id="IntervalLabel" Type="Text" X="20" Y="122" Width="290" Height="12"
+        <Control Id="KeyLabel" Type="Text" X="20" Y="118" Width="290" Height="12"
+                 NoPrefix="yes" Text="API key (optional)" />
+        <!-- Password="yes" masks the field while typing. -->
+        <Control Id="KeyEdit" Type="Edit" X="20" Y="131" Width="330" Height="18"
+                 Property="APIKEY" Password="yes" Indirect="no" />
+        <Control Id="KeyHint" Type="Text" X="20" Y="151" Width="330" Height="20"
+                 NoPrefix="yes"
+                 Text="Leave empty if the collector runs without an API key. It then checks none." />
+
+        <Control Id="IntervalLabel" Type="Text" X="20" Y="178" Width="290" Height="12"
                  NoPrefix="yes" Text="Poll interval in minutes" />
-        <Control Id="IntervalEdit" Type="Edit" X="20" Y="135" Width="60" Height="18"
+        <Control Id="IntervalEdit" Type="Edit" X="20" Y="191" Width="60" Height="18"
                  Property="INTERVAL" Indirect="no" />
 
-        <!-- No field for the API key on purpose: anything the installer touches
-             ends up in its log. Setting it in one command afterwards keeps it
-             out of both the log and the process list. -->
-        <Control Id="KeyNote" Type="Text" X="20" Y="164" Width="330" Height="30"
-                 NoPrefix="yes"
-                 Text="If the collector requires an API key, set it afterwards in an elevated prompt: ntlm-agent.exe configure --collector-url ... --api-key ..." />
-
-        <Control Id="AuditCheck" Type="CheckBox" X="20" Y="202" Width="330" Height="18"
+        <Control Id="AuditCheck" Type="CheckBox" X="20" Y="214" Width="330" Height="18"
                  Property="ENABLEAUDIT" CheckBoxValue="1"
                  Text="Switch on outgoing NTLM auditing on this machine" />
 
