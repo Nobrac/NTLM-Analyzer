@@ -47,10 +47,28 @@ jobs:
       - name: Install WiX
         run: dotnet tool install --global wix --version 5.*
 
+      # "wix extension add" takes an exact version or none at all - a wildcard
+      # like 5.* is rejected outright, unlike "dotnet tool install --version".
+      # The extensions ship in lockstep with the toolset, so ask wix what it is
+      # and pin that; if the matching build is missing, fall back to latest.
       - name: Add WiX extensions
+        shell: pwsh
         run: |
-          wix extension add -g WixToolset.UI.wixext/5.*
-          wix extension add -g WixToolset.Util.wixext/5.*
+          $raw = (wix --version) | Out-String
+          $ver = $raw.Trim().Split('+')[0].Trim()
+          Write-Host "wix reports '$($raw.Trim())' -> pinning extensions to $ver"
+          foreach ($e in 'WixToolset.UI.wixext', 'WixToolset.Util.wixext') {
+            wix extension add -g "$e/$ver"
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "::warning::$e/$ver not available, taking the latest instead"
+              wix extension add -g $e
+              if ($LASTEXITCODE -ne 0) { throw "could not add $e" }
+            }
+          }
+          # Informational only. GitHub's pwsh fails a step on the last exit
+          # code, so this must not be the final statement.
+          wix extension list -g 2>$null | Out-Host
+          Write-Host "extensions ready"
 
       - name: Build MSI
         run: >
