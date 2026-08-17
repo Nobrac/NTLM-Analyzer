@@ -54,7 +54,18 @@
          It still travels on the msiexec command line if passed that way, which
          is why the README recommends an Intune app secret or a script that
          builds the line at run time rather than a stored command. -->
-    <Property Id="APIKEY" Secure="yes" Hidden="yes" />
+    <Property Id="APIKEY" Secure="yes" />
+
+    <!-- Hiding APIKEY alone is not enough: its value is copied into the command
+         line of the deferred action, and a verbose log prints every property
+         value it sets. The CustomActionData properties carry the same secret and
+         have to be listed too. Authored here rather than via Property/@Hidden,
+         because that makes WiX author MsiHiddenProperties itself and declaring
+         it twice is a hard error.
+         Note this hides the key in the *log* only - passed on an msiexec
+         command line it is still visible in the process list. See the agent
+         README for the alternatives. -->
+    <Property Id="MsiHiddenProperties" Value="APIKEY;WriteConfig;EnableAudit" />
     <Property Id="INTERVAL" Value="15" />
     <!-- 1 = also switch outgoing NTLM auditing on. Off by default: it writes to
          the machine's policy, which an admin may want to control centrally. -->
