@@ -20,6 +20,11 @@ roxmltree = "0.20"
 windows-service = "0.7"
 winreg = "0.52"
 
+# Embeds the icon and a version resource into the EXE. Build-time only - it does
+# not end up in the shipped binary, and non-Windows builds skip it.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
 [profile.release]
 opt-level = "z"
 lto = true

@@ -1,6 +1,8 @@
 <div align="center">
 
-# 🛡️ NTLM-Analyzer
+<img src="assets/icon-256.png" width="96" alt="">
+
+# NTLM-Analyzer
 
 ### Find out who still uses NTLM in your Active Directory — so you can retire it for Kerberos.
 
@@ -12,6 +14,8 @@ the charts, the drill-downs, search, the filters, the language toggle and the
 per-event detail view all work. Only the time range and machine picker are
 fixed, because they would multiply with everything else.
 
+[![Live demo](https://img.shields.io/badge/live%20demo-open%20dashboard-3ddc97?logo=githubpages&logoColor=white)](https://nobrac.github.io/NTLM-Analyzer/)
+&nbsp;
 ![Collector: Python 3.7+](https://img.shields.io/badge/collector-Python%203.7%2B-3776AB?logo=python&logoColor=white)
 &nbsp;
 ![Agent: Rust](https://img.shields.io/badge/agent-Rust-CE422B?logo=rust&logoColor=white)
@@ -20,7 +24,7 @@ fixed, because they would multiply with everything else.
 &nbsp;
 [![License: GPL v3](https://img.shields.io/badge/license-GPLv3-blue.svg)](LICENSE)
 
-[Features](#features) · [Screenshots](#screenshots) · [Quick start](#quick-start) · [Troubleshooting](#troubleshooting)
+[Live demo](https://nobrac.github.io/NTLM-Analyzer/) · [Features](#features) · [Screenshots](#screenshots) · [Quick start](#quick-start) · [Troubleshooting](#troubleshooting)
 
 </div>
 

@@ -1,0 +1,104 @@
+name: Build MSI
+
+# Deliberately a separate workflow from "Build agent". The MSI depends on WiX,
+# a resource compiler and a working dialog set - if any of that breaks it must
+# not turn the agent build and its release red. The EXE ships either way; the
+# MSI is a convenience on top.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths:
+      - 'installer/**'
+      - 'assets/**'
+      - 'ntlm-agent-rs/**'
+      - '.github/workflows/build-msi.yml'
+  workflow_dispatch:
+
+jobs:
+  msi:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable, MSVC)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build agent
+        working-directory: ntlm-agent-rs
+        run: cargo build --release
+
+      # The agent now carries its own version resource, but the MSI is told the
+      # version explicitly anyway: ProductVersion has stricter rules than a file
+      # version, and reading it from Cargo.toml keeps one source of truth.
+      - name: Read version
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path ntlm-agent-rs/Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          if (-not $v) { throw "could not read version from Cargo.toml" }
+          "AGENT_VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "version: $v"
+
+      - name: Install WiX
+        run: dotnet tool install --global wix --version 5.*
+
+      - name: Add WiX extensions
+        run: |
+          wix extension add -g WixToolset.UI.wixext/5.*
+          wix extension add -g WixToolset.Util.wixext/5.*
+
+      - name: Build MSI
+        run: >
+          wix build installer/Package.wxs
+          -define AgentExe=ntlm-agent-rs/target/release/ntlm-agent.exe
+          -define IconFile=assets/ntlm-agent.ico
+          -define BannerBmp=assets/msi-banner.bmp
+          -define DialogBmp=assets/msi-dialog.bmp
+          -define ProductVersion=${{ env.AGENT_VERSION }}
+          -ext WixToolset.UI.wixext
+          -ext WixToolset.Util.wixext
+          -arch x64
+          -out ntlm-agent.msi
+
+      # A package that installs but does not uninstall is worse than none, so
+      # both directions run here before anyone downloads it.
+      - name: Install and uninstall silently
+        shell: pwsh
+        run: |
+          $log = "install.log"
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList `
+            "/i","ntlm-agent.msi","/qn","/l*v",$log,`
+            "COLLECTORURL=https://collector.invalid:8443","APIKEY=ci-test-key"
+          if ($p.ExitCode -ne 0) { Get-Content $log -Tail 40; throw "install failed: $($p.ExitCode)" }
+          if (-not (Get-Service NtlmAgent -ErrorAction SilentlyContinue)) { throw "service missing" }
+          $cfg = "$env:ProgramData\NtlmAgent\config.json"
+          if (-not (Test-Path $cfg)) { throw "config.json not written" }
+          $j = Get-Content $cfg -Raw | ConvertFrom-Json
+          if ($j.collector_url -ne "https://collector.invalid:8443") {
+            throw "collector_url not applied: $($j.collector_url)"
+          }
+          if (Select-String -Path $log -Pattern "ci-test-key" -Quiet) {
+            throw "API key leaked into the MSI log"
+          }
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList "/x","ntlm-agent.msi","/qn"
+          if ($p.ExitCode -ne 0) { throw "uninstall failed: $($p.ExitCode)" }
+          if (Get-Service NtlmAgent -ErrorAction SilentlyContinue) { throw "service survived uninstall" }
+          Write-Host "install/uninstall OK, key not in log"
+
+      - name: Upload MSI
+        uses: actions/upload-artifact@v4
+        with:
+          name: ntlm-agent-msi
+          path: ntlm-agent.msi
+          if-no-files-found: error
+
+      - name: Attach to release (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ntlm-agent.msi
