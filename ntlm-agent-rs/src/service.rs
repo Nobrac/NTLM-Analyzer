@@ -28,9 +28,9 @@ const SERVICE_NAME: &str = "NtlmAgent";
 const DISPLAY_NAME: &str = "NTLM-Analyzer Agent";
 
 #[cfg(not(windows))]
-pub use stub_impl::{install, run, uninstall};
+pub use stub_impl::{harden_data_dir, install, run, uninstall};
 #[cfg(windows)]
-pub use windows_impl::{install, run, uninstall};
+pub use windows_impl::{harden_data_dir, install, run, uninstall};
 
 #[cfg(windows)]
 mod windows_impl {
@@ -168,7 +168,10 @@ mod windows_impl {
     /// (by SID, so it works regardless of the system language). Prevents normal
     /// users from redirecting config.json - and with it the telemetry target.
     /// Not fatal: if icacls fails it is logged and the installation continues.
-    fn harden_data_dir() {
+    /// Public so the `configure` path (used by the MSI, which owns the files
+    /// and the service itself) can lock the data folder down without going
+    /// through the full `install`.
+    pub fn harden_data_dir() {
         let dir = config::data_dir();
         let _ = std::fs::create_dir_all(&dir);
         let status = std::process::Command::new(config::system32("icacls.exe"))
@@ -381,6 +384,7 @@ mod stub_impl {
     pub fn run() -> R {
         not_supported()
     }
+    pub fn harden_data_dir() {}
     pub fn install(_cfg: &config::Config) -> R {
         not_supported()
     }

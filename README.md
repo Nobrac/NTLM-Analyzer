@@ -149,13 +149,18 @@ reasoning behind each section are not.
 ### Overview: metrics and trend
 
 The top of the page answers "how bad is it, and is it getting better?" before
-any detail. A sticky section bar counts findings per area — greyed-out chips
-mean "checked, nothing there" rather than "not looked at". The metric cards keep
-**insecure** (NTLMv1) and **outdated** (NTLMv2) apart, because they need
-different urgency. The trend bars should approach zero over the weeks; that is
-the whole project in one picture.
+any detail. The headline is a share, not a raw count, because "4,000 NTLM
+events" means nothing without knowing what it is 4,000 out of. Underneath, the
+handover bar shows the whole estate split three ways — insecure, outdated,
+target state — with the exact figures repeated below it, so a one-percent slice
+is still readable. A sticky section bar counts findings per area; greyed-out
+chips mean "checked, nothing there" rather than "not looked at". The four focus
+cards name the single biggest item, the quickest win, the account that breaks in
+October, and anything happening outside office hours. The ring on the right
+counts the reporting machines by Windows build — amber for anything older than
+Server 2019, which cannot produce the 40xx events at all.
 
-![Header, colour legend, filters, metric cards and the trend chart](screenshots/01-overview.png)
+![Headline share, handover bar, deadline countdown, focus cards, trend and OS ring](screenshots/01-overview.png)
 
 ### The worklist: programs still using NTLM
 
@@ -168,14 +173,20 @@ the still-open rows into a paste-ready Group Policy entry.
 
 ![Program list with per-row sparklines, blocked badges and the exception-list button](screenshots/02-programs.png)
 
+Beside it, the most-used targets and the accounts still authenticating with
+NTLMv1 — the two lists you need when deciding what to fix and whom to talk to.
+
+![Most-used targets and insecure logons by account](screenshots/03-targets-users.png)
+
 ### When NTLM happens
 
 Weekday against hour of day. Office traffic forms the block in the middle — but
-the bright cell on Sunday at 03:00 is a backup job nobody remembers, and exactly
+the bright cell on Sunday at 05:00 is a backup job nobody remembers, and exactly
 the kind of straggler that breaks a shutdown. As a single number it would vanish
-into the daily trend; as a pattern it is unmissable.
+into the daily trend; as a pattern it is unmissable. Clicking a cell filters the
+event list to that hour.
 
-![Timing heatmap with a Sunday night batch job standing out](screenshots/03-timing.png)
+![Timing heatmap with a Sunday night batch job standing out](screenshots/04-timing.png)
 
 ### Why NTLM was used
 
@@ -183,46 +194,41 @@ On Server 2025 and Windows 11 24H2 Windows reports the *reason* for each
 fallback, and on older systems failed Kerberos requests supply it instead. Each
 cause comes with its concrete remedy — a missing SPN, a clock out of sync, an
 RC4-only account against an AES-only policy. This is the shortest path from
-finding to fix.
+finding to fix, and each row is clickable: it filters the events down to exactly
+the ones counted in it.
 
-![Cause analysis with remediation advice per reason](screenshots/04-why.png)
+![Cause analysis with remediation advice per reason](screenshots/05-why.png)
 
 ### Both directions
 
 *Who uses NTLM – and where to* comes from the domain controller and is the most
 reliable overall view, even when no program name can be determined.
 
-![Domain-wide view: which computer connects to which server](screenshots/05-domain.png)
+![Domain-wide view: which computer connects to which server](screenshots/06-domain.png)
 
 *Services accepting NTLM* is the opposite direction: the local service that
 **accepts** incoming authentication. It only fills once the
 *Audit Incoming NTLM Traffic* policy is active — the section says so itself
 rather than looking empty.
 
-![Services accepting incoming NTLM per machine](screenshots/06-services.png)
+![Services accepting incoming NTLM per machine](screenshots/07-services.png)
 
-### The insecure ones, and a deadline
-
-NTLMv1 is the part to replace first, broken down by account so you know whom to
-talk to.
-
-![Insecure logons ranked by user](screenshots/07-insecure-users.png)
+### A deadline of its own
 
 The NTLMv1-SSO panel is a countdown rather than a finding: in October 2026
 Microsoft flips the default to blocking, so whatever appears here breaks on its
-own — regardless of your own policies.
+own — regardless of your own policies. A multifunction printer scanning to a
+share is the classic entry in this list.
 
 ![NTLMv1 SSO panel with the October 2026 deadline](screenshots/08-v1sso.png)
 
 ### The safe side
 
 What already runs over Kerberos, shown for contrast rather than as a to-do —
-useful both for reassurance and for spotting weak encryption (`RC4/DES` instead
-of `AES`).
+useful both for reassurance and for spotting weak encryption (`RC4`/`DES`
+instead of `AES`), which is a finding hiding in the healthy-looking half.
 
-![Services already authenticating over Kerberos](screenshots/09-kerberos-services.png)
-
-![Accounts already authenticating over Kerberos, with the services they use](screenshots/10-kerberos-accounts.png)
+![Services and accounts already authenticating over Kerberos](screenshots/09-kerberos.png)
 
 ### Machine readiness
 
@@ -234,15 +240,23 @@ reach the normal audit path), a too-small event log, and machines already
 running in **deny** mode. The **Oct 2026** column marks who is affected by the
 `BlockNtlmv1SSO` flip; Credential Guard machines are exempt.
 
-![Machine list with OS builds, auditing state, restriction policies and readiness](screenshots/12-machines.png)
+![Machine list with OS builds, auditing state, restriction policies and readiness](screenshots/10-machines.png)
 
 ### Event list with per-event detail
 
 Every collected event, filterable by kind, NTLM version and account type
-(people vs. computers), searchable, exportable as CSV. Expanding a row shows the
-raw field values as Windows reported them, including the full program path.
+(people vs. computers), searchable, exportable as CSV. The header states both
+how many events matched and how many were loaded, so a capped list never reads
+as the complete answer.
 
 ![Recent events with filters and badges](screenshots/11-events.png)
+
+Clicking a row opens the raw event as Windows reported it — every field,
+grouped, with an explanation of what that event ID means and what a failure code
+implies. The buttons at the bottom jump straight to everything from the same
+account, program or machine.
+
+![Event detail with all raw fields and an explanation of the event ID](screenshots/12-event-detail.png)
 
 ---
 
