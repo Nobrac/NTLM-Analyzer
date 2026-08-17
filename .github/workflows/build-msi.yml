@@ -44,6 +44,13 @@ jobs:
           "AGENT_VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "version: $v"
 
+      # The licence page needs RTF. Converted from LICENSE by a script rather
+      # than inline: the conversion is almost entirely backslash handling, and
+      # escaping that through YAML into PowerShell into a .NET string produced
+      # a wrong result three times. The script is plain Python and is tested.
+      - name: Prepare licence RTF
+        run: python installer/make-license-rtf.py LICENSE license.rtf
+
       - name: Install WiX
         run: dotnet tool install --global wix --version 5.*
 
@@ -78,6 +85,7 @@ jobs:
           -define BannerBmp=assets/msi-banner.bmp
           -define DialogBmp=assets/msi-dialog.bmp
           -define ProductVersion=${{ env.AGENT_VERSION }}
+          -define LicenseRtf=license.rtf
           -ext WixToolset.UI.wixext
           -ext WixToolset.Util.wixext
           -arch x64
