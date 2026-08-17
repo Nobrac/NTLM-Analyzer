@@ -29,6 +29,7 @@ RED = (255, 107, 107, 255)
 AMBER = (245, 184, 65, 255)
 GREEN = (61, 220, 151, 255)
 EDGE = (14, 19, 31, 255)          # --void, as the outline
+RIM = (214, 226, 246, 255)        # light rim so the mark survives a dark tab
 SS = 8                            # supersampling factor
 
 # Share of the shield width per band. Deliberately not equal thirds: the point
@@ -88,7 +89,9 @@ def render(size):
     met, and no join style fixed them.
     """
     s = size * SS
-    pad = s * 0.05
+    # Room for the light rim without letting it touch the tile edge.
+    pad = s * 0.095
+    halo_w = max(2, int(s * 0.045))
     outline_w = max(2, int(s * 0.05))
 
     def mask_of(inset):
@@ -96,6 +99,13 @@ def render(size):
         ImageDraw.Draw(m).polygon(shield(s, s, inset), fill=255)
         return m
 
+    # Three concentric silhouettes: a light rim, the dark outline, the fill.
+    # The rim is what makes the mark separate from a dark browser tab or task
+    # bar - the dark outline alone disappeared into them. On a light background
+    # the rim is invisible and the dark outline still carries the shape, so this
+    # costs nothing there. A framed tile was the other option and read better at
+    # 48 px, but at 16 px the frame swallowed the shield.
+    rim = mask_of(pad - halo_w)
     outer = mask_of(pad)
     inner = mask_of(pad + outline_w)
 
@@ -113,7 +123,8 @@ def render(size):
         bd.rectangle([x - seam / 2, 0, x + seam / 2, s], fill=EDGE)
 
     img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
-    img.paste(Image.new("RGBA", (s, s), EDGE), (0, 0), outer)   # outline
+    img.paste(Image.new("RGBA", (s, s), RIM), (0, 0), rim)      # light rim
+    img.paste(Image.new("RGBA", (s, s), EDGE), (0, 0), outer)   # dark outline
     img.paste(bands, (0, 0), inner)                             # fill
     return img.resize((size, size), Image.LANCZOS)
 
