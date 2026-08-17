@@ -97,8 +97,25 @@ jobs:
           path: ntlm-agent-rs/target/release/ntlm-agent.exe
           if-no-files-found: error
 
-      - name: Attach binary to release (tags only)
+      # Uses the GitHub CLI, which is preinstalled on the runner, instead of a
+      # third-party action. Two reasons: actions referenced anywhere in a
+      # workflow are downloaded before the run starts, even when their step is
+      # skipped - so every push to main was fetching a release action it never
+      # used, and that download is what hit a 429. And one less external
+      # dependency in the release path of a security tool is worth having.
+      - name: Attach to release (tags only)
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: ntlm-agent-rs/target/release/ntlm-agent.exe
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "release $tag does not exist yet - creating it"
+            gh release create $tag --title $tag --generate-notes
+            if ($LASTEXITCODE -ne 0) { throw "could not create release $tag" }
+          }
+          gh release upload $tag "$env:GITHUB_WORKSPACE/ntlm-agent-rs/target/release/ntlm-agent.exe" --clobber
+          if ($LASTEXITCODE -ne 0) { throw "upload failed" }
+          Write-Host "attached to release $tag"
