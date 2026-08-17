@@ -4,6 +4,13 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>NTLM-Analyzer</title>
+<!-- Embedded rather than a separate file: the dashboard is one
+     self-contained page with no external requests, and the CSP allows
+     data: for images. A browser tab with the generic globe next to a
+     security tool looks unfinished. Two sizes because 16 is what most
+     tabs use and 32 what pinned tabs and bookmarks pick. -->
+<link rel="icon" type="image/png" sizes="32x32" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAF9klEQVR42u1Xf0xdZxl+3u87915+3ba0tdAilkFs5raO1m40JaOV4ZyhTSUqTWasG5tZNc64rNl0/YcsmYn+MbVNaoJbxBZj0oszLHFgNzUtzKVESSm3QAXv3Ya9cvl1C/deLtx7zvke/4AyuiYb3dj+2pucnOTLOe/znPe8z/N+H7AYJBU+oViOZS0uiIiYoSH6TPbs/Vp5irTXu6qE3EzGuMaOqLncv4tIehGTQlKJiAmPpcsJ9Yf1G6w77AyQTBAEoN5DwxiCogBZObiQyMsTeL1AbMoZEJhvlRb4LpFUQlIuRaM5nvSaS5uLcspON//RPvVSk0Qnx+DYwFyaELleOiDLK/A5NoxtVkxCZ1nYWLQFjzx2hN9p+KZnNJIK2b54eXlhYcoSEfYOxaqLSnPKfvfbVvvJ73/XA48HxXlrsaWA+OI2HzIZAgC8PkHf0ByGNn0W/uK1cDPuB5AQwBikrkQR7P4Xnuz5JwDajzxaX/Z2OF0tm+XPFgD4srOL0hnw1ItNAmXhhb27UZGzHh3rg/jpjwqBaXch33oPjp+M4MTeamz7+p2Yn56HqA8ug0k7GPvF3zB8vAPNLzXJQ9+upy87u2ipCX1ZWZxNUP47HkV54WfwVPnt6Boew2zawJl2kYw7IAR+BcymDUxyHpnYLOyZFRAgIF6NgqM1GD83gMmro0gkIb6sLALAUouJAPOuwY78tTBaY94x0AJYGtBKoBVgaYESAEogWq3sshSYcaG8FrJvL4TJODf8tpukpmRhUWQVNSjvueN9CHzS8SmBTwmoBX93M0oEWiu4hh/fFHQJrRWUWsBcIiCGk5YF+HP9ci2dBnFLs2YFMhTAEHY8hVy/XyxrAXOJQDwZf4sAS7aW6NB0HOK6UCJYrVqIEjDtIDUyieKS2zQIxpPxt5YI9L7RF7IsRPZU7MZw7JpJpObg02p1CJAQj4Y9OoPZ0JjZVbkHHguR3jf6QgCgSOqGhup5Q3R+9cFa2oT5y9Uoci0Lhh+dAg2hc7yY7hqGnndMTe1+0qCzoaF6nqReUkFsarblrru3yRfuuVeO9/Yj6Rp4VsGPRSkwZWPkVBd27KqQ7ds/L7Gp2ZZ3rV/EJSnPPdP+uuPi4o+P/kT/IzLqNg2/jTzLAo358F9vu7DyszH1p14kLv/H/eGxY9o4uPjcM+2vL27JXAUArYBqbT3kxqZmnj1wsAa1B+rYErwI5dMQSz6UNOkY6DVZyAxNYqDxDL6yv577D9yP2NTMs62th9zWxf5TAHBIxA2QenvpurMz087pX578tVVQVOy0dY4jdg3w5yg4Lm8JXOV4waSN/u81Y2N2vnPixSYrfs05vb103dkAqQ+JuDc4YT1gSKrghe4n/P68/t+3nrH6wrZz4FgYsZQgP0/Bdfj+yiBAx4VemwUk0ug//BvM/3vcaWlrs9bk5fYHL3Q/QVLVA+YmKxYRAkBd3X2J0JWRg3fvvCvySscrVk/IdSp/MIjuYQc6X0OrBUfDcoWQoGMAJfBs9CPdN4qeg79C+nLUOdPRbu3YcUckdGXkYF3dfYnlWDfNAhExgQB1VcXW8OVgpGZ35b2h82+es5ysz9l7jlzkiZYY0o6Cx++DeC3QNaAhxNKwNuRCEfjfC3/FhQd/xs0q3z7b/aZVWXlPKBiM1FRVbA0HAtQiYlbgHdQA0Pba4JbRJM9F4i4ffvxpA9ng+DzruO2ph7h34CS/NNrM6mgzqy6d4J0/f5zZt5USyHMePvK0uRo3HE3yXNtrg1uW51xxBAKBxRf2WeEJ+/mJOWY6OntZ9eVvuII1jlq3yWyqreKm2irq/AID5DpV+77mtnf1cXyOmfCE/Tywz7ox1y1GYyPV9anUMzixazLN9miSfLUzyMOPHWVZyU6nrGSnc/jRo3y16zKjKXJiju09gxO7ru8BGxs/8pmTsrx8A+8kHphI8+WxFJMj0+TINDmWYnIizZcH3kk8cONv5OoNVZKKfDfh+eBwcXic9eFx1p8PDhcve04+1pM2SR0I3NxQgQD1LTcagP8DPY8VETPRB40AAAAASUVORK5CYII=">
+<link rel="icon" type="image/png" sizes="16x16" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAChklEQVR42pWTT2iUZxDGf/O+m+ynMTSxMZtaPbQ9NAXNIU00EtEGK+1BsYEGIQTxH+2pUkp7VW+FCirqQUExiof2Qz2IVGrxX2nAqKiFWHNQTEJFiEaiSZrs7rfv00MSWa0KPrdhZn4M88wYU5LUAESAAOPlms5NmNk1gFRPj0rLMxzrPHnuy6tXr1vK0gQgcgGfJKiIZQb5iSz1zYt1b0jHxx7c6jBJjYdPXryyfV07y2vLaV4hynIJe+/PZqC5nijJIzMkYd5RGJngwf4/6Nx9lI62lkUpIOq60h221n3kFjZVUbfmEVEu8Oftebj2FZTnsgSbnEKFAlF1BRhc77ocOtpaohSgGelS91ZJCUNj4ww9yVOTC4yPTJAbGiGbLwYEwEjNiigdSztAqakFUpDwZngH3oE5w7zDgsOsaA/eoYKQBIB7luANVFTsgKw5p4LeABCEMxOQdUD/25ma4X/yCR70Wo5ADmnwXzJzqoeBfue9G2xoXNT9V2qmHo6OBo/jVRDnHeNPR0NlX6L6xUu6nfeDLgSxquH9XXNXrrJjPX+H6soy8sn/ESGXEL1Tyd1D58PqDz+xZc0f7FIIuDiWN7OzGzat75xZ11ry86neXGlNBBgqBJQEDCibX8Wto7/nlvZlSjq+2txpZmfjWB5Jtk1yktLXeodPt63/Vj+2Z5L2n1qTJU9+CSsfHQlNd/Yl1d9/kaxdt0U3ex+flpSe6pk0WJKZmSSlBp6y88Ceg9+c6TrBw8YKDKjqzdK64DM2bvl677sVfGdmyXSPFX2j2TOell++MfDDhV9/awFo+fzTC00fv7fDzC4BJgmbtPEFlySL49gXxbWSaqfjOI69pOdu7j+tZTR/mbSjAgAAAABJRU5ErkJggg==">
 <style>
 :root{
   /* Tells the browser to draw native controls - select popups, scrollbars,
@@ -21,7 +28,10 @@
 }
 *{box-sizing:border-box}
 html{scroll-behavior:smooth}
-body{margin:0;background:var(--void);color:var(--ink);font-family:var(--text);font-size:18px;
+/* 390 px wide viewports scrolled ~4 px sideways. Nothing may exceed the
+   viewport, and long unbroken values (SPNs, paths) are the usual culprit. */
+html{overflow-x:hidden}
+body{max-width:100vw;overflow-x:hidden;margin:0;background:var(--void);color:var(--ink);font-family:var(--text);font-size:18px;
   line-height:1.5;-webkit-font-smoothing:antialiased;overflow-x:hidden}
 body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:0;
   background:radial-gradient(1200px 600px at 10% -8%,rgba(255,107,107,.05),transparent 62%),
@@ -104,6 +114,12 @@ select option:checked,.sel-st option:checked{background:#26314a;color:#fff}
 .seg{position:relative;width:0;min-width:3px;flex:0 0 auto;transition:width 1.4s cubic-bezier(.16,1,.3,1);
   overflow:hidden;display:flex;align-items:center;padding:0 12px;cursor:pointer}
 .seg.tight{padding:0 3px}
+/* First tab stop. Reaching the tables meant tabbing through the whole header
+   and section bar; this jumps straight to the part people came for. */
+.skip{position:absolute;left:-9999px;top:0;z-index:100;background:var(--card2);
+  color:var(--ink);border:1px solid var(--edge2);border-radius:0 0 10px 0;
+  padding:12px 18px;font-size:15px;text-decoration:none}
+.skip:focus{left:0}
 .handbar{position:relative;overflow:visible}
 .seg:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
 .seg.on{filter:brightness(1.45)}
@@ -192,7 +208,10 @@ table{width:100%;border-collapse:collapse}
    own slightly lighter surface, a firm bottom edge, brighter and heavier type.
    Contrast against that band goes from 4.69:1 to 6.98:1. */
 thead th{background:rgba(158,180,225,.055);border-bottom:1px solid var(--edge2);
-  position:relative}
+  position:relative;cursor:pointer;user-select:none}
+thead th:hover{color:var(--ink)}
+thead th[aria-sort=ascending]::after{content:" \\2191";color:var(--krb)}
+thead th[aria-sort=descending]::after{content:" \\2193";color:var(--krb)}
 th{font-family:var(--mono);font-size:12.5px;letter-spacing:.1em;text-transform:uppercase;
   color:var(--dim);font-weight:600;text-align:left;padding:12px 22px 12px;white-space:nowrap}
 /* First data row needs no line of its own - the band already draws it. */
@@ -464,6 +483,7 @@ tbody tr.on{background:rgba(61,220,151,.10);box-shadow:inset 3px 0 0 var(--krb)}
 })();
 </script>
 
+<a class="skip" href="#sec-events">Skip to the event list</a>
 <div class="stage">
 <header><div class="hin">
   <div class="logo"><span class="orb" id="orb"></span><span id="brand">NTLM-Analyzer</span></div>
@@ -962,7 +982,16 @@ en: {
   top_h:'Most-used targets',
 }};
 
-let LANG = (navigator.language || 'de').toLowerCase().startsWith('de') ? 'de' : 'en';
+// Remembered across reloads. The browser language is only the first guess -
+// switching and then pressing F5 used to throw the choice away, which is a real
+// annoyance on a page people keep open all day. localStorage is avoided for
+// anything data-bearing; a display preference is not that.
+function storedLang(){
+  try { const v = localStorage.getItem('ntlm.lang'); return v === 'de' || v === 'en' ? v : null; }
+  catch(e){ return null; }   // private mode or storage disabled
+}
+let LANG = storedLang() ||
+  ((navigator.language || 'de').toLowerCase().startsWith('de') ? 'de' : 'en');
 const t = (k, v) => { let s = (I18N[LANG] && I18N[LANG][k]) || (I18N.de[k]) || k;
   if(v) for(const a in v) s = s.split('{' + a + '}').join(v[a]);
   return s; };
@@ -997,6 +1026,72 @@ const S = {range:'30d', mach:'', hideDone:false, q:'', kind:'', acct:'all', show
            bucket:'', wd:'', hr:'', pick:'', rsn:''};
            // bucket/wd/hr: drill-down from the charts, pick: from the handover bar
 let DATA = null, TIMER = null;
+
+// ---- shareable state -------------------------------------------------------
+// The filter state lives in the URL so a view can be sent to a colleague or
+// bookmarked. This is the only place the page reads anything from the address
+// bar, so every value is validated against what it is allowed to be rather
+// than trusted - an unknown range or a 200-character "kind" never reaches the
+// query the collector runs, and nothing from here is ever written to the DOM
+// without going through esc() first.
+const URL_RULES = {
+  range:  v => ['24h', '7d', '30d', 'all'].includes(v) ? v : null,
+  mach:   v => v.length <= 64 ? v : null,
+  q:      v => v.length <= 100 ? v : null,
+  kind:   v => /^[a-z]{0,16}$/.test(v) ? v : null,
+  acct:   v => ['all', 'people', 'computers'].includes(v) ? v : null,
+  pick:   v => ['NTLMv1', 'NTLMv2', 'kerberos'].includes(v) ? v : null,
+  rsn:    v => /^k?[0-9a-fA-Fx]{1,12}$/.test(v) ? v : null,
+  bucket: v => /^\d{4}-\d{2}-\d{2}(T\d{2})?$/.test(v) ? v : null,
+  wd:     v => /^[0-6]$/.test(v) ? v : null,
+  hr:     v => /^([0-9]|1[0-9]|2[0-3])$/.test(v) ? v : null
+};
+
+// Absent parameters reset to their default rather than being left alone -
+// otherwise going Back to the unfiltered view would keep the old filter in S
+// while the URL claims there is none.
+const URL_DEFAULTS = {range: '30d', mach: '', q: '', kind: '', acct: 'all',
+                      pick: '', rsn: '', bucket: '', wd: '', hr: ''};
+
+function readUrlState(){
+  let p;
+  try { p = new URLSearchParams(location.search); } catch(e){ return; }
+  for(const k in URL_RULES){
+    const raw = p.get(k);
+    const ok = raw === null ? null : URL_RULES[k](raw);
+    S[k] = ok !== null ? ok : URL_DEFAULTS[k];
+  }
+  LAST_QS = null;   // the URL is now the source of truth again
+}
+
+// Filter changes get their own history entry so Back returns to the previous
+// view - that is what people expect after clicking through three charts. Typing
+// in the search box only replaces, otherwise every keystroke would be an entry
+// and Back would be useless.
+let LAST_QS = null;
+
+function writeUrlState(){
+  const p = new URLSearchParams();
+  for(const k in URL_RULES){
+    const v = S[k];
+    if(v !== '' && v !== null && v !== undefined && !(k === 'range' && v === '30d')
+       && !(k === 'acct' && v === 'all')) p.set(k, v);
+  }
+  const qs = p.toString();
+  if(qs === LAST_QS) return;
+  let onlySearch = false;
+  if(LAST_QS !== null){
+    const a = new URLSearchParams(LAST_QS), b = new URLSearchParams(qs);
+    a.delete('q'); b.delete('q');
+    onlySearch = a.toString() === b.toString();
+  }
+  const url = qs ? '?' + qs : location.pathname;
+  try {
+    if(LAST_QS === null || onlySearch) history.replaceState(null, '', url);
+    else history.pushState(null, '', url);
+  } catch(e){}
+  LAST_QS = qs;
+}
 
 function params(extra){
   const p = new URLSearchParams();
@@ -1035,9 +1130,58 @@ async function load(){
 const tag = (cls, txt, ti) => '<span class="tag ' + cls + '"' +
   (ti ? ' title="' + esc(ti) + '"' : '') + '>' + esc(txt) + '</span>';
 const emptyBox = (a, b) => '<div class="empty"><b>' + esc(a) + '</b>' + esc(b || '') + '</div>';
-const tbl = (heads, rows) => '<table><thead><tr>' + heads.map(h =>
-  '<th' + (h[1] ? ' class="' + h[1] + '"' : '') + '>' + esc(h[0]) + '</th>').join('') +
+// Every table on the page goes through here, so sorting added once applies to
+// all of them. Sorting happens on the rendered rows rather than on the data:
+// each panel shapes its own rows, and re-sorting the source would mean
+// teaching this helper about a dozen different record shapes.
+const tbl = (heads, rows) => '<table class="srt"><thead><tr>' + heads.map((h, i) =>
+  '<th tabindex="0" role="button" aria-sort="none" data-col="' + i + '"' +
+  (h[1] ? ' class="' + h[1] + '"' : '') + '>' + esc(h[0]) + '</th>').join('') +
   '</tr></thead><tbody>' + rows + '</tbody></table>';
+
+// Numbers must not sort as text - "9" before "45" is the classic wrong answer.
+// A cell that parses as a number after stripping spaces and thousands dots is
+// compared numerically, everything else by locale.
+function cellKey(td){
+  const t = (td ? td.textContent : '').trim();
+  // Only a leading number counts. Several cells carry a badge after the value
+  // ("172" plus a blocked count of "24"); stripping everything non-numeric
+  // glued those into 17224 and the column sorted into nonsense.
+  const m = t.match(/^-?[\d\u00a0.,]+/);
+  if(m){
+    const n = parseFloat(m[0].replace(/[\s\u00a0.]/g, '').replace(',', '.'));
+    if(!isNaN(n)) return {num: n};
+  }
+  return {txt: t.toLowerCase()};
+}
+
+function sortTable(th){
+  const table = th.closest('table');
+  const body = table ? table.querySelector('tbody') : null;
+  if(!body) return;
+  const col = +th.dataset.col;
+  const asc = th.getAttribute('aria-sort') !== 'ascending';
+  const rows = [...body.rows];
+  rows.sort((a, b) => {
+    const x = cellKey(a.cells[col]), y = cellKey(b.cells[col]);
+    if('num' in x && 'num' in y) return asc ? x.num - y.num : y.num - x.num;
+    const xs = 'num' in x ? String(x.num) : x.txt, ys = 'num' in y ? String(y.num) : y.txt;
+    return asc ? xs.localeCompare(ys) : ys.localeCompare(xs);
+  });
+  rows.forEach(r => body.appendChild(r));
+  table.querySelectorAll('th').forEach(o => o.setAttribute('aria-sort', 'none'));
+  th.setAttribute('aria-sort', asc ? 'ascending' : 'descending');
+}
+
+document.addEventListener('click', function(e){
+  const th = e.target.closest && e.target.closest('table.srt th');
+  if(th) sortTable(th);
+});
+document.addEventListener('keydown', function(e){
+  if(e.key !== 'Enter' && e.key !== ' ') return;
+  const th = e.target.closest && e.target.closest('table.srt th');
+  if(th){ e.preventDefault(); sortTable(th); }
+});
 const CARD = (id, title, flag, meta, body, cls, extra) =>
   '<section class="card ' + (cls || '') + '" id="' + id + '"><div class="ch"><h2>' + esc(title) + '</h2>' +
   (flag ? '<span class="flag ' + (flag[1] || '') + '">' + esc(flag[0]) + '</span>' : '') +
@@ -1094,7 +1238,14 @@ function countTo(el, to){
 // ---- Kopfbereich ---------------------------------------------------------
 function renderChrome(){
   document.documentElement.lang = LANG;
-  document.title = t('doc_title');
+  // Set here, not in render(): renderChrome runs afterwards and overwrote it.
+  // With several tabs open the same title on each says nothing; the share is
+  // the one number worth having in the tab strip.
+  const st0 = (DATA && DATA.stats) || {};
+  const share0 = st0.total
+    ? Math.round((st0.total - (st0.krb_ev || 0)) / st0.total * 100) : null;
+  document.title = share0 === null ? t('doc_title')
+                                   : t('doc_title') + ' \u2013 ' + share0 + ' % NTLM';
   $('#range').innerHTML = [['24h', t('range')], ['7d', t('r7d')], ['30d', t('r30d')], ['all', t('rall')]]
     .map(r => '<button data-r="' + r[0] + '"' + (S.range === r[0] ? ' aria-pressed="true"' : '') + '>' +
       esc(r[1]) + '</button>').join('');
@@ -1521,7 +1672,14 @@ function renderEvents(){
     (S.acct === 'all' || (S.acct === 'comp') === /\$/.test(e.user || '')) &&
     (!ql || [e.user, e.process, e.target_server, e.workstation, e.source, e.process_path]
       .join(' ').toLowerCase().indexOf(ql) >= 0));
+  // Announced to screen readers: after a drill-down the only thing that
+  // changes above the fold is this count, and silently swapping it leaves
+  // anyone not looking at the table with no feedback at all.
   const m = document.querySelector('#sec-events .meta');
+  if(m && !m.getAttribute('aria-live')){
+    m.setAttribute('aria-live', 'polite');
+    m.setAttribute('aria-atomic', 'true');
+  }
   if(m){
     const found = DATA.events_total !== undefined ? DATA.events_total : all.length;
     const capped = all.length < found;
@@ -1634,6 +1792,7 @@ const closeDrawer = () => { $('#drawer').classList.remove('on'); $('#scrim').cla
 // ---- Zeichnen ------------------------------------------------------------
 function render(){
   if(!DATA) return;
+  writeUrlState();
   renderChrome(); renderOsDonut(); renderHero(); renderFocus();
   $('#grid').innerHTML = [secTrend(), secPrograms(), secTargets(), secV1(), secHeat(), secWhy(),
     secDomain(), secIncoming(), secSso(), secKrb(), secKrbAcc(), secAgents(), secEvents()].join('');
@@ -1662,7 +1821,10 @@ document.addEventListener('click', function(ev){
   if(el.id === 'logout'){ window.location = '/logout'; return; }
   if(el.id === 'hide'){ S.hideDone = !S.hideDone; render(); return; }
   const lang = el.closest('[data-l]');
-  if(lang){ LANG = lang.dataset.l; render(); return; }
+  if(lang){
+    LANG = lang.dataset.l;
+    try { localStorage.setItem('ntlm.lang', LANG); } catch(e){}
+    render(); return; }
   const r = el.closest('[data-r]');
   if(r){ S.range = r.dataset.r; load(); return; }
   const go = el.closest('[data-go]');
@@ -1755,8 +1917,15 @@ document.addEventListener('focusout', function(e){
   if(e.target.closest && e.target.closest('#handbar .seg')) segTip(null);
 });
 
+readUrlState();
 load();
 TIMER = setInterval(load, 60000);
+
+// Back and Forward should move between shared views rather than do nothing.
+addEventListener('popstate', function(){
+  readUrlState();
+  load();
+});
 
 </script>
 </body>
