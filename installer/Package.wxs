@@ -54,20 +54,14 @@
          It still travels on the msiexec command line if passed that way, which
          is why the README recommends an Intune app secret or a script that
          builds the line at run time rather than a stored command. -->
-    <!-- Hidden keeps the value out of the verbose install log. It is needed on
-         three properties, not one: APIKEY itself, and the two CustomActionData
-         properties that carry a copy of it into the deferred actions. A log
-         prints every property value it sets, so hiding only APIKEY leaked the
-         key through the command line assembled below - caught by the CI check
-         that greps the install log.
-         MsiHiddenProperties cannot be authored directly (WIX0070); WiX builds
-         it from these attributes.
-         This hides the key in the *log* only. Passed on an msiexec command line
-         it is still visible in the process list - see the agent README. -->
-    <Property Id="APIKEY" Secure="yes" Hidden="yes" />
-    <Property Id="WriteConfig" Hidden="yes" />
-    <Property Id="EnableAudit" Hidden="yes" />
-
+    <!-- Deliberately no APIKEY property.
+         Two attempts to hide it failed: the value reaches the log through the
+         helper action that runs the command, not through the property table, so
+         Property/@Hidden and MsiHiddenProperties both missed it. Rather than
+         keep guessing at a helper's logging behaviour, no secret goes through
+         the installer at all - which also removes the exposure on the msiexec
+         command line, where nothing could have hidden it anyway.
+         The key is set once afterwards with "ntlm-agent.exe configure". -->
     <Property Id="INTERVAL" Value="15" />
     <!-- 1 = also switch outgoing NTLM auditing on. Off by default: it writes to
          the machine's policy, which an admin may want to control centrally. -->
@@ -133,7 +127,7 @@
     <SetProperty Id="WriteConfig"
                  Before="WriteConfig"
                  Sequence="execute"
-                 Value="&quot;[INSTALLFOLDER]ntlm-agent.exe&quot; configure --collector-url &quot;[COLLECTORURL]&quot; --api-key &quot;[APIKEY]&quot; --interval [INTERVAL]" />
+                 Value="&quot;[INSTALLFOLDER]ntlm-agent.exe&quot; configure --collector-url &quot;[COLLECTORURL]&quot; --interval [INTERVAL]" />
 
     <CustomAction Id="WriteConfig"
                   BinaryRef="Wix4UtilCA_X64"
@@ -145,7 +139,7 @@
     <SetProperty Id="EnableAudit"
                  Before="EnableAudit"
                  Sequence="execute"
-                 Value="&quot;[INSTALLFOLDER]ntlm-agent.exe&quot; configure --collector-url &quot;[COLLECTORURL]&quot; --api-key &quot;[APIKEY]&quot; --interval [INTERVAL] --enable-outgoing-audit" />
+                 Value="&quot;[INSTALLFOLDER]ntlm-agent.exe&quot; configure --collector-url &quot;[COLLECTORURL]&quot; --interval [INTERVAL] --enable-outgoing-audit" />
 
     <CustomAction Id="EnableAudit"
                   BinaryRef="Wix4UtilCA_X64"
@@ -204,17 +198,17 @@
                  NoPrefix="yes"
                  Text="Example: https://collector.example.local:8443 - use HTTPS, otherwise the API key travels in clear text." />
 
-        <Control Id="KeyLabel" Type="Text" X="20" Y="120" Width="290" Height="12"
-                 NoPrefix="yes" Text="API key" />
-        <!-- Password="yes" masks the field; the property is Hidden so it does
-             not end up in the installer log either. -->
-        <Control Id="KeyEdit" Type="Edit" X="20" Y="133" Width="330" Height="18"
-                 Property="APIKEY" Password="yes" Indirect="no" />
-
-        <Control Id="IntervalLabel" Type="Text" X="20" Y="162" Width="290" Height="12"
+        <Control Id="IntervalLabel" Type="Text" X="20" Y="122" Width="290" Height="12"
                  NoPrefix="yes" Text="Poll interval in minutes" />
-        <Control Id="IntervalEdit" Type="Edit" X="20" Y="175" Width="60" Height="18"
+        <Control Id="IntervalEdit" Type="Edit" X="20" Y="135" Width="60" Height="18"
                  Property="INTERVAL" Indirect="no" />
+
+        <!-- No field for the API key on purpose: anything the installer touches
+             ends up in its log. Setting it in one command afterwards keeps it
+             out of both the log and the process list. -->
+        <Control Id="KeyNote" Type="Text" X="20" Y="164" Width="330" Height="30"
+                 NoPrefix="yes"
+                 Text="If the collector requires an API key, set it afterwards in an elevated prompt: ntlm-agent.exe configure --collector-url ... --api-key ..." />
 
         <Control Id="AuditCheck" Type="CheckBox" X="20" Y="202" Width="330" Height="18"
                  Property="ENABLEAUDIT" CheckBoxValue="1"
