@@ -26,9 +26,13 @@ fn main() {
             res.set("CompanyName", "NTLM-Analyzer");
             res.set("LegalCopyright", "GPL-3.0-or-later");
             if let Err(e) = res.compile() {
-                // A missing resource compiler must not break the build - the
-                // agent works fine without an icon.
-                println!("cargo:warning=could not embed icon/version: {e}");
+                // A missing resource compiler must not break a local build - the
+                // agent works fine without an icon. CI asserts the resource is
+                // there, so this cannot ship unnoticed the way it did once.
+                println!(
+                    "cargo:warning=could not embed icon/version resource: {e} \
+                     (needs rc.exe from the Windows SDK)"
+                );
             }
         } else {
             println!("cargo:warning=icon not found at {icon}, building without one");
