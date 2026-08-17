@@ -119,43 +119,48 @@ def render(size):
 
 
 def msi_art(out, tile):
-    """The two bitmaps WiX's stock UI expects, in the dashboard's own palette.
+    """The two bitmaps WiX's stock UI expects.
 
-    Sizes are fixed by WixUI: 493x58 for the strip across the top of every page
-    and 493x312 for the welcome and finish pages. BMP because that is what the
-    installer UI loads - PNG is silently ignored.
+    Light, not dark. The dashboard's palette was the obvious choice and the
+    wrong one: WixUI draws every page title and description in **black**, and
+    that is baked into the stock dialogs - so a dark banner meant black text on
+    dark blue. The brand shows through the mark and the three colours instead,
+    on a background the standard text can actually be read against.
+
+    Sizes are fixed by WixUI: 493x58 for the strip across the top of every page,
+    493x312 for the welcome and finish pages. BMP because PNG is ignored.
     """
-    VOID = (14, 19, 31)
-    CARD = (29, 38, 55)
-    DIM = (163, 177, 201)
-    INK = (238, 242, 250)
+    PAPER = (250, 251, 253)       # near-white, matches the dialog background
+    PANEL = (236, 240, 246)       # left column of the welcome page
+    RULE = (203, 212, 226)
+    MUTED = (90, 104, 128)
 
-    # --- top banner: mark on the RIGHT, and no text at all ---
-    # WixUI draws each page's own title and description over the left of this
-    # strip. The first version had the wordmark baked in on the left, so the
-    # installer's title printed straight through it. Artwork right, text space
-    # left - which is also how the stock WiX banner is laid out.
-    banner = Image.new("RGB", (493, 58), CARD)
+    # --- top banner: text space on the left, mark on the right ---
+    # WixUI writes the page title over the left of this strip, so nothing of
+    # ours may sit there.
+    banner = Image.new("RGB", (493, 58), PAPER)
     d = ImageDraw.Draw(banner)
-    d.rectangle([0, 57, 493, 58], fill=(60, 74, 100))
+    d.rectangle([0, 56, 493, 58], fill=RULE)
     ico = tile.resize((40, 40), Image.LANCZOS)
-    banner.paste(ico, (493 - 40 - 14, 9), ico)
+    banner.paste(ico, (493 - 40 - 16, 8), ico)
     banner.save(os.path.join(out, "msi-banner.bmp"))
     print("wrote %s" % os.path.join(out, "msi-banner.bmp"))
 
-    # --- welcome/finish panel: large mark on a dark field, and the handover
-    #     bar as a hairline, so the installer already tells the story ---
-    dlg = Image.new("RGB", (493, 312), VOID)
+    # --- welcome/finish panel: mark on the left, text space on the right ---
+    dlg = Image.new("RGB", (493, 312), PAPER)
     d = ImageDraw.Draw(dlg)
-    d.rectangle([0, 0, 164, 312], fill=CARD)
-    big = tile.resize((104, 104), Image.LANCZOS)
-    dlg.paste(big, (30, 66), big)
-    y = 196
+    d.rectangle([0, 0, 164, 312], fill=PANEL)
+    d.rectangle([164, 0, 165, 312], fill=RULE)
+    big = tile.resize((108, 108), Image.LANCZOS)
+    dlg.paste(big, (28, 72), big)
+    y = 206
     for colour, a, b in BANDS:
-        d.rectangle([30 + 104 * a, y, 30 + 104 * b, y + 5], fill=colour[:3])
-    d.text((30, 214), "NTLMv1", fill=RED[:3])
-    d.text((30, 228), "NTLMv2", fill=AMBER[:3])
-    d.text((30, 242), "Kerberos", fill=GREEN[:3])
+        d.rectangle([28 + 108 * a, y, 28 + 108 * b, y + 6], fill=colour[:3])
+    d.text((28, 222), "NTLMv1", fill=(196, 60, 60))
+    d.text((28, 236), "NTLMv2", fill=(160, 112, 20))
+    d.text((28, 250), "Kerberos", fill=(20, 130, 92))
+    d.text((28, 272), "retire one,", fill=MUTED)
+    d.text((28, 285), "keep the other", fill=MUTED)
     dlg.save(os.path.join(out, "msi-dialog.bmp"))
     print("wrote %s" % os.path.join(out, "msi-dialog.bmp"))
 
