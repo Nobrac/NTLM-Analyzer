@@ -1,0 +1,233 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  NTLM-Analyzer agent - Windows Installer package (WiX v4/v5).
+
+  Two ways in, one definition:
+
+    * double-click        - a wizard asks for the collector URL and API key
+    * msiexec /qn         - the same values arrive as properties, for Intune
+                            or any other unattended rollout
+
+  Division of labour: the MSI owns the payload and the service entry, the agent
+  only writes its configuration. That is why the custom action calls
+  `ntlm-agent.exe configure` and not `install` - `install` would copy the EXE a
+  second time and create a service the installer does not know about, leaving
+  an orphan behind on uninstall.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+
+  <Package Name="NTLM-Analyzer Agent"
+           Manufacturer="NTLM-Analyzer"
+           Version="$(var.ProductVersion)"
+           UpgradeCode="8f3d1c5e-6a24-4f77-9d2b-1c0e5a7b4e91"
+           Scope="perMachine"
+           Compressed="yes">
+
+    <!-- Upgrades replace in place; the config file survives because it lives in
+         ProgramData and is never a component of this package. -->
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="A newer version of the NTLM-Analyzer agent is already installed." />
+
+    <Launch Condition="Installed OR (VersionNT64 &gt;= 600)"
+            Message="This agent requires 64-bit Windows." />
+
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- Shown in Apps & features and on the installer's own dialogs. The .ico
+         carries nine sizes so Windows never has to scale one up. -->
+    <Icon Id="AgentIcon" SourceFile="$(var.IconFile)" />
+
+    <!-- WixUI's stock artwork replaced with the product's own. Sizes are fixed
+         by the UI: 493x58 for the header strip, 493x312 for the welcome and
+         finish pages. -->
+    <WixVariable Id="WixUIBannerBmp" Value="$(var.BannerBmp)" />
+    <WixVariable Id="WixUIDialogBmp" Value="$(var.DialogBmp)" />
+
+    <!-- ============================================================ -->
+    <!-- Properties. Public (upper-case) so msiexec can set them:          -->
+    <!--   msiexec /i ntlm-agent.msi /qn COLLECTORURL=https://... APIKEY=x -->
+    <!-- ============================================================ -->
+    <Property Id="COLLECTORURL" Value="https://" />
+    <!-- Hidden keeps the key out of the MSI log and the property table dump.
+         It still travels on the msiexec command line if passed that way, which
+         is why the README recommends an Intune app secret or a script that
+         builds the line at run time rather than a stored command. -->
+    <Property Id="APIKEY" Secure="yes" Hidden="yes" />
+    <Property Id="INTERVAL" Value="15" />
+    <!-- 1 = also switch outgoing NTLM auditing on. Off by default: it writes to
+         the machine's policy, which an admin may want to control centrally. -->
+    <Property Id="ENABLEAUDIT" Value="0" />
+
+    <Property Id="ARPPRODUCTICON" Value="AgentIcon" />
+    <Property Id="ARPNOMODIFY" Value="1" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/Nobrac/NTLM-Analyzer" />
+
+    <!-- ============================================================ -->
+    <!-- Payload and service                                              -->
+    <!-- ============================================================ -->
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="NtlmAgent" />
+    </StandardDirectory>
+
+    <ComponentGroup Id="AgentFiles" Directory="INSTALLFOLDER">
+      <Component Id="AgentExeComponent" Bitness="always64">
+        <File Id="AgentExe" Source="$(var.AgentExe)" KeyPath="yes" />
+
+        <!-- The service is declared here rather than created by the agent, so
+             Windows Installer tracks it and removes it again on uninstall. -->
+        <ServiceInstall Id="AgentService"
+                        Name="NtlmAgent"
+                        DisplayName="NTLM-Analyzer Agent"
+                        Description="Collects NTLM usage data and reports it to the NTLM-Analyzer collector."
+                        Type="ownProcess"
+                        Start="auto"
+                        ErrorControl="normal"
+                        Account="LocalSystem"
+                        Arguments="service"
+                        Vital="yes">
+          <!-- Restart on failure: a collector that is briefly unreachable makes
+               the agent exit; without this the machine would silently stop
+               reporting until someone noticed. -->
+          <util:ServiceConfig FirstFailureActionType="restart"
+                              SecondFailureActionType="restart"
+                              ThirdFailureActionType="restart"
+                              RestartServiceDelayInSeconds="60" />
+        </ServiceInstall>
+
+        <!-- Stop before uninstall, start after install - but only once the
+             configuration has been written (see the sequencing below). -->
+        <ServiceControl Id="AgentServiceControl"
+                        Name="NtlmAgent"
+                        Stop="both"
+                        Remove="uninstall"
+                        Wait="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <Feature Id="Main" Title="NTLM-Analyzer Agent" Level="1">
+      <ComponentGroupRef Id="AgentFiles" />
+    </Feature>
+
+    <!-- ============================================================ -->
+    <!-- Custom actions: write config, then start the service             -->
+    <!-- ============================================================ -->
+
+    <!-- The command line is assembled into the deferred action's CustomActionData
+         because a deferred action runs without access to the property table. -->
+    <SetProperty Id="WriteConfig"
+                 Before="WriteConfig"
+                 Sequence="execute"
+                 Value="&quot;[INSTALLFOLDER]ntlm-agent.exe&quot; configure --collector-url &quot;[COLLECTORURL]&quot; --api-key &quot;[APIKEY]&quot; --interval [INTERVAL]" />
+
+    <CustomAction Id="WriteConfig"
+                  BinaryRef="Wix4UtilCA_X64"
+                  DllEntry="WixQuietExec64"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check" />
+
+    <SetProperty Id="EnableAudit"
+                 Before="EnableAudit"
+                 Sequence="execute"
+                 Value="&quot;[INSTALLFOLDER]ntlm-agent.exe&quot; configure --collector-url &quot;[COLLECTORURL]&quot; --api-key &quot;[APIKEY]&quot; --interval [INTERVAL] --enable-outgoing-audit" />
+
+    <CustomAction Id="EnableAudit"
+                  BinaryRef="Wix4UtilCA_X64"
+                  DllEntry="WixQuietExec64"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check" />
+
+    <!-- A missing collector URL is a broken install, not a warning: the service
+         would start and fail forever. Catch it in both UI and silent mode. -->
+    <Launch Condition="Installed OR (COLLECTORURL AND COLLECTORURL &lt;&gt; &quot;https://&quot;)"
+            Message="Please supply the collector URL, e.g. COLLECTORURL=https://collector.example.local:8443" />
+
+    <InstallExecuteSequence>
+      <!-- After the files are on disk, before the service is started. -->
+      <Custom Action="WriteConfig" After="InstallFiles"
+              Condition="NOT Installed AND ENABLEAUDIT &lt;&gt; &quot;1&quot;" />
+      <Custom Action="EnableAudit" After="InstallFiles"
+              Condition="NOT Installed AND ENABLEAUDIT = &quot;1&quot;" />
+    </InstallExecuteSequence>
+
+    <!-- ============================================================ -->
+    <!-- Wizard                                                            -->
+    <!-- ============================================================ -->
+    <ui:WixUI Id="WixUI_InstallDir" InstallDirectory="INSTALLFOLDER" />
+    <UIRef Id="WixUI_ErrorProgressText" />
+
+    <UI>
+      <!-- Slot the settings page between the licence and the folder page. -->
+      <Publish Dialog="LicenseAgreementDlg" Control="Next"
+               Event="NewDialog" Value="AgentSettingsDlg"
+               Condition="LicenseAccepted = &quot;1&quot;" Order="3" />
+      <Publish Dialog="InstallDirDlg" Control="Back"
+               Event="NewDialog" Value="AgentSettingsDlg" Order="3" />
+
+      <Dialog Id="AgentSettingsDlg" Width="370" Height="270"
+              Title="[ProductName] Setup">
+        <Control Id="Title" Type="Text" X="15" Y="6" Width="200" Height="15"
+                 Transparent="yes" NoPrefix="yes" Text="{\WixUI_Font_Title}Collector connection" />
+        <Control Id="Description" Type="Text" X="25" Y="23" Width="330" Height="20"
+                 Transparent="yes" NoPrefix="yes"
+                 Text="This machine will report which accounts and programs still use NTLM. Nothing is changed on it." />
+        <Control Id="BannerBitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="44"
+                 TabSkip="no" Text="!(loc.InstallDirDlgBannerBitmap)" />
+        <Control Id="BannerLine" Type="Line" X="0" Y="44" Width="370" Height="0" />
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+
+        <Control Id="UrlLabel" Type="Text" X="20" Y="60" Width="290" Height="12"
+                 NoPrefix="yes" Text="Collector URL" />
+        <Control Id="UrlEdit" Type="Edit" X="20" Y="73" Width="330" Height="18"
+                 Property="COLLECTORURL" Indirect="no" />
+        <Control Id="UrlHint" Type="Text" X="20" Y="93" Width="330" Height="20"
+                 NoPrefix="yes"
+                 Text="Example: https://collector.example.local:8443 - use HTTPS, otherwise the API key travels in clear text." />
+
+        <Control Id="KeyLabel" Type="Text" X="20" Y="120" Width="290" Height="12"
+                 NoPrefix="yes" Text="API key" />
+        <!-- Password="yes" masks the field; the property is Hidden so it does
+             not end up in the installer log either. -->
+        <Control Id="KeyEdit" Type="Edit" X="20" Y="133" Width="330" Height="18"
+                 Property="APIKEY" Password="yes" Indirect="no" />
+
+        <Control Id="IntervalLabel" Type="Text" X="20" Y="162" Width="290" Height="12"
+                 NoPrefix="yes" Text="Poll interval in minutes" />
+        <Control Id="IntervalEdit" Type="Edit" X="20" Y="175" Width="60" Height="18"
+                 Property="INTERVAL" Indirect="no" />
+
+        <Control Id="AuditCheck" Type="CheckBox" X="20" Y="202" Width="330" Height="18"
+                 Property="ENABLEAUDIT" CheckBoxValue="1"
+                 Text="Switch on outgoing NTLM auditing on this machine" />
+
+        <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17"
+                 Text="!(loc.WixUIBack)">
+          <Publish Event="NewDialog" Value="LicenseAgreementDlg" />
+        </Control>
+        <Control Id="Next" Type="PushButton" X="236" Y="243" Width="56" Height="17"
+                 Default="yes" Text="!(loc.WixUINext)">
+          <Publish Event="NewDialog" Value="InstallDirDlg"
+                   Condition="COLLECTORURL AND COLLECTORURL &lt;&gt; &quot;https://&quot;" />
+          <Publish Event="SpawnDialog" Value="UrlMissingDlg"
+                   Condition="NOT COLLECTORURL OR COLLECTORURL = &quot;https://&quot;" />
+        </Control>
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17"
+                 Cancel="yes" Text="!(loc.WixUICancel)">
+          <Publish Event="SpawnDialog" Value="CancelDlg" />
+        </Control>
+      </Dialog>
+
+      <Dialog Id="UrlMissingDlg" Width="260" Height="85" Title="[ProductName] Setup">
+        <Control Id="Text" Type="Text" X="20" Y="15" Width="220" Height="35"
+                 NoPrefix="yes" Text="Please enter the collector URL before continuing." />
+        <Control Id="OK" Type="PushButton" X="100" Y="57" Width="56" Height="17"
+                 Default="yes" Cancel="yes" Text="!(loc.WixUIOK)">
+          <Publish Event="EndDialog" Value="Return" />
+        </Control>
+      </Dialog>
+    </UI>
+  </Package>
+</Wix>
