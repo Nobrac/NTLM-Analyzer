@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// Version reported with every status push (shown in the dashboard).
-pub const AGENT_VERSION: &str = "1.9.0";
+pub const AGENT_VERSION: &str = "2.0.0";
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Config {

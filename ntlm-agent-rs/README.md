@@ -91,6 +91,11 @@ ntlm-agent.exe install --collector-url https://collector.example.local:8443 ^
 
 :: stop and remove the service
 ntlm-agent.exe uninstall
+
+:: write or change the configuration only - no file copy, no service changes.
+:: Useful to correct the collector URL or the API key on a machine that is
+:: already installed.
+ntlm-agent.exe configure --collector-url https://collector.example.local:8443 --api-key SECRET123
 ```
 
 The configuration lives in `C:\ProgramData\NtlmAgent\config.json`; watermarks in

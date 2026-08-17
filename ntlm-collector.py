@@ -123,6 +123,8 @@ CREATE TABLE IF NOT EXISTS agents (
     restrict_dom    TEXT,
     exc_client      TEXT,          -- bereits konfigurierte GPO-Ausnahmelisten
     exc_dc          TEXT,
+    domain_level    TEXT,          -- msDS-Behavior-Version der Domaene (roh)
+    forest_level    TEXT,          -- msDS-Behavior-Version der Gesamtstruktur
     last_seen       TEXT
 );
 """
@@ -191,7 +193,7 @@ def init_db(path):
     have_a = {r[1] for r in conn.execute("PRAGMA table_info(agents)")}
     for col in ("lm_level", "block_v1sso", "cred_guard", "ntlm_log_kb",
                 "os_version", "restrict_out", "restrict_in", "restrict_dom",
-                "exc_client", "exc_dc"):
+                "exc_client", "exc_dc", "domain_level", "forest_level"):
         if have_a and col not in have_a:
             conn.execute(f"ALTER TABLE agents ADD COLUMN {col} TEXT")
     # Bestandsdaten: Prozessnamen ohne Endung angleichen (einmalig wirksam,
@@ -512,8 +514,8 @@ class Handler(BaseHTTPRequestHandler):
                 "INSERT INTO agents (source,is_dc,agent_version,outgoing_audit,"
                 "incoming_audit,domain_audit,lm_level,block_v1sso,cred_guard,ntlm_log_kb,"
                 "os_version,restrict_out,restrict_in,restrict_dom,exc_client,exc_dc,"
-                "last_seen) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "domain_level,forest_level,last_seen) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(source) DO UPDATE SET is_dc=excluded.is_dc, "
                 "agent_version=excluded.agent_version, outgoing_audit=excluded.outgoing_audit, "
                 "incoming_audit=excluded.incoming_audit, domain_audit=excluded.domain_audit, "
@@ -522,13 +524,15 @@ class Handler(BaseHTTPRequestHandler):
                 "os_version=excluded.os_version, restrict_out=excluded.restrict_out, "
                 "restrict_in=excluded.restrict_in, restrict_dom=excluded.restrict_dom, "
                 "exc_client=excluded.exc_client, exc_dc=excluded.exc_dc, "
+                "domain_level=excluded.domain_level, forest_level=excluded.forest_level, "
                 "last_seen=excluded.last_seen",
                 (source, 1 if p.get("is_dc") else 0, g("agent_version"),
                  g("outgoing_audit"), g("incoming_audit"),
                  g("domain_audit"), g("lm_level"), g("block_v1sso"),
                  g("cred_guard"), g("ntlm_log_kb"),
                  g("os_version"), g("restrict_out"), g("restrict_in"),
-                 g("restrict_dom"), g("exc_client"), g("exc_dc"), now))
+                 g("restrict_dom"), g("exc_client"), g("exc_dc"),
+                 g("domain_level"), g("forest_level"), now))
             self.server.conn.commit()
         return True
 
@@ -627,6 +631,44 @@ class Handler(BaseHTTPRequestHandler):
             where.append("(user LIKE ? OR process LIKE ? OR target_server LIKE ? "
                          "OR ip LIKE ? OR workstation LIKE ?)")
             params += [like, like, like, like, like]
+
+        # Drill-down from the trend chart and the heatmap. These have to use the
+        # very same expressions the charts are built from, in the viewer's local
+        # time, or a click would select a different set than the bar counted.
+        try:
+            tzoff = int(one("tzoff") or 0)
+        except (TypeError, ValueError):
+            tzoff = 0
+        tzoff = max(-840, min(840, tzoff))      # -14h .. +14h
+        tzmod = f"{tzoff:+d} minutes"           # from an int, never from input
+
+        bucket = one("bucket")                  # one bar of the trend chart
+        if bucket:
+            width = 13 if rng == "24h" else 10  # hourly bars in the 24h range
+            where.append(f"substr(datetime(event_time, ?),1,{width}) = ?")
+            params += [tzmod, bucket[:width]]
+        wd = one("wd")                          # heatmap weekday, 0 = Sunday
+        if wd not in (None, "") and str(wd).isdigit() and 0 <= int(wd) <= 6:
+            where.append("CAST(strftime('%w', event_time, ?) AS INTEGER) = ?")
+            params += [tzmod, int(wd)]
+        hr = one("hr")                          # heatmap hour
+        if hr not in (None, "") and str(hr).isdigit() and 0 <= int(hr) <= 23:
+            where.append("CAST(strftime('%H', event_time, ?) AS INTEGER) = ?")
+            params += [tzmod, int(hr)]
+        # Both charts count NTLM only, so a click has to exclude Kerberos too -
+        # otherwise the row count would not match the bar the user clicked.
+        if one("nokrb") == "1":
+            where.append("kind != 'kerberos'")
+        # Drill-down from the "why NTLM" panel. That table has two sources and
+        # each needs its own column: the enhanced 40xx events carry a usage id,
+        # failed Kerberos requests carry a failure code. Same predicates the
+        # aggregation uses, so a click lands on exactly the counted rows.
+        rid = one("rid")
+        if rid:
+            where.append("reason_id = ?"); params.append(rid)
+        fcode = one("fcode")
+        if fcode:
+            where.append("failure_code = ?"); params.append(fcode)
         return one, rng, cutoff, where, params
 
     def _send_csv(self, qs):
@@ -895,7 +937,8 @@ class Handler(BaseHTTPRequestHandler):
                            ntlm_log_kb=r[13], os_version=r[14],
                            restrict_out=r[15], restrict_in=r[16],
                            restrict_dom=r[17], exc_client=r[18],
-                           exc_dc=r[19], cg=cg_by_src.get(r[0], 0)) for r in c.execute(
+                           exc_dc=r[19], domain_level=r[20], forest_level=r[21],
+                           cg=cg_by_src.get(r[0], 0)) for r in c.execute(
                 "SELECT a.source, a.is_dc, a.agent_version, a.outgoing_audit, a.incoming_audit, "
                 "a.domain_audit, a.last_seen, "
                 "(SELECT COUNT(*) FROM events e WHERE e.source=a.source), "
@@ -903,7 +946,8 @@ class Handler(BaseHTTPRequestHandler):
                 "a.lm_level, "
                 "(SELECT MIN(event_time) FROM events e WHERE e.source=a.source), "
                 "a.block_v1sso, a.cred_guard, a.ntlm_log_kb, a.os_version, "
-                "a.restrict_out, a.restrict_in, a.restrict_dom, a.exc_client, a.exc_dc "
+                "a.restrict_out, a.restrict_in, a.restrict_dom, a.exc_client, a.exc_dc, "
+                "a.domain_level, a.forest_level "
                 "FROM agents a ORDER BY a.last_seen DESC").fetchall()]
 
             # Datenbasis: seit wann liegen ueberhaupt Events vor? Zwei Wochen im
@@ -925,12 +969,18 @@ class Handler(BaseHTTPRequestHandler):
                 f"ORDER BY event_time DESC, id DESC LIMIT ?",
                 params + [limit]).fetchall()
             events = [dict(zip(cols2, r)) for r in rows]
+            # The list is capped, the count must not be: without this the panel
+            # reports the cap ("300") as if it were the result, which is plainly
+            # wrong once a filter matches more than that.
+            events_total = c.execute(
+                f"SELECT COUNT(*) FROM events{clause}", params).fetchone()[0]
 
         return {"stats": stats, "v1sso": v1sso, "incoming": incoming, "reasons": reasons, "trend": trend, "trend_bucket": ("hour" if rng == "24h" else "day"), "heat": heat, "spark": spark,
                 "top_proc": top_proc, "v1_users": v1_users,
                 "blockers": blockers, "domain": domain, "kerberos": kerberos,
                 "kerberos_accounts": kerberos_accounts,
                 "agents": agents, "sources": srcs, "events": events,
+                "events_total": events_total, "events_limit": limit,
                 "generated_at": datetime.now(timezone.utc).isoformat()}
 
 
@@ -942,18 +992,22 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <title>NTLM-Analyzer</title>
 <style>
 :root{
-  --void:#080b14; --card:#111827; --card2:#141c2e;
-  --edge:rgba(148,170,220,.10); --edge2:rgba(148,170,220,.20);
-  --ink:#e8edf7; --dim:#93a2bd; --faint:#5d6b87;
+  /* Tells the browser to draw native controls - select popups, scrollbars,
+     focus rings - in their dark variant. Without it the dropdown list is
+     rendered by the OS with light defaults and unreadable grey text. */
+  color-scheme:dark;
+  --void:#0e131f; --card:#18202f; --card2:#1d2637;
+  --edge:rgba(158,180,225,.13); --edge2:rgba(158,180,225,.24);
+  --ink:#eef2fa; --dim:#a3b1c9; --faint:#7c8aa4;
   --v1:#ff6b6b; --v2:#f5b841; --krb:#3ddc97; --pol:#a78bfa; --grey:#4a5872;
   --disp:'Segoe UI Variable Display','Segoe UI',system-ui,-apple-system,sans-serif;
   --text:'Segoe UI Variable Text','Segoe UI',system-ui,-apple-system,sans-serif;
   --mono:'Cascadia Mono','IBM Plex Mono',ui-monospace,Consolas,'SF Mono',monospace;
-  --r:14px; --pad:clamp(16px,2.2vw,38px);
+  --r:14px; --pad:clamp(20px,2.8vw,52px);
 }
 *{box-sizing:border-box}
 html{scroll-behavior:smooth}
-body{margin:0;background:var(--void);color:var(--ink);font-family:var(--text);font-size:13.5px;
+body{margin:0;background:var(--void);color:var(--ink);font-family:var(--text);font-size:18px;
   line-height:1.5;-webkit-font-smoothing:antialiased;overflow-x:hidden}
 body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:0;
   background:radial-gradient(1200px 600px at 10% -8%,rgba(255,107,107,.05),transparent 62%),
@@ -965,9 +1019,9 @@ button{font:inherit}
 a{color:inherit}
 
 header{position:sticky;top:0;z-index:60;backdrop-filter:blur(18px) saturate(1.4);
-  background:rgba(8,11,20,.76);border-bottom:1px solid var(--edge)}
-.hin{padding:0 var(--pad);height:58px;display:flex;align-items:center;gap:16px}
-.logo{display:flex;align-items:center;gap:11px;font-family:var(--disp);font-size:15px;font-weight:600;
+  background:rgba(14,19,31,.80);border-bottom:1px solid var(--edge)}
+.hin{padding:0 var(--pad);height:66px;display:flex;align-items:center;gap:16px}
+.logo{display:flex;align-items:center;gap:11px;font-family:var(--disp);font-size:17px;font-weight:600;
   letter-spacing:-.02em;white-space:nowrap}
 .orb{width:9px;height:9px;border-radius:50%;background:var(--krb);position:relative;flex:none}
 .orb::after{content:"";position:absolute;inset:-5px;border-radius:50%;border:1px solid var(--krb);
@@ -977,198 +1031,285 @@ header{position:sticky;top:0;z-index:60;backdrop-filter:blur(18px) saturate(1.4)
 .tools{display:flex;align-items:center;gap:8px;margin-left:auto;flex-wrap:wrap;justify-content:flex-end}
 .pill{display:flex;background:rgba(255,255,255,.035);border:1px solid var(--edge);border-radius:9px;
   padding:2px;gap:2px}
-.pill button{background:none;border:0;color:var(--dim);font-family:var(--mono);font-size:11px;
+.pill button{background:none;border:0;color:var(--dim);font-family:var(--mono);font-size:12.5px;
   padding:5px 11px;border-radius:7px;cursor:pointer;transition:.18s;white-space:nowrap}
 .pill button:hover{color:var(--ink)}
 .pill button[aria-pressed=true]{background:rgba(255,255,255,.08);color:var(--ink)}
 select,.ghost{background:rgba(255,255,255,.035);border:1px solid var(--edge);color:var(--ink);
-  border-radius:9px;padding:6px 10px;font-family:var(--mono);font-size:11px;cursor:pointer;transition:.18s}
+  border-radius:9px;padding:6px 10px;font-family:var(--mono);font-size:12.5px;cursor:pointer;transition:.18s}
 select:hover,.ghost:hover{border-color:var(--edge2);background:rgba(255,255,255,.06)}
+select option,.sel-st option{background:#1d2637;color:var(--ink)}
+select option:checked,.sel-st option:checked{background:#26314a;color:#fff}
 .ghost[aria-pressed=true]{background:rgba(61,220,151,.1);border-color:rgba(61,220,151,.35);color:#9ff0cb}
 
-.jump{position:sticky;top:58px;z-index:55;backdrop-filter:blur(14px);background:rgba(8,11,20,.7);
+.herotop{display:flex;gap:clamp(24px,4vw,70px);align-items:flex-start}
+.herotext{flex:1 1 auto;min-width:0}
+.osdon{flex:0 0 auto;width:330px;border:1px solid var(--edge);border-radius:var(--r);
+  background:rgba(255,255,255,.02);padding:16px 18px}
+.osdon .oh{font-family:var(--mono);font-size:12px;letter-spacing:.09em;text-transform:uppercase;
+  color:var(--faint);margin-bottom:12px}
+.osdon .ow{display:flex;align-items:center;gap:16px}
+.osdon svg{flex:none}
+.osdon .ring circle{transition:stroke-dasharray 1.1s cubic-bezier(.16,1,.3,1)}
+.osdon .mid{font-family:var(--disp);font-weight:620;fill:var(--ink)}
+.osdon .midl{font-family:var(--mono);fill:var(--faint)}
+.osdon .leg{flex:1 1 auto;min-width:0;display:flex;flex-direction:column;gap:5px}
+.osdon .lr{display:flex;align-items:baseline;gap:7px;font-size:13px;color:var(--dim);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.osdon .lr i{width:9px;height:9px;border-radius:2px;flex:none;align-self:center}
+.osdon .lr b{font-family:var(--mono);font-size:13px;font-weight:600;color:var(--ink);
+  font-variant-numeric:tabular-nums;min-width:2ch;text-align:right}
+.osdon .note{font-family:var(--mono);font-size:11.5px;color:var(--faint);margin-top:11px;
+  padding-top:10px;border-top:1px solid var(--edge)}
+.osdon .fl{margin-top:10px;padding-top:10px;border-top:1px solid var(--edge);
+  display:flex;flex-direction:column;gap:4px}
+.osdon .flr{display:flex;align-items:baseline;gap:8px;font-size:13px;color:var(--dim)}
+.osdon .flr span{flex:1 1 auto}
+.osdon .flr b{font-family:var(--mono);font-size:13px;color:var(--ink);font-weight:600}
+.osdon .flr em{font-style:normal;color:var(--v2);font-weight:700;cursor:help}
+@media(max-width:1250px){.osdon{display:none}}
+.jump{position:sticky;top:66px;z-index:55;backdrop-filter:blur(14px);background:rgba(14,19,31,.76);
   border-bottom:1px solid var(--edge);padding:9px var(--pad);display:flex;gap:5px;flex-wrap:wrap}
 .jl{background:none;border:1px solid transparent;color:var(--faint);font-family:var(--mono);
-  font-size:10.5px;padding:4px 9px;border-radius:7px;cursor:pointer;transition:.16s;display:flex;
+  font-size:14px;padding:4px 9px;border-radius:7px;cursor:pointer;transition:.16s;display:flex;
   gap:6px;align-items:center;white-space:nowrap}
 .jl:hover{color:var(--ink);border-color:var(--edge)}
 .jl b{color:var(--dim);font-weight:400;font-variant-numeric:tabular-nums}
 .jl.nil{opacity:.4}
 
-.hero{padding:48px var(--pad) 30px}
-.eyebrow{font-family:var(--mono);font-size:10.5px;letter-spacing:.18em;text-transform:uppercase;
+.hero{padding:58px var(--pad) 44px}
+.eyebrow{font-family:var(--mono);font-size:15.5px;letter-spacing:.16em;text-transform:uppercase;
   color:var(--faint);margin-bottom:16px}
-.thesis{font-family:var(--disp);font-size:clamp(28px,3.5vw,52px);font-weight:340;line-height:1.09;
+.thesis{font-family:var(--disp);font-size:clamp(40px,4.2vw,66px);font-weight:380;line-height:1.09;
   letter-spacing:-.035em;max-width:24ch;margin:0 0 8px}
 .thesis .big{font-weight:640;font-variant-numeric:tabular-nums}
 .thesis .fade{color:var(--faint)}
-.sub{color:var(--dim);font-size:14.5px;max-width:66ch;margin:0 0 30px}
-.handbar{display:flex;height:44px;border-radius:10px;overflow:hidden;gap:2px;background:var(--edge);
+.sub{color:var(--dim);font-size:18px;max-width:66ch;margin:0 0 30px}
+.handbar{display:flex;height:50px;border-radius:10px;overflow:hidden;gap:2px;background:var(--edge);
   margin-bottom:12px}
-.seg{position:relative;width:0;transition:width 1.4s cubic-bezier(.16,1,.3,1);overflow:hidden;
-  display:flex;align-items:center;padding:0 14px;cursor:pointer}
+.seg{position:relative;width:0;min-width:3px;flex:0 0 auto;transition:width 1.4s cubic-bezier(.16,1,.3,1);
+  overflow:hidden;display:flex;align-items:center;padding:0 12px;cursor:pointer}
+.seg.tight{padding:0 3px}
+.handbar{position:relative;overflow:visible}
+.seg:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
+.seg.on{filter:brightness(1.45)}
+.handbar:hover .seg:not(:hover){filter:brightness(.72)}
+.segtip{position:absolute;bottom:calc(100% + 14px);left:0;transform:translateX(-50%) translateY(4px);
+  background:#1d2637;border:1px solid var(--edge2);border-radius:12px;padding:13px 16px;
+  box-shadow:0 18px 40px rgba(0,0,0,.45);pointer-events:none;opacity:0;visibility:hidden;
+  transition:opacity .16s,transform .16s;z-index:30;white-space:nowrap}
+.segtip.on{opacity:1;visibility:visible;transform:translateX(-50%) translateY(0)}
+.segtip::after{content:"";position:absolute;top:100%;left:50%;margin-left:-6px;
+  border:6px solid transparent;border-top-color:#1d2637}
+.segtip .th{font-family:var(--disp);font-size:15px;font-weight:600;color:var(--ink);
+  margin-bottom:9px;display:flex;align-items:center;gap:8px}
+.segtip .th i{width:10px;height:10px;border-radius:3px;flex:none}
+.segtip .tr{display:flex;align-items:baseline;justify-content:space-between;gap:22px;
+  font-size:13px;color:var(--dim);padding:2px 0}
+.segtip .tr b{font-family:var(--mono);font-size:14px;color:var(--ink);font-weight:600;
+  font-variant-numeric:tabular-nums}
+.segtip .tf{margin-top:9px;padding-top:8px;border-top:1px solid var(--edge);
+  font-family:var(--mono);font-size:11.5px;color:var(--faint)}
 .seg.s1{background:linear-gradient(180deg,rgba(255,107,107,.30),rgba(255,107,107,.16))}
 .seg.s2{background:linear-gradient(180deg,rgba(245,184,65,.28),rgba(245,184,65,.14))}
 .seg.s3{background:linear-gradient(180deg,rgba(61,220,151,.26),rgba(61,220,151,.13))}
 .seg::after{content:"";position:absolute;left:0;top:0;bottom:0;width:2px}
 .seg.s1::after{background:var(--v1)}.seg.s2::after{background:var(--v2)}.seg.s3::after{background:var(--krb)}
-.seg b{font-family:var(--mono);font-size:11.5px;font-weight:500;white-space:nowrap;opacity:0;
+.seg b{font-family:var(--mono);font-size:15px;font-weight:500;white-space:nowrap;opacity:0;
   transition:opacity .5s .8s}
 .seg.s1 b{color:#ffb3b3}.seg.s2 b{color:#ffd894}.seg.s3 b{color:#9ff0cb}
 .seg:hover{filter:brightness(1.3)}
-.handkey{display:flex;gap:20px;flex-wrap:wrap;font-family:var(--mono);font-size:11px;color:var(--faint)}
-.handkey i{display:inline-block;width:7px;height:7px;border-radius:2px;margin-right:7px}
+.handkey{display:flex;gap:12px;flex-wrap:wrap;margin-top:14px}
+.kk{display:flex;align-items:baseline;gap:9px;padding:9px 14px;border:1px solid var(--edge);
+  border-radius:10px;background:rgba(255,255,255,.02);font-size:14px;color:var(--dim)}
+.kk i{width:9px;height:9px;border-radius:3px;flex:none;align-self:center}
+.kk b{font-family:var(--mono);font-size:17px;font-weight:600;color:var(--ink);
+  font-variant-numeric:tabular-nums}
+.kk em{font-family:var(--mono);font-size:13px;font-style:normal;color:var(--faint);
+  font-variant-numeric:tabular-nums}
+.kk.nil{opacity:.55}
+.kk.nil b{color:var(--dim)}
 .deadline{display:flex;align-items:center;gap:16px;margin-top:26px;padding:15px 19px;
   border:1px solid var(--edge);border-radius:var(--r);background:rgba(255,107,107,.045);max-width:700px}
-.dnum{font-family:var(--disp);font-size:33px;font-weight:620;letter-spacing:-.03em;color:var(--v1);
+.dnum{font-family:var(--disp);font-size:38px;font-weight:620;letter-spacing:-.03em;color:var(--v1);
   font-variant-numeric:tabular-nums;line-height:1}
-.dtxt{font-size:13px;color:var(--dim)}
-.dtxt b{color:var(--ink);font-weight:600;display:block;font-size:13.5px;margin-bottom:2px}
+.dtxt{font-size:15px;color:var(--dim)}
+.dtxt b{color:var(--ink);font-weight:600;display:block;font-size:15.5px;margin-bottom:2px}
 
-.focus{display:flex;gap:10px;flex-wrap:wrap;padding:0 var(--pad) 20px}
-.fc{flex:1 1 210px;border:1px solid var(--edge);border-radius:11px;padding:12px 14px;background:var(--card);
+.focus{display:flex;gap:18px;flex-wrap:wrap;padding:0 var(--pad) 34px}
+.fc{flex:1 1 260px;border:1px solid var(--edge);border-radius:11px;padding:19px 21px;background:var(--card);
   cursor:pointer;transition:transform .22s cubic-bezier(.16,1,.3,1),border-color .22s,background .22s;
   text-align:left;color:inherit}
 .fc:hover{transform:translateY(-3px);border-color:var(--edge2);background:var(--card2)}
-.fc .k{font-family:var(--mono);font-size:9.5px;letter-spacing:.13em;text-transform:uppercase;
+.fc .k{font-family:var(--mono);font-size:14px;letter-spacing:.13em;text-transform:uppercase;
   color:var(--faint);margin-bottom:6px}
-.fc .v{font-family:var(--disp);font-size:15px;font-weight:580;letter-spacing:-.015em;margin-bottom:3px}
-.fc .w{font-family:var(--mono);font-size:10.5px;color:var(--dim)}
+.fc .v{font-family:var(--disp);font-size:19.5px;font-weight:580;letter-spacing:-.015em;margin-bottom:3px}
+.fc .w{font-family:var(--mono);font-size:14.5px;color:var(--dim)}
 
-.grid{padding:0 var(--pad) 90px;display:grid;gap:14px;
-  grid-template-columns:repeat(auto-fit,minmax(360px,1fr))}
+/* Fixed column counts rather than auto-fit. Auto-fit packed four columns onto
+   a wide monitor, which reads as a wall. Two is the working default; a third
+   only appears on genuinely huge screens. */
+.grid{padding:0 var(--pad) 90px;display:grid;gap:30px;grid-template-columns:1fr}
+@media(min-width:1000px){.grid{grid-template-columns:repeat(2,1fr)}}
+@media(min-width:2900px){.grid{grid-template-columns:repeat(3,1fr)}}
 .c2{grid-column:span 2}.call{grid-column:1/-1}
-@media(max-width:1150px){.c2,.call{grid-column:span 1}}
+@media(max-width:999px){.c2{grid-column:span 1}}
+@media(max-width:999px){.c2,.call{grid-column:span 1}}
 .card{border:1px solid var(--edge);border-radius:var(--r);scroll-margin-top:118px;
   background:linear-gradient(180deg,rgba(255,255,255,.022),transparent 40%),var(--card);
   overflow:hidden;opacity:0;transform:translateY(16px);
   transition:opacity .6s cubic-bezier(.16,1,.3,1),transform .6s cubic-bezier(.16,1,.3,1),border-color .25s}
 .card.in{opacity:1;transform:none}
 .card:hover{border-color:var(--edge2)}
-.ch{display:flex;align-items:center;gap:10px;padding:14px 17px 11px;flex-wrap:wrap}
-.ch h2{margin:0;font-family:var(--disp);font-size:14.5px;font-weight:580;letter-spacing:-.012em}
-.ch .meta{margin-left:auto;font-family:var(--mono);font-size:10.5px;color:var(--faint)}
-.flag{font-family:var(--mono);font-size:9.5px;letter-spacing:.09em;text-transform:uppercase;
+.ch{display:flex;align-items:center;gap:12px;padding:20px 22px 16px;flex-wrap:wrap}
+.ch h2{margin:0;font-family:var(--disp);font-size:18.5px;font-weight:580;letter-spacing:-.012em}
+.ch .meta{margin-left:auto;font-family:var(--mono);font-size:14px;color:var(--faint)}
+.flag{font-family:var(--mono);font-size:12.5px;letter-spacing:.09em;text-transform:uppercase;
   padding:2px 7px;border-radius:5px;border:1px solid var(--edge2);color:var(--dim)}
 .flag.due{color:var(--v1);border-color:rgba(255,107,107,.35);background:rgba(255,107,107,.07)}
 .flag.ok{color:var(--krb);border-color:rgba(61,220,151,.3);background:rgba(61,220,151,.06)}
 .mini{background:rgba(255,255,255,.04);border:1px solid var(--edge);color:var(--dim);border-radius:7px;
-  padding:3px 9px;font-family:var(--mono);font-size:10px;cursor:pointer;transition:.16s}
+  padding:3px 9px;font-family:var(--mono);font-size:12px;cursor:pointer;transition:.16s}
 .mini:hover{color:var(--ink);border-color:var(--krb)}
 
 table{width:100%;border-collapse:collapse}
-th{font-family:var(--mono);font-size:9.5px;letter-spacing:.11em;text-transform:uppercase;color:var(--faint);
-  font-weight:400;text-align:left;padding:6px 17px 9px;white-space:nowrap}
-td{padding:8px 17px;border-top:1px solid rgba(148,170,220,.07);font-size:12.8px}
+/* The header row used to sit at the same weight and near the same tone as the
+   data, so a table read as one undifferentiated block. It is now a band: its
+   own slightly lighter surface, a firm bottom edge, brighter and heavier type.
+   Contrast against that band goes from 4.69:1 to 6.98:1. */
+thead th{background:rgba(158,180,225,.055);border-bottom:1px solid var(--edge2);
+  position:relative}
+th{font-family:var(--mono);font-size:12.5px;letter-spacing:.1em;text-transform:uppercase;
+  color:var(--dim);font-weight:600;text-align:left;padding:12px 22px 12px;white-space:nowrap}
+/* First data row needs no line of its own - the band already draws it. */
+thead + tbody tr:first-child td{border-top:0}
+td{padding:14px 22px;border-top:1px solid rgba(158,180,225,.11);font-size:16.5px;line-height:1.45}
 tbody tr{transition:background .16s}
+tbody tr:nth-child(even){background:rgba(158,180,225,.028)}
 tbody tr.click{cursor:pointer}
 tbody tr.click:hover{background:rgba(148,170,220,.06)}
+tbody tr.on{background:rgba(61,220,151,.10);box-shadow:inset 3px 0 0 var(--krb)}
 .r{text-align:right;font-family:var(--mono);font-variant-numeric:tabular-nums}
-.mn{font-family:var(--mono);font-size:11.5px}
-.dm{color:var(--faint)}
-.nm{font-weight:560}
-.cut{display:inline-block;max-width:30ch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+.mn{font-family:var(--mono);font-size:15px}
+/* Table cells marked .dm carry real content - target servers, accounts,
+   timestamps - not asides, so they sit at the middle tone (7.5:1) rather than
+   the faintest one (4.7:1). The gap to primary text stays wide enough to keep
+   the hierarchy. */
+.dm{color:var(--dim)}
+.nm{font-weight:620}
+.cut{display:inline-block;max-width:44ch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
   vertical-align:bottom}
-.tag{display:inline-block;font-family:var(--mono);font-size:10px;padding:1px 6px;border-radius:5px;
+.tag{display:inline-block;font-family:var(--mono);font-size:12.5px;padding:2px 7px;border-radius:5px;
   border:1px solid;line-height:15px;white-space:nowrap}
 .tag.v1{color:var(--v1);border-color:rgba(255,107,107,.32);background:rgba(255,107,107,.07)}
 .tag.v2{color:var(--v2);border-color:rgba(245,184,65,.32);background:rgba(245,184,65,.07)}
 .tag.krb{color:var(--krb);border-color:rgba(61,220,151,.3);background:rgba(61,220,151,.06)}
 .tag.pol{color:var(--pol);border-color:rgba(167,139,250,.32);background:rgba(167,139,250,.07)}
 .tag.n{color:var(--faint);border-color:var(--edge2)}
+.restn{color:var(--faint);font-family:var(--mono);font-size:12px;margin-left:6px}
 .sel-st{background:rgba(255,255,255,.04);border:1px solid var(--edge);color:var(--dim);border-radius:7px;
-  padding:2px 6px;font-family:var(--mono);font-size:10.5px}
+  padding:3px 8px;font-family:var(--mono);font-size:13px}
 .done td{opacity:.42}
-.empty{padding:30px 17px;text-align:center;color:var(--faint);font-size:12.5px}
-.empty b{display:block;color:var(--dim);font-size:13.5px;margin-bottom:5px;font-weight:500}
+.empty{padding:34px 20px;text-align:center;color:var(--faint);font-size:15.5px}
+.empty b{display:block;color:var(--dim);font-size:15.5px;margin-bottom:5px;font-weight:500}
 
-.bar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:0 17px 12px}
+.bar{display:flex;align-items:center;gap:9px;flex-wrap:wrap;padding:2px 22px 14px}
 .search{flex:1 1 240px;min-width:160px;background:rgba(255,255,255,.035);border:1px solid var(--edge);
-  color:var(--ink);border-radius:9px;padding:7px 11px;font-family:var(--mono);font-size:11.5px}
+  color:var(--ink);border-radius:9px;padding:7px 11px;font-family:var(--mono);font-size:13px}
 .search::placeholder{color:var(--faint)}
 .search:focus{outline:none;border-color:var(--edge2);background:rgba(255,255,255,.06)}
 .chipset{display:flex;gap:5px;flex-wrap:wrap}
 .chip{background:rgba(255,255,255,.035);border:1px solid var(--edge);color:var(--dim);border-radius:8px;
-  padding:4px 9px;font-family:var(--mono);font-size:10.5px;cursor:pointer;transition:.16s;white-space:nowrap}
+  padding:5px 11px;font-family:var(--mono);font-size:13px;cursor:pointer;transition:.16s;white-space:nowrap}
 .chip:hover{color:var(--ink);border-color:var(--edge2)}
 .chip[aria-pressed=true]{background:rgba(255,255,255,.09);color:var(--ink);border-color:var(--edge2)}
 .active{display:flex;gap:6px;flex-wrap:wrap;padding:0 17px 11px}
 .afl{display:inline-flex;align-items:center;gap:7px;background:rgba(61,220,151,.09);
   border:1px solid rgba(61,220,151,.28);color:#9ff0cb;border-radius:8px;padding:4px 8px;
-  font-family:var(--mono);font-size:10.5px}
-.afl button{background:none;border:0;color:inherit;cursor:pointer;opacity:.7;padding:0 0 0 2px;font-size:13px}
+  font-family:var(--mono);font-size:12px}
+.afl button{background:none;border:0;color:inherit;cursor:pointer;opacity:.7;padding:0 0 0 2px;font-size:15px}
 .afl button:hover{opacity:1}
-.clearall{background:none;border:0;color:var(--faint);font-family:var(--mono);font-size:10.5px;
+.clearall{background:none;border:0;color:var(--faint);font-family:var(--mono);font-size:12px;
   cursor:pointer;text-decoration:underline;text-underline-offset:3px}
 .clearall:hover{color:var(--ink)}
 .more{display:block;width:100%;background:rgba(255,255,255,.03);border:0;border-top:1px solid var(--edge);
-  color:var(--dim);font-family:var(--mono);font-size:11px;padding:11px;cursor:pointer;transition:.16s}
+  color:var(--dim);font-family:var(--mono);font-size:12.5px;padding:11px;cursor:pointer;transition:.16s}
 .more:hover{background:rgba(255,255,255,.06);color:var(--ink)}
 
-.bars{padding:8px 17px 15px}
+.bars{padding:14px 22px 20px}
 .brow{margin-bottom:10px;cursor:pointer}
 .brow:last-child{margin-bottom:0}
 .brow:hover .blab{color:var(--ink)}
-.blab{display:flex;justify-content:space-between;gap:10px;font-size:12.5px;margin-bottom:4px;
+.blab{display:flex;justify-content:space-between;gap:10px;font-size:15.5px;margin-bottom:4px;
   color:var(--dim);transition:color .16s}
-.blab .bn{font-family:var(--mono);font-size:11px;color:var(--faint);flex:none}
+.blab .bn{font-family:var(--mono);font-size:12.5px;color:var(--faint);flex:none}
 .blab .btx{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .btr{height:4px;background:rgba(148,170,220,.09);border-radius:3px;overflow:hidden}
 .bfl{height:100%;width:0;border-radius:3px;transition:width 1s cubic-bezier(.16,1,.3,1)}
 .bfl.red{background:linear-gradient(90deg,#c94a4a,var(--v1))}
 .bfl.amb{background:linear-gradient(90deg,#c08b2c,var(--v2))}
 
-.blocks{padding:14px 17px 6px;display:flex;align-items:flex-end;gap:2px;height:150px}
+/* align-items must stretch: the columns need a definite height, otherwise the
+   percentage heights of the bars inside resolve against nothing and collapse
+   to zero. The bars are pushed to the bottom by .bcol's justify-content. */
+.blocks{padding:14px 17px 6px;display:flex;align-items:stretch;gap:2px;height:150px}
 .bcol{flex:1;display:flex;flex-direction:column;justify-content:flex-end;min-width:0;cursor:default;
   transition:opacity .16s}
 .bcol:hover{opacity:.7}
 .bcol span{display:block;transition:height .8s cubic-bezier(.16,1,.3,1)}
 .axis{display:flex;justify-content:space-between;padding:4px 17px 14px;font-family:var(--mono);
-  font-size:9.5px;color:var(--faint)}
+  font-size:12px;color:var(--faint)}
 
-.hm{padding:4px 17px 15px}
+.hm{padding:8px 20px 18px}
 .hr{display:grid;grid-template-columns:20px repeat(24,1fr);gap:2px;align-items:center;margin-bottom:2px}
-.hr .lb{font-family:var(--mono);font-size:9px;color:var(--faint)}
+.hr .lb{font-family:var(--mono);font-size:12px;color:var(--faint)}
 .hc{aspect-ratio:1;border-radius:2px;background:rgba(148,170,220,.05);transform:scale(.4);opacity:0;
   transition:transform .5s cubic-bezier(.16,1,.3,1),opacity .5s}
 .hc.in{transform:scale(1);opacity:1}
-.hnote{font-family:var(--mono);font-size:10.5px;color:var(--dim);margin-top:11px;padding-top:10px;
+.hc{cursor:pointer}
+.hc:hover{outline:1px solid var(--ink);outline-offset:1px}
+.hc.on{outline:2px solid var(--krb);outline-offset:1px}
+.bcol{cursor:pointer}
+.bcol:hover span{filter:brightness(1.25)}
+.bcol.on span{filter:brightness(1.5)}
+.bcol.on{outline:1px solid var(--krb);outline-offset:1px;border-radius:2px}
+.hnote{font-family:var(--mono);font-size:14px;color:var(--dim);margin-top:11px;padding-top:10px;
   border-top:1px solid var(--edge)}
 .hnote b{color:var(--v2);font-weight:500}
 
-.scrim{position:fixed;inset:0;background:rgba(4,6,12,.62);backdrop-filter:blur(3px);opacity:0;
+.scrim{position:fixed;inset:0;background:rgba(6,9,16,.60);backdrop-filter:blur(3px);opacity:0;
   pointer-events:none;transition:opacity .3s;z-index:70}
 .scrim.on{opacity:1;pointer-events:auto}
-.drawer{position:fixed;top:0;right:0;bottom:0;width:min(540px,100%);background:#0d1422;
+.drawer{position:fixed;top:0;right:0;bottom:0;width:min(540px,100%);background:#151d2b;
   border-left:1px solid var(--edge2);z-index:80;transform:translateX(100%);
   transition:transform .42s cubic-bezier(.16,1,.3,1);display:flex;flex-direction:column;
   box-shadow:-30px 0 70px rgba(0,0,0,.45)}
 .drawer.on{transform:none}
 .dh{padding:20px 22px 15px;border-bottom:1px solid var(--edge);display:flex;align-items:flex-start;gap:12px}
-.dh h3{margin:0 0 5px;font-family:var(--disp);font-size:17px;font-weight:580;letter-spacing:-.02em}
-.dh .when{font-family:var(--mono);font-size:11px;color:var(--faint)}
+.dh h3{margin:0 0 6px;font-family:var(--disp);font-size:22px;font-weight:580;letter-spacing:-.02em}
+.dh .when{font-family:var(--mono);font-size:14.5px;color:var(--faint)}
 .x{background:rgba(255,255,255,.05);border:1px solid var(--edge);color:var(--dim);border-radius:8px;
-  width:30px;height:30px;cursor:pointer;margin-left:auto;flex:none;transition:.16s;font-size:15px}
+  width:34px;height:34px;cursor:pointer;margin-left:auto;flex:none;transition:.16s;font-size:17px}
 .x:hover{color:var(--ink);border-color:var(--edge2)}
 .dbody{overflow-y:auto;padding:4px 0 26px;flex:1}
 .expl{margin:15px 22px;padding:13px 15px;border:1px solid var(--edge);border-radius:11px;
-  background:rgba(148,170,220,.04);font-size:12.5px;color:var(--dim);line-height:1.55}
+  background:rgba(148,170,220,.04);font-size:16px;color:var(--dim);line-height:1.6}
 .expl b{display:block;color:var(--ink);font-weight:600;margin-bottom:4px}
 .grp{margin:17px 22px 0}
-.grp .gk{font-family:var(--mono);font-size:9.5px;letter-spacing:.13em;text-transform:uppercase;
+.grp .gk{font-family:var(--mono);font-size:12.5px;letter-spacing:.11em;text-transform:uppercase;
   color:var(--faint);padding-bottom:8px;border-bottom:1px solid var(--edge);margin-bottom:4px}
-.fr{display:grid;grid-template-columns:130px 1fr;gap:12px;padding:6px 0;font-size:12.5px;
+.fr{display:grid;grid-template-columns:150px 1fr;gap:14px;padding:9px 0;font-size:16px;
   border-bottom:1px solid rgba(148,170,220,.05)}
 .fr:last-child{border-bottom:0}
-.fr .fk{color:var(--faint);font-family:var(--mono);font-size:10.5px;padding-top:2px}
-.fr .fv{font-family:var(--mono);font-size:12px;word-break:break-word}
+.fr .fk{color:var(--faint);font-family:var(--mono);font-size:14px;padding-top:2px}
+.fr .fv{font-family:var(--mono);font-size:15.5px;word-break:break-word}
 .fr .fv.none{color:var(--faint)}
 .dact{display:flex;gap:8px;flex-wrap:wrap;margin:19px 22px 0}
 .dact button{flex:1 1 auto;background:rgba(255,255,255,.04);border:1px solid var(--edge);color:var(--dim);
-  border-radius:9px;padding:8px 12px;font-family:var(--mono);font-size:10.5px;cursor:pointer;transition:.18s}
+  border-radius:9px;padding:10px 14px;font-family:var(--mono);font-size:14px;cursor:pointer;transition:.18s}
 .dact button:hover{color:var(--ink);border-color:var(--krb);background:rgba(61,220,151,.07)}
-.code{margin:15px 22px;background:#080d16;border:1px solid var(--edge);border-radius:10px;padding:13px 15px;
-  font-family:var(--mono);font-size:11.5px;color:var(--dim);white-space:pre-wrap;word-break:break-all;
+.code{margin:15px 22px;background:#0c1119;border:1px solid var(--edge);border-radius:10px;padding:13px 15px;
+  font-family:var(--mono);font-size:15px;color:var(--dim);white-space:pre-wrap;word-break:break-all;
   max-height:360px;overflow-y:auto}
 
 @media(prefers-reduced-motion:reduce){
@@ -1198,9 +1339,14 @@ tbody tr.click:hover{background:rgba(148,170,220,.06)}
 <div class="jump" id="jump"></div>
 
 <section class="hero">
-  <div class="eyebrow" id="eyebrow"></div>
-  <h1 class="thesis" id="thesis"></h1>
-  <p class="sub" id="subline"></p>
+  <div class="herotop">
+    <div class="herotext">
+      <div class="eyebrow" id="eyebrow"></div>
+      <h1 class="thesis" id="thesis"></h1>
+      <p class="sub" id="subline"></p>
+    </div>
+    <aside class="osdon" id="osdon"></aside>
+  </div>
   <div class="handbar" id="handbar"></div>
   <div class="handkey" id="handkey"></div>
   <div class="deadline">
@@ -1230,7 +1376,14 @@ de: {
   doc_title:'NTLM-Analyzer', h1:'NTLM-Analyzer',
   intro:'Wer im Netzwerk verwendet noch das ältere NTLM-Anmeldeverfahren – und was läuft bereits sicher über Kerberos. Ziel ist, NTLM nach und nach abzulösen.',
   live:'Aktualisiert sich automatisch · zuletzt',
-  leg_goal:'Farbbedeutung', leg_bad:'Rot = unsicher (NTLMv1)', leg_old:'Gelb = veraltet (NTLMv2)', leg_good:'Grün = sicher (Kerberos)',
+  drill_hint:'klicken, um die Ereignisse zu sehen', f_day:'Tag',
+  osbar_lbl:'Agenten nach Betriebssystem', osbar_other:'weitere', osbar_unknown:'unbekannt',
+  ev_capped:'die neuesten {n} geladen',
+  tip_events:'Ereignisse', tip_share:'Anteil', tip_click:'klicken, um danach zu filtern',
+  fl_dom:'Domänenebene', fl_for:'Gesamtstruktur', fl_raw:'Ebene {n}',
+  fl_split_t:'Die Agenten melden unterschiedliche Werte',
+  osdon_mid:'Agenten', osdon_old:'{n} vor Server 2019 – dort fehlen die 40xx-Ereignisse', osbar_tip:'Gezählt werden nur Maschinen mit Agent, nicht die gesamte Domäne',
+  leg_goal:'Farbbedeutung', leg_bad:'NTLMv1 · unsicher', leg_old:'NTLMv2 · veraltet', leg_good:'Kerberos · sicher',
   range:'Zeitraum', r7d:'7 Tage', r30d:'30 Tage', rall:'Alles',
   lab_total:'NTLM gesamt', sub_total:'erfasste Vorgänge', tt_total:'Zählt jedes erfasste Ereignis im gewählten Zeitraum – NTLM, Kerberos und Domänenmeldungen zusammen. Klick zeigt die Liste.',
   lab_v1:'Unsicher', sub_v1:'NTLMv1 – zuerst ablösen', tt_v1:'Zählt Anmeldungen mit NTLMv1: Ereignis 4624 mit Version NTLMv1 sowie 4024/4025 (NTLMv1-SSO). Klick filtert die Liste.',
@@ -1270,7 +1423,7 @@ de: {
   lt11:'Zwischengespeichert interaktiv (gespeicherte Domänenanmeldung)',
   lt12:'Zwischengespeichert remoteinteraktiv', lt13:'Zwischengespeichertes Entsperren',
   btn_exc:'Ausnahmeliste erzeugen', exc_copy:'Kopieren', exc_copied:'Kopiert!',
-  exc_entries:'Einträge (nur offene)', exc_empty:'Keine offenen Einträge – nichts zu tun.',
+  exc_entries:'{n} Einträge (nur offene)', exc_empty:'Keine offenen Einträge – nichts zu tun.',
   exc_gpo_out:'Einfügen in: Netzwerksicherheit: NTLM einschränken: Remoteserverausnahmen für die NTLM-Authentifizierung hinzufügen',
   exc_gpo_dom:'Einfügen in: Netzwerksicherheit: NTLM einschränken: Serverausnahmen in dieser Domäne hinzufügen (auf den DCs)',
   exc_note:'Eine Ausnahme ist ein Aufschub, kein Fix – die Liste weiter abarbeiten.',
@@ -1427,12 +1580,14 @@ de: {
   d_ws:'Arbeitsstation', d_ip:'IP-Adresse', d_lt:'Anmeldetyp',
   d_enc:'Verschlüsselung',
   as_of:'Stand: ',
-  hero_eyebrow:'{m} Agenten · {n} Tage Datenbasis',
+  hero_eyebrow:'{m} {ua} · {n} {ud} Datenbasis',
+  u_agent:'Agent', u_agents:'Agenten', u_day:'Tag', u_days:'Tage',
   hero_thesis:'Noch {p} % aller Anmeldungen <span class="fade">laufen über NTLM.</span>',
   hero_down:'Zu Beginn des Zeitraums waren es {was} %.',
   hero_up:'Zu Beginn waren es {was} % — der Anteil steigt gerade.',
   hero_flat:'Der Anteil bewegt sich im Zeitraum kaum.',
   hero_tail:'{p} Programme und {u} Konten halten den Rest — angeführt von {top}.',
+  hero_tail_nl:'{p} Programme und {u} Konten halten den Rest.',
   hero_ddl_t:'Tage bis Oktober 2026',
   hero_ddl_b:'Dann stellt Windows NTLMv1-SSO standardmäßig auf Blockieren um. Was dann noch NTLMv1 spricht, bricht von selbst.',
   foc_big:'Größter Posten', foc_big_w:'{n}× · {m} Maschinen',
@@ -1445,7 +1600,14 @@ en: {
   doc_title:'NTLM-Analyzer', h1:'NTLM-Analyzer',
   intro:'Who on the network still uses the legacy NTLM authentication – and what already runs securely over Kerberos. The goal is to phase NTLM out step by step.',
   live:'Refreshes automatically · last',
-  leg_goal:'Color legend', leg_bad:'Red = insecure (NTLMv1)', leg_old:'Yellow = outdated (NTLMv2)', leg_good:'Green = secure (Kerberos)',
+  drill_hint:'click to see the events', f_day:'Day',
+  osbar_lbl:'Agents by OS', osbar_other:'others', osbar_unknown:'unknown',
+  ev_capped:'newest {n} loaded',
+  tip_events:'Events', tip_share:'Share', tip_click:'click to filter by this',
+  fl_dom:'Domain level', fl_for:'Forest level', fl_raw:'level {n}',
+  fl_split_t:'Agents report different values',
+  osdon_mid:'agents', osdon_old:'{n} predate Server 2019 – no 40xx events there', osbar_tip:'Counts reporting machines only, not the whole domain',
+  leg_goal:'Color legend', leg_bad:'NTLMv1 · insecure', leg_old:'NTLMv2 · outdated', leg_good:'Kerberos · secure',
   range:'Time range', r7d:'7 days', r30d:'30 days', rall:'All',
   lab_total:'NTLM total', sub_total:'recorded events', tt_total:'Counts every recorded event in the selected range - NTLM, Kerberos and domain reports combined. Click shows the list.',
   lab_v1:'Insecure', sub_v1:'NTLMv1 – replace first', tt_v1:'Counts NTLMv1 logons: event 4624 with version NTLMv1 plus 4024/4025 (NTLMv1 SSO). Click filters the list.',
@@ -1485,7 +1647,7 @@ en: {
   lt11:'Cached interactive (stored domain logon)',
   lt12:'Cached remote interactive', lt13:'Cached unlock',
   btn_exc:'Generate exception list', exc_copy:'Copy', exc_copied:'Copied!',
-  exc_entries:'entries (open items only)', exc_empty:'No open items - nothing to do.',
+  exc_entries:'{n} entries (open items only)', exc_empty:'No open items - nothing to do.',
   exc_gpo_out:'Paste into: Network security: Restrict NTLM: Add remote server exceptions for NTLM authentication',
   exc_gpo_dom:'Paste into: Network security: Restrict NTLM: Add server exceptions in this domain (on the DCs)',
   exc_note:'An exception is a stay of execution, not a fix - keep working the list down.',
@@ -1642,12 +1804,14 @@ en: {
   d_ws:'Workstation', d_ip:'IP address', d_lt:'Logon type',
   d_enc:'Encryption',
   as_of:'As of: ',
-  hero_eyebrow:'{m} agents · {n} days of data',
+  hero_eyebrow:'{m} {ua} · {n} {ud} of data',
+  u_agent:'agent', u_agents:'agents', u_day:'day', u_days:'days',
   hero_thesis:'Still {p} % of all logons <span class="fade">go through NTLM.</span>',
   hero_down:'At the start of the period it was {was} %.',
   hero_up:'It was {was} % at the start — the share is rising.',
   hero_flat:'The share has barely moved over the period.',
   hero_tail:'{p} programs and {u} accounts hold the rest — led by {top}.',
+  hero_tail_nl:'{p} programs and {u} accounts hold the rest.',
   hero_ddl_t:'days until October 2026',
   hero_ddl_b:'Windows then switches NTLMv1 SSO to blocking by default. Whatever still speaks NTLMv1 breaks on its own.',
   foc_big:'Largest item', foc_big_w:'{n}× · {m} machines',
@@ -1680,11 +1844,17 @@ const KINDK = {outgoing:'b_out', incoming:'b_dom', domain:'b_dom', auth:'b_fb', 
   krbfail:'b_krbfail', cgblock:'b_cg', ntlmv1sso:'b_deadline', policyblock:'b_policyblock',
   policywarn:'b_policywarn', secblock:'b_secblock'};
 const kindName = k => I18N[LANG][KINDK[k]] ? t(KINDK[k]) : k;
+// DATA.heat rows run Monday..Sunday - the server rotates strftime's %w,
+// which is Sunday-first. DN() is Sunday-first too, so every read of a heat
+// row index has to be converted or the whole grid sits one day off.
+const HW = i => (i + 1) % 7;          // heat row index -> strftime %w
 const DN = () => LANG === 'de' ? ['So','Mo','Di','Mi','Do','Fr','Sa']
                                : ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
 
 // ---- Zustand -------------------------------------------------------------
-const S = {range:'30d', mach:'', hideDone:false, q:'', kind:'', acct:'all', shown:60};
+const S = {range:'30d', mach:'', hideDone:false, q:'', kind:'', acct:'all', shown:60,
+           bucket:'', wd:'', hr:'', pick:'', rsn:''};
+           // bucket/wd/hr: drill-down from the charts, pick: from the handover bar
 let DATA = null, TIMER = null;
 
 function params(extra){
@@ -1692,6 +1862,22 @@ function params(extra){
   p.set('range', S.range);
   if(S.mach) p.set('source', S.mach);
   p.set('tzoff', String(TZOFF()));
+  // A weekday of 0 (Sunday) and hour 0 are falsy but perfectly valid, so these
+  // are tested against '' rather than for truthiness.
+  if(S.bucket) p.set('bucket', S.bucket);
+  if(S.wd !== '') p.set('wd', S.wd);
+  if(S.hr !== '') p.set('hr', S.hr);
+  if(S.bucket || S.wd !== '' || S.hr !== '') p.set('nokrb', '1');
+  // The bar counts ntlm_version for the two NTLM slices and kind for Kerberos -
+  // the filter has to use the same columns or the row count would not match.
+  // A reason filter and a version filter would both want the 'kind' parameter,
+  // so they are mutually exclusive - selecting one clears the other.
+  if(S.rsn){
+    if(S.rsn.charAt(0) === 'k'){ p.set('kind', 'krbfail'); p.set('fcode', S.rsn.slice(1)); }
+    else p.set('rid', S.rsn);
+  }
+  else if(S.pick === 'kerberos') p.set('kind', 'kerberos');
+  else if(S.pick) p.set('version', S.pick);
   if(extra) for(const k in extra) if(extra[k]) p.set(k, extra[k]);
   return p;
 }
@@ -1715,6 +1901,25 @@ const CARD = (id, title, flag, meta, body, cls, extra) =>
   '<section class="card ' + (cls || '') + '" id="' + id + '"><div class="ch"><h2>' + esc(title) + '</h2>' +
   (flag ? '<span class="flag ' + (flag[1] || '') + '">' + esc(flag[0]) + '</span>' : '') +
   (extra || '') + (meta ? '<span class="meta">' + esc(meta) + '</span>' : '') + '</div>' + body + '</section>';
+// SQLite's GROUP_CONCAT(DISTINCT ...) cannot take a separator, so these lists
+// arrive as "a,b,c" with no spaces - a wall of text in a wide column. Split
+// them, show the first few and count the rest; the full list stays in the
+// tooltip so nothing is lost.
+function nameList(v, max){
+  const all = String(v == null ? '' : v).split(',').map(x => x.trim()).filter(Boolean);
+  if(!all.length) return '<span class="dm">\u2013</span>';
+  const show = all.slice(0, max || 3), rest = all.length - show.length;
+  return '<span title="' + esc(all.join(', ')) + '">' + esc(show.join(', ')) +
+    (rest ? '<span class="restn">+' + rest + '</span>' : '') + '</span>';
+}
+// Encryption types arrive concatenated too. Each gets its own chip, and a weak
+// one (RC4/DES) is coloured as a finding instead of hiding in a list.
+function encTags(v){
+  const all = String(v == null ? '' : v).split(',').map(x => x.trim()).filter(Boolean);
+  if(!all.length) return '<span class="dm">\u2013</span>';
+  return all.slice(0, 3).map(e => tag(/RC4|DES/i.test(e) ? 'v2' : 'krb', e)).join(' ') +
+    (all.length > 3 ? '<span class="restn">+' + (all.length - 3) + '</span>' : '');
+}
 const stSel = (key, st) => '<select class="sel-st" data-key="' + esc(key) + '" onclick="event.stopPropagation()">' +
   ['offen','arbeit','erledigt'].map(v => '<option value="' + v + '"' +
     ((st || 'offen') === v ? ' selected' : '') + '>' + esc(t('st_' + v)) + '</option>').join('') + '</select>';
@@ -1762,13 +1967,152 @@ function renderChrome(){
   document.querySelectorAll('#lang button').forEach(b =>
     b.setAttribute('aria-pressed', b.dataset.l === LANG));
 }
+// A non-zero share must never print as "0.0 %" - that reads as nothing at all.
+function pctTxt(n, tot){
+  if(!tot || !n) return '0 %';
+  const p = n / tot * 100;
+  return p < 0.1 ? '<0.1 %' : p.toFixed(1) + ' %';
+}
+// Hover card for the handover bar. One card is reused and moved rather than
+// one per segment, so nothing accumulates in the DOM on re-render. It follows
+// the segment centre and is clamped to the bar so a slice at either end does
+// not push it off screen.
+function segTip(sg){
+  const bar = $('#handbar'), tip = $('#segtip');
+  if(!bar || !tip) return;
+  if(!sg){ tip.classList.remove('on'); return; }
+  const bw = bar.clientWidth;
+  const r = sg.getBoundingClientRect(), br = bar.getBoundingClientRect();
+  tip.innerHTML =
+    '<div class="th"><i style="background:var(' + esc(sg.dataset.col) + ')"></i>' +
+      esc(sg.dataset.nm) + '</div>' +
+    '<div class="tr">' + esc(t('tip_events')) + '<b>' +
+      Number(sg.dataset.n).toLocaleString(LANG === 'de' ? 'de-DE' : 'en-GB') + '</b></div>' +
+    '<div class="tr">' + esc(t('tip_share')) + '<b>' + esc(sg.dataset.pc) + '</b></div>' +
+    '<div class="tf">' + esc(t('tip_click')) + '</div>';
+  const mid = r.left - br.left + r.width / 2;
+  tip.style.left = Math.max(90, Math.min(bw - 90, mid)) + 'px';
+  tip.classList.add('on');
+}
+// After a drill-down the events panel is what the user wants to look at.
+function goEvents(){
+  const el = document.getElementById('sec-events');
+  if(el) el.scrollIntoView({behavior:'smooth', block:'start'});
+}
+// A light touch of inventory context. This counts the machines that report
+// in, not every server in the domain - the note under the ring says so, because
+// "3 x Server 2025" in a header otherwise reads as a domain-wide census.
+const OS_FAM = v => {
+  const s = String(v || '');
+  let m = s.match(/Windows Server\s+(\d{4}(?:\s*R2)?)/i);
+  if(m) return 'Server ' + m[1].replace(/\s+/g, ' ');
+  m = s.match(/Windows\s+(11|10|8\.1|7)\b/i);
+  if(m) return 'Windows ' + m[1];
+  return s ? t('osbar_unknown') : '';
+};
+// Colour by age rather than by arbitrary hue: green is current, amber is
+// getting on, red predates the 40xx auditing events entirely - which is
+// exactly the group whose NTLM traffic is hardest to see.
+const OS_COL = f => {
+  if(/^Server 2025/.test(f))             return '#3ddc97';
+  if(/^Windows 11/.test(f))              return '#7ce0bd';   // current, but a client
+  if(/^Server 2022/.test(f))             return '#5ec8c0';
+  if(/^Server 2019/.test(f))             return '#6f9fd8';
+  if(/^Windows 10/.test(f))              return '#9a8fc0';
+  if(/^Server 2016/.test(f))             return '#f5b841';
+  if(/^Server (2012|2008|2003)/.test(f)) return '#ff6b6b';
+  return '#4a5872';
+};
+const OS_OLD = f => /^Server (2003|2008|2012|2016)/.test(f);
+
+// msDS-Behavior-Version -> product name. Mapped in the collector, not the
+// agent: Microsoft adds levels over time, and a value we do not know yet should
+// still show as "Level 11" rather than disappear. 8 and 9 were never used -
+// Server 2019 and 2022 introduced no new functional level.
+const FL_NAME = {'0':'2000', '1':'2003 interim', '2':'2003', '3':'2008',
+                 '4':'2008 R2', '5':'2012', '6':'2012 R2', '7':'2016', '10':'2025'};
+const flText = v => {
+  if(v === null || v === undefined || v === '') return null;
+  const n = FL_NAME[String(v)];
+  return n ? 'Server ' + n : t('fl_raw', {n: v});
+};
+// A functional level is a property of the domain, not of one machine, so all
+// agents should report the same value. Take the most common one and flag a
+// disagreement rather than silently picking a winner.
+function levelOf(field){
+  const seen = {};
+  (DATA.agents || []).forEach(a => { const v = a[field];
+    if(v !== null && v !== undefined && v !== '') seen[v] = (seen[v] || 0) + 1; });
+  const rows = Object.entries(seen).sort((a, b) => b[1] - a[1]);
+  if(!rows.length) return null;
+  return {val: rows[0][0], split: rows.length > 1};
+}
+function renderOsDonut(){
+  const el = $('#osdon'); if(!el) return;
+  const tally = {};
+  (DATA.agents || []).forEach(a => { const f = OS_FAM(a.os_version); if(f) tally[f] = (tally[f] || 0) + 1; });
+  let rows = Object.entries(tally).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+  const total = rows.reduce((n, r) => n + r[1], 0);
+  // Count the ageing builds before folding small slices away, otherwise a
+  // Server 2016 swallowed by "other" would drop out of the warning.
+  const old = rows.filter(r => OS_OLD(r[0])).reduce((n, r) => n + r[1], 0);
+  if(!total){ el.innerHTML = ''; return; }
+  // A ring stops being readable past a handful of slices, so anything beyond
+  // the top five is folded into one - the machines panel has the full list.
+  if(rows.length > 6){
+    const rest = rows.slice(5).reduce((n, r) => n + r[1], 0);
+    rows = rows.slice(0, 5).concat([[t('osbar_other'), rest]]);
+  }
+  const R = 46, C = 2 * Math.PI * R;
+  let off = 0;
+  const arcs = rows.map(r => {
+    const len = r[1] / total * C;
+    const seg = '<circle cx="60" cy="60" r="' + R + '" fill="none" stroke="' + OS_COL(r[0]) +
+      '" stroke-width="17" stroke-dasharray="' + len.toFixed(2) + ' ' + (C - len).toFixed(2) +
+      '" stroke-dashoffset="' + (-off).toFixed(2) + '" transform="rotate(-90 60 60)">' +
+      '<title>' + esc(r[0] + ' \u00b7 ' + r[1] + ' \u00b7 ' +
+        (r[1] / total * 100).toFixed(0) + ' %') + '</title></circle>';
+    off += len;
+    return seg;
+  }).join('');
+  el.innerHTML =
+    '<div class="oh">' + esc(t('osbar_lbl')) + '</div>' +
+    '<div class="ow"><svg class="ring" width="120" height="120" viewBox="0 0 120 120">' +
+      '<circle cx="60" cy="60" r="' + R + '" fill="none" stroke="rgba(158,180,225,.09)" stroke-width="17"/>' +
+      arcs +
+      '<text class="mid" x="60" y="58" text-anchor="middle" font-size="26">' + total + '</text>' +
+      '<text class="midl" x="60" y="76" text-anchor="middle" font-size="11">' +
+        esc(t('osdon_mid')) + '</text>' +
+    '</svg><div class="leg">' +
+      rows.map(r => '<div class="lr" title="' + esc(r[0]) + '">' +
+        '<i style="background:' + OS_COL(r[0]) + '"></i><b>' + r[1] + '</b>' + esc(r[0]) + '</div>').join('') +
+    '</div></div>' +
+    '<div class="note">' + esc(old ? t('osdon_old', {n: old}) : t('osbar_tip')) + '</div>' +
+    levelRow();
+}
+// Domain and forest functional level, shown once - it describes the directory,
+// not any single machine.
+function levelRow(){
+  const d = levelOf('domain_level'), f = levelOf('forest_level');
+  if(!d && !f) return '';
+  const cell = (lbl, x) => {
+    if(!x) return '';
+    const txt = flText(x.val) || '\u2013';
+    return '<div class="flr"><span>' + esc(lbl) + '</span><b>' + esc(txt) + '</b>' +
+      (x.split ? '<em title="' + esc(t('fl_split_t')) + '">!</em>' : '') + '</div>';
+  };
+  return '<div class="fl">' + cell(t('fl_dom'), d) + cell(t('fl_for'), f) + '</div>';
+}
 function renderHero(){
   // stats.total counts every stored event, stats.krb counts Kerberos SERVICES.
   // The share has to compare NTLM events against Kerberos TICKETS.
   const st = DATA.stats, krb = st.krb_ev || 0, ntlm = Math.max(0, st.total - krb);
   const pct = (ntlm + krb) ? Math.round(ntlm / (ntlm + krb) * 100) : 0;
+  const nAg = (DATA.agents || []).length, nDay = st.coverage_days;
   $('#eyebrow').textContent = t('hero_eyebrow',
-    {m: (DATA.agents || []).length, n: st.coverage_days});
+    {m: nAg, n: nDay,
+     ua: t(nAg === 1 ? 'u_agent' : 'u_agents'),
+     ud: t(nDay === 1 ? 'u_day' : 'u_days')});
   $('#thesis').innerHTML = t('hero_thesis').replace('{p}', '<span class="big" id="pct">0</span>');
   const tr = DATA.trend || [];
   let was = pct;
@@ -1781,15 +2125,57 @@ function renderHero(){
   const top = (DATA.blockers || [])[0];
   $('#subline').textContent =
     t(was > pct ? 'hero_down' : was < pct ? 'hero_up' : 'hero_flat', {was: was}) + ' ' +
-    t('hero_tail', {p: st.procs, u: (DATA.v1_users || []).length, top: top ? top.process : '\u2013'});
+    (top && top.process && top.process !== '-' && top.process !== '(unknown)'
+      ? t('hero_tail', {p: st.procs, u: (DATA.v1_users || []).length, top: top.process})
+      : t('hero_tail_nl', {p: st.procs, u: (DATA.v1_users || []).length}));
   const tot = st.v1 + st.v2 + krb || 1;
-  $('#handbar').innerHTML = [['s1', st.v1, 'NTLMv1'], ['s2', st.v2, 'NTLMv2'], ['s3', krb, 'Kerberos']]
-    .map(x => '<div class="seg ' + x[0] + '" data-w="' + (x[1] / tot * 100).toFixed(1) +
-      '"><b>' + x[2] + ' &middot; ' + x[1] + '</b></div>').join('');
+  // A segment below ~8 % is too narrow for its label - the text would be
+  // clipped mid-word. Hide the in-segment label there; the counts are always
+  // readable in the legend underneath, and the tooltip still has them.
+  // A share of zero gets no segment at all - an empty coloured block would
+  // claim the reader's attention for something that is not there. Segments
+  // that do carry a value keep a minimum width (class "has") so a one-percent
+  // share stays visible and its label is never cut mid-word: full
+  // "name · count" where it fits, the bare count in a middle band, nothing
+  // below that. The legend underneath and the tooltip always carry the number.
+  // The bar is the picture; the readout underneath is the text. In a healthy
+  // domain NTLMv1 is the smallest slice by far - exactly the one that matters
+  // most - so putting names inside the segments guarantees the important one
+  // goes unlabelled. Labels live in the readout, which always lists all three.
+  // A segment only carries text when it is comfortably wide.
+  // Every colour carries its own name, always - a slice you cannot read is a
+  // slice you cannot act on. Narrow segments are widened to fit their label via
+  // a min-width computed from the text, and the wide one shrinks to make room.
+  // That trades a little geometric accuracy for legibility, so the label spells
+  // out the true share and the readout underneath repeats it exactly.
+  // No text inside the segments at all. Squeezing a label into a 1 % slice was
+  // the source of every layout problem this bar has had - clipped words, then
+  // widened slices that misstated the proportions. The bar is now purely the
+  // picture; detail appears on hover, and the readout underneath always carries
+  // the numbers. Nothing has to fit anywhere any more.
+  $('#handbar').innerHTML =
+    [['s1', st.v1, 'NTLMv1', 'NTLMv1', '--v1'], ['s2', st.v2, 'NTLMv2', 'NTLMv2', '--v2'],
+     ['s3', krb, 'Kerberos', 'kerberos', '--krb']]
+    .filter(x => x[1] > 0)
+    .map(x => '<div class="seg has ' + x[0] + (S.pick === x[3] ? ' on' : '') +
+      '" tabindex="0" role="button"' +
+      ' data-w="' + (x[1] / tot * 100).toFixed(1) + '"' +
+      ' data-pick="' + esc(x[3]) + '" data-nm="' + esc(x[2]) + '"' +
+      ' data-n="' + x[1] + '" data-pc="' + esc(pctTxt(x[1], tot)) + '"' +
+      ' data-col="' + x[4] + '"' +
+      ' aria-label="' + esc(x[2] + ' ' + x[1] + ' ' + pctTxt(x[1], tot)) + '"></div>').join('') +
+    '<div class="segtip" id="segtip" aria-hidden="true"></div>';
   setTimeout(function(){ document.querySelectorAll('.seg').forEach(function(s){
-    s.style.width = s.dataset.w + '%'; s.querySelector('b').style.opacity = 1; }); }, 100);
-  $('#handkey').innerHTML = [['--v1', 'leg_bad'], ['--v2', 'leg_old'], ['--krb', 'leg_good']]
-    .map(x => '<span><i style="background:var(' + x[0] + ')"></i>' + esc(t(x[1])) + '</span>').join('');
+    s.style.width = s.dataset.w + '%';
+    const b = s.querySelector('b'); if(b) b.style.opacity = 1; }); }, 100);
+  // Always all three, including a zero - "NTLMv1 0" is a result worth reading,
+  // and a category that silently vanishes reads as a rendering fault.
+  $('#handkey').innerHTML = [['--v1', 'leg_bad', st.v1], ['--v2', 'leg_old', st.v2],
+      ['--krb', 'leg_good', krb]]
+    .map(x => '<span class="kk' + (x[2] ? '' : ' nil') + '">' +
+      '<i style="background:var(' + x[0] + ')"></i>' +
+      '<b>' + x[2] + '</b><em>' + pctTxt(x[2], tot) + '</em>' +
+      esc(t(x[1])) + '</span>').join('');
   $('#ddl_t').textContent = t('hero_ddl_t');
   $('#ddl_b').textContent = t('hero_ddl_b');
   countTo($('#pct'), pct);
@@ -1810,9 +2196,10 @@ function renderFocus(){
     esc(t('foc_due_w', {n: v1u[0].n})) + '</div></button>');
   let pd = -1, ph = 0, pv = 0;
   (DATA.heat || []).forEach((row, d) => row.forEach((v, h) => { if(v > pv){ pv = v; pd = d; ph = h; } }));
-  if(pd >= 0 && (pd === 0 || pd === 6 || ph < 6 || ph > 19))
+  // HW(pd) is the real weekday: 0 Sunday, 6 Saturday.
+  if(pd >= 0 && (HW(pd) === 0 || HW(pd) === 6 || ph < 6 || ph > 19))
     out.push('<button class="fc" data-go="sec-heat"><div class="k">' + esc(t('foc_odd')) +
-      '</div><div class="v">' + esc(DN()[pd] + ', ' + String(ph).padStart(2, '0') + ':00') +
+      '</div><div class="v">' + esc(DN()[HW(pd)] + ', ' + String(ph).padStart(2, '0') + ':00') +
       '</div><div class="w">' + esc(t('foc_odd_w', {n: pv})) + '</div></button>');
   $('#focus').innerHTML = out.join('');
 }
@@ -1824,7 +2211,8 @@ function secTrend(){
     emptyBox(t('trend_empty'), ''), 'c2');
   const mx = Math.max.apply(null, tr.map(b => b.v1 + b.v2 + b.other)) || 1;
   const body = '<div class="blocks">' + tr.map(b =>
-    '<div class="bcol" title="' + esc(b.b + ' \u00b7 ' + (b.v1 + b.v2 + b.other)) + '">' +
+    '<div class="bcol' + (S.bucket === b.b ? ' on' : '') + '" data-bucket="' + esc(b.b) +
+    '" title="' + esc(b.b + ' \u00b7 ' + (b.v1 + b.v2 + b.other) + ' \u2013 ' + t('drill_hint')) + '">' +
     '<span data-h="' + (b.other / mx * 100) + '" style="height:0;background:var(--grey)"></span>' +
     '<span data-h="' + (b.v2 / mx * 100) + '" style="height:0;background:var(--v2)"></span>' +
     '<span data-h="' + (b.v1 / mx * 100) + '" style="height:0;background:var(--v1)"></span></div>').join('') +
@@ -1843,7 +2231,7 @@ function secPrograms(){
       (/\d+\.\d+\.\d+\.\d+/.test(b.target || '') ? ' ' + tag('v1', t('b_ip')) : '') + '</td>' +
       '<td class="r">' + b.n + (b.blocked ? ' ' + tag('v1', b.blocked) : '') + '</td>' +
       '<td>' + spark((DATA.spark || {})[b.process]) + '</td>' +
-      '<td class="dm mn">' + esc(b.who || '\u2013') + '</td>' +
+      '<td class="dm">' + nameList(b.who, 3) + '</td>' +
       '<td>' + stSel(b.key, b.st) + '</td></tr>').join(''))
     : emptyBox(t('empty_blockers'), '');
   return CARD('sec-programs', t('prog_h'), [t('nav_label')], t('exc_entries', {n: bl.length}),
@@ -1867,21 +2255,25 @@ function secHeat(){
 }
 function fillHeat(){
   const el = $('#hm'); if(!el) return;
-  const g = DATA.heat || [], names = DN(), ord = [1,2,3,4,5,6,0];
+  const g = DATA.heat || [], names = DN();
   let mx = 0; g.forEach(r => r.forEach(v => { if(v > mx) mx = v; })); mx = mx || 1;
   let h = '<div class="hr"><div></div>';
   for(let i = 0; i < 24; i++) h += '<div class="lb" style="text-align:center">' + (i % 6 === 0 ? i : '') + '</div>';
   h += '</div>';
-  ord.forEach(d => { h += '<div class="hr"><div class="lb">' + names[d] + '</div>';
+  for(let d = 0; d < 7; d++){ const wd = HW(d);
+    h += '<div class="hr"><div class="lb">' + names[wd] + '</div>';
     for(let x = 0; x < 24; x++){ const n = (g[d] && g[d][x]) || 0, v = n / mx;
-      h += '<div class="hc" title="' + names[d] + ' ' + x + ':00 \u00b7 ' + n + '"' +
+      h += '<div class="hc' + (String(S.wd) === String(wd) && String(S.hr) === String(x) ? ' on' : '') +
+        '" data-wd="' + wd + '" data-hr="' + x +
+        '" title="' + names[wd] + ' ' + x + ':00 \u00b7 ' + n +
+        (n ? ' \u2013 ' + esc(t('drill_hint')) : '') + '"' +
         (v ? ' style="background:rgba(' + Math.round(190 + v * 65) + ',' + Math.round(120 - v * 13) +
           ',' + Math.round(95 - v * 30) + ',' + (0.22 + v * 0.72) + ')"' : '') + '></div>'; }
-    h += '</div>'; });
+    h += '</div>'; }
   let pd = 0, ph = 0, pv = 0;
   g.forEach((r, d) => r.forEach((v, x) => { if(v > pv){ pv = v; pd = d; ph = x; } }));
   el.innerHTML = h + (pv ? '<div class="hnote">' + t('heat_peak',
-    {d: names[pd], h: String(ph).padStart(2, '0'), n: pv}) + '</div>' : '');
+    {d: names[HW(pd)], h: String(ph).padStart(2, '0'), n: pv}) + '</div>' : '');
   if(!calm && window.IntersectionObserver){
     new IntersectionObserver(function(es, o){ es.forEach(function(e){ if(!e.isIntersecting) return;
       el.querySelectorAll('.hc').forEach(function(c, i){ setTimeout(function(){ c.classList.add('in'); }, i * 3); });
@@ -1891,7 +2283,9 @@ function fillHeat(){
 function secWhy(){
   const rs = DATA.reasons || [];
   const body = rs.length ? tbl([[t('th_reason')], [t('th_fix')], [t('th_count2'), 'r']],
-    rs.map(r => '<tr><td class="nm">' + esc(t('rid_' + r.rid)) + '</td>' +
+    rs.map(r => '<tr class="click' + (S.rsn === r.rid ? ' on' : '') +
+      '" data-rsn="' + esc(r.rid) + '" title="' + esc(t('drill_hint')) + '">' +
+      '<td class="nm">' + esc(t('rid_' + r.rid)) + '</td>' +
       '<td class="dm">' + esc(t('fix_' + r.cat)) + '</td><td class="r">' + r.n + '</td></tr>').join(''))
     : emptyBox(t('empty_events'), '');
   return CARD('sec-why', t('why_h'), [t('nav_label')], '', body);
@@ -1902,7 +2296,7 @@ function secDomain(){
       [t('th_count3'), 'r'], [t('th_last')]],
     d.slice(0, 40).map(x => '<tr class="click" data-q="' + esc(x.workstation) + '">' +
       '<td class="nm">' + esc(x.workstation) + '</td><td class="mn dm">' + esc(x.target) + '</td>' +
-      '<td class="dm mn">' + esc(x.who || '\u2013') + '</td><td class="r">' + x.n + '</td>' +
+      '<td class="dm">' + nameList(x.who, 3) + '</td><td class="r">' + x.n + '</td>' +
       '<td class="mn dm">' + when(x.last_seen) + '</td></tr>').join(''))
     : emptyBox(t('empty_domain'), '');
   return CARD('sec-domain', t('dom_h'), [t('nav_label')], String(d.length), body, 'c2');
@@ -1912,7 +2306,7 @@ function secIncoming(){
   const body = i.length ? tbl([[t('th_machine')], [t('th_service')], [t('th_count4'), 'r'],
       [t('th_accounts'), 'r']],
     i.map(x => '<tr class="click" data-mach="' + esc(x.machine) + '"><td class="nm">' + esc(x.machine) +
-      '</td><td class="mn dm">' + esc(x.process) + '</td><td class="r">' + x.n + '</td>' +
+      '</td><td class="dm">' + esc(x.process) + '</td><td class="r">' + x.n + '</td>' +
       '<td class="r dm">' + x.users + '</td></tr>').join(''))
     : emptyBox(t('empty_events'), '');
   return CARD('sec-incoming', t('inc_h'), [t('nav_label')], String(i.length), body);
@@ -1930,8 +2324,7 @@ function secKrb(){
   const k = DATA.kerberos || [];
   const body = k.length ? tbl([[t('th_service')], [t('th_count6'), 'r'], [t('th_enc')]],
     k.map(x => '<tr><td class="mn"><span class="cut">' + esc(x.service) + '</span></td>' +
-      '<td class="r">' + x.n + '</td><td>' + tag(/RC4|DES/i.test(x.enc || '') ? 'v2' : 'krb',
-        x.enc || '\u2013') + '</td></tr>').join(''))
+      '<td class="r">' + x.n + '</td><td>' + encTags(x.enc) + '</td></tr>').join(''))
     : emptyBox(t('empty_krb'), '');
   return CARD('sec-kerberos', t('krb_h'), [t('leg_good'), 'ok'], '', body);
 }
@@ -1941,7 +2334,7 @@ function secKrbAcc(){
     k.slice(0, 12).map(x => '<tr class="click" data-q="' + esc(x.account) + '">' +
       '<td class="mn"><span class="cut">' + esc(x.account) + '</span></td>' +
       '<td class="r dm">' + x.svc_count + '</td><td class="r">' + x.n + '</td>' +
-      '<td>' + tag(/RC4|DES/i.test(x.enc || '') ? 'v2' : 'krb', x.enc || '\u2013') + '</td></tr>').join(''))
+      '<td>' + encTags(x.enc) + '</td></tr>').join(''))
     : emptyBox(t('empty_krba'), '');
   return CARD('sec-kacc', t('krba_h'), [t('leg_good'), 'ok'], '', body);
 }
@@ -1963,7 +2356,7 @@ function secAgents(){
         : lm && +lm >= 4 ? tag('v2', t('oct_aff')) : tag('n', t('oct_unk'));
       return '<tr class="click" data-mach="' + esc(m.source) + '"><td class="nm">' + esc(m.source) +
         ' ' + (m.is_dc ? tag('n', t('type_dc')) : '') + '</td>' +
-        '<td class="mn dm">' + esc(m.os_version || '\u2013') +
+        '<td class="dm">' + esc(m.os_version || '\u2013') +
         (m.os_version && !/2600\d|2[6-9]\d{3}/.test(m.os_version) ? ' ' + tag('n', t('b_os_old')) : '') + '</td>' +
         '<td>' + (au.join(' ') || '<span class="dm">\u2013</span>') + '</td>' +
         '<td>' + (lm ? tag(+lm >= 5 ? 'krb' : +lm >= 3 ? 'v2' : 'v1', lm) : '<span class="dm">\u2013</span>') + '</td>' +
@@ -1971,10 +2364,10 @@ function secAgents(){
         '<td class="mn dm">' + when(m.last_seen) + '</td></tr>'; }).join(''))
     : emptyBox(t('empty_agents'), '');
   return CARD('sec-agents', t('ag_h'), null,
-    t('cov_ok', {n: DATA.stats.coverage_days}), body, 'c2');
+    t('cov_ok', {d: DATA.stats.coverage_days}), body, 'c2');
 }
 function secEvents(){
-  return CARD('sec-events', t('ev_h'), null, '<span id="evmeta"></span>',
+  return CARD('sec-events', t('ev_h'), null, '\u2013',
     '<div class="bar"><input class="search" id="q" placeholder="' + esc(t('search_ph')) + '">' +
     '<div class="chipset" id="kinds"></div></div><div class="active" id="active"></div>' +
     '<div id="events"></div>', 'call');
@@ -1987,7 +2380,13 @@ function renderEvents(){
     (S.acct === 'all' || (S.acct === 'comp') === /\$/.test(e.user || '')) &&
     (!ql || [e.user, e.process, e.target_server, e.workstation, e.source, e.process_path]
       .join(' ').toLowerCase().indexOf(ql) >= 0));
-  const m = $('#evmeta'); if(m) m.textContent = list.length + ' / ' + all.length;
+  const m = document.querySelector('#sec-events .meta');
+  if(m){
+    const found = DATA.events_total !== undefined ? DATA.events_total : all.length;
+    const capped = all.length < found;
+    m.textContent = list.length + ' / ' + found.toLocaleString(LANG === 'de' ? 'de-DE' : 'en-GB') +
+      (capped ? ' \u2013 ' + t('ev_capped', {n: DATA.events_limit}) : '');
+  }
   const kinds = [''].concat(Object.keys(KINDC).filter(k => all.some(e => e.kind === k)));
   $('#kinds').innerHTML = kinds.map(k => '<button class="chip" data-k="' + k + '" aria-pressed="' +
     (S.kind === k) + '">' + esc(k ? kindName(k) : t('f_all')) + '</button>').join('') +
@@ -1998,6 +2397,14 @@ function renderEvents(){
   if(S.q) act.push(['q', t('search_ph').split(':')[0] + ': ' + S.q]);
   if(S.kind) act.push(['kind', kindName(S.kind)]);
   if(S.mach) act.push(['mach', S.mach]);
+  if(S.rsn) act.push(['rsn', t('rid_' + S.rsn)]);
+  if(S.pick) act.push(['pick', S.pick === 'kerberos' ? 'Kerberos' : S.pick]);
+  if(S.bucket) act.push(['bucket', t('f_day') + ': ' + S.bucket]);
+  if(S.wd !== '' || S.hr !== ''){
+    const nm = DN();
+    act.push(['when', (S.wd !== '' ? nm[+S.wd] + ' ' : '') +
+                      (S.hr !== '' ? String(S.hr).padStart(2, '0') + ':00' : '')]);
+  }
   $('#active').innerHTML = act.length ? act.map(a => '<span class="afl">' + esc(a[1]) +
     '<button data-clr="' + a[0] + '">&times;</button></span>').join('') +
     '<button class="clearall" data-clr="all">' + esc(t('again')) + '</button>' : '';
@@ -2009,9 +2416,9 @@ function renderEvents(){
       '<td>' + tag(KINDC[e.kind] || 'n', kindName(e.kind)) +
         (e.ntlm_version ? ' ' + tag(e.ntlm_version === 'NTLMv1' ? 'v1' : 'v2', e.ntlm_version) : '') + '</td>' +
       '<td>' + esc(e.user || '\u2013') + '</td>' +
-      '<td class="mn dm">' + esc(e.process || '\u2013') + '</td>' +
+      '<td class="dm">' + esc(e.process || '\u2013') + '</td>' +
       '<td class="mn dm"><span class="cut">' + esc(e.target_server || e.workstation || '\u2013') + '</span></td>' +
-      '<td class="mn dm">' + esc(e.source) + '</td>' +
+      '<td class="dm">' + esc(e.source) + '</td>' +
       '<td class="r dm">' + e.event_id + '</td></tr>').join('')) +
     (list.length > S.shown ? '<button class="more" id="more">' + esc(t('more')) + '</button>' : '');
   window.__EVLIST = list;
@@ -2086,7 +2493,7 @@ const closeDrawer = () => { $('#drawer').classList.remove('on'); $('#scrim').cla
 // ---- Zeichnen ------------------------------------------------------------
 function render(){
   if(!DATA) return;
-  renderChrome(); renderHero(); renderFocus();
+  renderChrome(); renderOsDonut(); renderHero(); renderFocus();
   $('#grid').innerHTML = [secTrend(), secPrograms(), secTargets(), secV1(), secHeat(), secWhy(),
     secDomain(), secIncoming(), secSso(), secKrb(), secKrbAcc(), secAgents(), secEvents()].join('');
   fillHeat(); renderEvents(); renderJump();
@@ -2124,9 +2531,46 @@ document.addEventListener('click', function(ev){
   if(evrow){ openEvent(+evrow.dataset.ev); return; }
   const clr = el.closest('[data-clr]');
   if(clr){ const k = clr.dataset.clr;
-    if(k === 'all'){ S.q = ''; S.kind = ''; S.mach = ''; load(); }
+    if(k === 'all'){ S.q = ''; S.kind = ''; S.mach = ''; S.bucket = ''; S.wd = ''; S.hr = '';
+      S.pick = ''; S.rsn = ''; load(); }
+    else if(k === 'pick'){ S.pick = ''; load(); }
+    else if(k === 'rsn'){ S.rsn = ''; load(); }
     else if(k === 'mach'){ S.mach = ''; load(); }
+    else if(k === 'bucket'){ S.bucket = ''; load(); }
+    else if(k === 'when'){ S.wd = ''; S.hr = ''; load(); }
     else { S[k] = ''; render(); }
+    return; }
+  // Drill-down out of the two charts. Both are server-side filters, so the
+  // whole payload is refetched - a day three weeks back is not in the event
+  // list the page happens to be holding.
+  const rw = el.closest('[data-rsn]');
+  if(rw){
+    S.rsn = S.rsn === rw.dataset.rsn ? '' : rw.dataset.rsn;
+    S.pick = ''; S.shown = 60;
+    load().then(function(){ if(S.rsn) goEvents(); });
+    return; }
+  const sg = el.closest('#handbar .seg');
+  if(sg){
+    S.pick = S.pick === sg.dataset.pick ? '' : sg.dataset.pick;
+    // Mutually exclusive with the reason filter in both directions: both want
+    // the 'kind' parameter, and a chip that is displayed but ignored would be
+    // worse than no chip at all.
+    S.rsn = ''; S.shown = 60;
+    load().then(function(){ if(S.pick) goEvents(); });
+    return; }
+  const bar = el.closest('[data-bucket]');
+  if(bar){
+    S.bucket = S.bucket === bar.dataset.bucket ? '' : bar.dataset.bucket;
+    S.wd = ''; S.hr = ''; S.shown = 60;
+    load().then(() => { if(S.bucket) goEvents(); });
+    return; }
+  const cell = el.closest('[data-wd]');
+  if(cell){
+    const same = String(S.wd) === cell.dataset.wd && String(S.hr) === cell.dataset.hr;
+    S.wd = same ? '' : cell.dataset.wd;
+    S.hr = same ? '' : cell.dataset.hr;
+    S.bucket = ''; S.shown = 60;
+    load().then(() => { if(S.wd !== '') goEvents(); });
     return; }
   const chip = el.closest('.chip');
   if(chip){ if(chip.dataset.k !== undefined) S.kind = chip.dataset.k;
@@ -2153,6 +2597,22 @@ document.addEventListener('change', function(e){
       body: JSON.stringify({key: k, status: v})}).then(function(){ load(); }).catch(function(){});
   } });
 addEventListener('keydown', function(e){ if(e.key === 'Escape') closeDrawer(); });
+// Pointer and keyboard both reach the card; the bar is a real control now.
+document.addEventListener('mouseover', function(e){
+  const sg = e.target.closest && e.target.closest('#handbar .seg');
+  if(sg) segTip(sg);
+});
+document.addEventListener('mouseout', function(e){
+  if(e.target.closest && e.target.closest('#handbar') &&
+     !(e.relatedTarget && e.relatedTarget.closest && e.relatedTarget.closest('#handbar'))) segTip(null);
+});
+document.addEventListener('focusin', function(e){
+  const sg = e.target.closest && e.target.closest('#handbar .seg');
+  segTip(sg || null);
+});
+document.addEventListener('focusout', function(e){
+  if(e.target.closest && e.target.closest('#handbar .seg')) segTip(null);
+});
 
 load();
 TIMER = setInterval(load, 60000);

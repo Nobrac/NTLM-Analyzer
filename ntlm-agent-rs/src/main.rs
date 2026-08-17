@@ -102,6 +102,40 @@ fn main() {
                 exit(2);
             }
         },
+        // Write the configuration only - no file copy, no service. This is what
+        // the MSI calls: the installer owns the payload and the service entry,
+        // so the agent must not create a second copy of either. Everything else
+        // (argument parsing, the HTTP warning, locking down the data folder) is
+        // shared with `install`.
+        "configure" => match config::Config::from_args(rest) {
+            Ok(cfg) => {
+                if cfg
+                    .collector_url
+                    .trim_start()
+                    .to_ascii_lowercase()
+                    .starts_with("http://")
+                {
+                    eprintln!(
+                        "WARNING: --collector-url uses HTTP (unencrypted). \
+                         Telemetry and API key travel over the network in clear \
+                         text. Recommendation: switch the collector to HTTPS."
+                    );
+                }
+                if let Err(e) = cfg.save() {
+                    eprintln!("Saving the configuration failed: {e}");
+                    exit(1);
+                }
+                service::harden_data_dir();
+                println!(
+                    "Configuration written to {}.",
+                    config::config_path().display()
+                );
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                exit(2);
+            }
+        },
         "uninstall" => match service::uninstall() {
             Ok(()) => println!("Service 'NtlmAgent' removed."),
             Err(e) => {

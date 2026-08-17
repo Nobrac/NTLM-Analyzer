@@ -126,6 +126,14 @@ struct AgentStatus {
     /// point out what is already covered instead of proposing duplicates.
     exc_client: Option<String>,
     exc_dc: Option<String>,
+    /// Domain and forest functional level, as the raw msDS-Behavior-Version
+    /// integer read from rootDSE. Deliberately *not* translated here: mapping a
+    /// number to "Windows Server 2016" is presentation, and Microsoft adds new
+    /// levels over time. Keeping the raw value means a new level only needs a
+    /// collector update, never a fleet-wide agent rollout.
+    /// None when the machine is not domain-joined or the query did not answer.
+    domain_level: Option<String>,
+    forest_level: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -149,6 +157,7 @@ pub fn run_cycle(cfg: &Config) -> Result<(), String> {
     let dc = is_dc();
 
     // 1) Status/heartbeat (independent of events, on every run)
+    let dl = functional_levels();
     let status = AgentStatus {
         source: me.clone(),
         is_dc: dc,
@@ -166,6 +175,8 @@ pub fn run_cycle(cfg: &Config) -> Result<(), String> {
         restrict_dom: restrict_state(NETLOGON, "RestrictNTLMInDomain"),
         exc_client: read_multi_sz(LSA, "ClientAllowedNTLMServers"),
         exc_dc: read_multi_sz(NETLOGON, "DCAllowedNTLMServers"),
+        domain_level: dl.0,
+        forest_level: dl.1,
     };
     let status_url = format!("{}/status", cfg.collector_url.trim_end_matches('/'));
     match serde_json::to_string(&status) {
@@ -1483,4 +1494,122 @@ fn enable_outgoing_audit() -> Result<(), String> {
 #[cfg(not(windows))]
 fn enable_outgoing_audit() -> Result<(), String> {
     Err("nur unter Windows".to_string())
+}
+
+// ------------------- Domänen- und Gesamtstrukturebene -------------------
+//
+// Read from rootDSE (domainFunctionality / forestFunctionality). This is the
+// first thing the agent asks the directory for rather than the local event log,
+// so it is deliberately defensive:
+//
+//   * six-hour cache - a functional level changes once every few years, and the
+//     cycle runs every 15 minutes; spawning a process 96 times a day for a
+//     constant would be wasteful
+//   * hard timeout with the child killed - an LDAP bind against an unreachable
+//     DC can hang for a long time, and a stuck helper must never stall the
+//     collection cycle
+//   * every failure is silent and yields None; a missing level is cosmetic,
+//     losing the event push over it would not be
+//
+// The values are sent as raw integers; naming them is the collector's job.
+
+#[cfg(windows)]
+static LEVEL_CACHE: std::sync::Mutex<Option<(std::time::Instant, Option<String>, Option<String>)>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(windows)]
+const LEVEL_TTL: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+
+#[cfg(windows)]
+fn functional_levels() -> (Option<String>, Option<String>) {
+    // A poisoned mutex must not take the cycle down with it; fall through to a
+    // fresh query instead.
+    if let Ok(guard) = LEVEL_CACHE.lock() {
+        if let Some((when, d, f)) = guard.as_ref() {
+            if when.elapsed() < LEVEL_TTL {
+                return (d.clone(), f.clone());
+            }
+        }
+    }
+    let fresh = query_functional_levels();
+    if let Ok(mut guard) = LEVEL_CACHE.lock() {
+        *guard = Some((std::time::Instant::now(), fresh.0.clone(), fresh.1.clone()));
+    }
+    fresh
+}
+
+#[cfg(windows)]
+fn query_functional_levels() -> (Option<String>, Option<String>) {
+    // Not domain-joined: rootDSE would not answer anyway, so skip the process.
+    if std::env::var("USERDNSDOMAIN").is_err() {
+        return (None, None);
+    }
+    let ps = config::system32(r"WindowsPowerShell\v1.0\powershell.exe");
+    // ADSI is present on every domain-joined Windows - no RSAT, no AD module.
+    let script = "$ErrorActionPreference='Stop';\
+                  $r=[ADSI]'LDAP://RootDSE';\
+                  ''+$r.domainFunctionality;\
+                  ''+$r.forestFunctionality";
+    let out = match run_capped(
+        &ps,
+        &["-NoProfile", "-NonInteractive", "-Command", script],
+        15,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            config::log(&format!("functional level query failed: {e}"));
+            return (None, None);
+        }
+    };
+    let mut it = out
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && l.chars().all(|c| c.is_ascii_digit()) && l.len() <= 3);
+    (it.next().map(str::to_string), it.next().map(str::to_string))
+}
+
+/// Run a helper and capture stdout, killing it if it outstays its welcome.
+/// `std::process` has no timeout of its own, so the read happens on a thread
+/// and the wait is bounded by a channel.
+#[cfg(windows)]
+fn run_capped(exe: &std::path::Path, args: &[&str], secs: u64) -> Result<String, String> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(exe)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("start: {e}"))?;
+    let mut pipe = match child.stdout.take() {
+        Some(p) => p,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("no stdout".to_string());
+        }
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = pipe.read_to_end(&mut buf);
+        let _ = tx.send(buf);
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(secs)) {
+        Ok(buf) => {
+            let _ = child.wait();
+            Ok(String::from_utf8_lossy(&buf).into_owned())
+        }
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(format!("no answer within {secs}s"))
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn functional_levels() -> (Option<String>, Option<String>) {
+    (None, None)
 }
