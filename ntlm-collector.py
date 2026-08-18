@@ -1014,11 +1014,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 }
 *{box-sizing:border-box}
 html{scroll-behavior:smooth}
-/* 390 px wide viewports scrolled ~4 px sideways. Nothing may exceed the
-   viewport, and long unbroken values (SPNs, paths) are the usual culprit. */
-html{overflow-x:hidden}
-body{max-width:100vw;overflow-x:hidden;margin:0;background:var(--void);color:var(--ink);font-family:var(--text);font-size:18px;
-  line-height:1.5;-webkit-font-smoothing:antialiased;overflow-x:hidden}
+/* No overflow-x:hidden here. It was added against 4 px of sideways scroll on
+   phones and silently broke position:sticky for the whole page - an ancestor
+   with overflow hidden becomes the scroll container, so the header stopped
+   pinning on every screen size. The overflow itself is fixed at its source now
+   (scrollable tables, scrollable heatmap). */
+body{margin:0;background:var(--void);color:var(--ink);font-family:var(--text);font-size:18px;
+  line-height:1.5;-webkit-font-smoothing:antialiased}
 body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:0;
   background:radial-gradient(1200px 600px at 10% -8%,rgba(255,107,107,.05),transparent 62%),
              radial-gradient(1200px 700px at 90% 108%,rgba(61,220,151,.042),transparent 62%)}
@@ -1031,6 +1033,10 @@ a{color:inherit}
 header{position:sticky;top:0;z-index:60;backdrop-filter:blur(18px) saturate(1.4);
   background:rgba(14,19,31,.80);border-bottom:1px solid var(--edge)}
 .hin{padding:0 var(--pad);height:66px;display:flex;align-items:center;gap:16px}
+/* The controls scrolled sideways out of view on a phone: the language toggle
+   and the CSV button were simply unreachable. Wrapping costs a second row and
+   keeps everything within reach. */
+}
 .logo{display:flex;align-items:center;gap:11px;font-family:var(--disp);font-size:17px;font-weight:600;
   letter-spacing:-.02em;white-space:nowrap}
 .orb{width:9px;height:9px;border-radius:50%;background:var(--krb);position:relative;flex:none}
@@ -1088,6 +1094,7 @@ select option:checked,.sel-st option:checked{background:#26314a;color:#fff}
 .jl.nil{opacity:.4}
 
 .hero{padding:58px var(--pad) 44px}
+}
 .eyebrow{font-family:var(--mono);font-size:15.5px;letter-spacing:.16em;text-transform:uppercase;
   color:var(--faint);margin-bottom:16px}
 .thesis{font-family:var(--disp);font-size:clamp(40px,4.2vw,66px);font-weight:380;line-height:1.09;
@@ -1106,7 +1113,13 @@ select option:checked,.sel-st option:checked{background:#26314a;color:#fff}
   color:var(--ink);border:1px solid var(--edge2);border-radius:0 0 10px 0;
   padding:12px 18px;font-size:15px;text-decoration:none}
 .skip:focus{left:0}
-.handbar{position:relative;overflow:visible}
+/* overflow-x:clip instead of visible: the segments' percentage widths plus the
+   2 px gaps add up to slightly over 100 % on a narrow screen, and the last one
+   stuck 4 px past the viewport. "clip" trims that without creating a scroll
+   container - so position:sticky elsewhere on the page keeps working, which
+   plain "hidden" would have broken. overflow-y stays visible so the hover card
+   above the bar is not cut off. */
+.handbar{position:relative;overflow-x:clip;overflow-y:visible}
 .seg:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
 .seg.on{filter:brightness(1.45)}
 .handbar:hover .seg:not(:hover){filter:brightness(.72)}
@@ -1166,11 +1179,15 @@ select option:checked,.sel-st option:checked{background:#26314a;color:#fff}
    a wide monitor, which reads as a wall. Two is the working default; a third
    only appears on genuinely huge screens. */
 .grid{padding:0 var(--pad) 90px;display:grid;gap:30px;grid-template-columns:1fr}
-@media(min-width:1000px){.grid{grid-template-columns:repeat(2,1fr)}}
+/* Two columns only from 1400 px. At 1000 px each panel was about 480 px wide,
+   which a seven-column table does not fit into - the card clipped the rest and
+   220 cells were unreachable at laptop width. One wide column reads better than
+   two truncated ones. */
+@media(min-width:1400px){.grid{grid-template-columns:repeat(2,1fr)}}
 @media(min-width:2900px){.grid{grid-template-columns:repeat(3,1fr)}}
 .c2{grid-column:span 2}.call{grid-column:1/-1}
-@media(max-width:999px){.c2{grid-column:span 1}}
-@media(max-width:999px){.c2,.call{grid-column:span 1}}
+@media(max-width:1399px){.c2{grid-column:span 1}}
+@media(max-width:1399px){.c2,.call{grid-column:span 1}}
 .card{border:1px solid var(--edge);border-radius:var(--r);scroll-margin-top:118px;
   background:linear-gradient(180deg,rgba(255,255,255,.022),transparent 40%),var(--card);
   overflow:hidden;opacity:0;transform:translateY(16px);
@@ -1189,6 +1206,9 @@ select option:checked,.sel-st option:checked{background:#26314a;color:#fff}
 .mini:hover{color:var(--ink);border-color:var(--krb)}
 
 table{width:100%;border-collapse:collapse}
+.tw{overflow-x:auto}
+/* Stacked rows need no scrolling - and a stray scrollbar there looks broken. */
+@media(max-width:760px){.tw{overflow-x:visible}}
 /* The header row used to sit at the same weight and near the same tone as the
    data, so a table read as one undifferentiated block. It is now a band: its
    own slightly lighter surface, a firm bottom edge, brighter and heavier type.
@@ -1281,6 +1301,12 @@ tbody tr.on{background:rgba(61,220,151,.10);box-shadow:inset 3px 0 0 var(--krb)}
 
 .hm{padding:8px 20px 18px}
 .hr{display:grid;grid-template-columns:20px repeat(24,1fr);gap:2px;align-items:center;margin-bottom:2px}
+/* 24 hours across 390 px leaves 4 px per cell - neither readable nor tappable.
+   Scroll the grid instead and keep the cells usable. */
+@media(max-width:760px){
+  .hm{overflow-x:auto;padding-left:14px;padding-right:14px}
+  .hr{min-width:560px}
+}
 .hr .lb{font-family:var(--mono);font-size:12px;color:var(--faint)}
 .hc{aspect-ratio:1;border-radius:2px;background:rgba(148,170,220,.05);transform:scale(.4);opacity:0;
   transition:transform .5s cubic-bezier(.16,1,.3,1),opacity .5s}
@@ -1335,9 +1361,64 @@ tbody tr.on{background:rgba(61,220,151,.10);box-shadow:inset 3px 0 0 var(--krb)}
   *,*::before,*::after{animation:none!important;transition:none!important}
   .card{opacity:1;transform:none}.hc{opacity:1;transform:none}
 }
+/* Below this width a seven-column table cannot work. The card clips whatever
+   does not fit, so five of seven columns were simply unreachable - not even by
+   swiping. Each row becomes a small block instead, with the column name in
+   front of its value. The labels are filled in by JS from the table's own
+   header, so every table on the page gets this without being told about it. */
+@media(max-width:760px){
+  table.srt thead{position:absolute;left:-9999px}      /* kept for screen readers */
+  table.srt tr{display:block;padding:12px 4px;border-top:1px solid rgba(158,180,225,.11)}
+  table.srt tbody tr:first-child{border-top:0}
+  /* wrap: cells holding several tags side by side (the machine panel) would
+     otherwise keep them on one line and push past the card edge. */
+  table.srt td{display:flex;flex-wrap:wrap;gap:6px 12px;align-items:baseline;
+    border:0;padding:3px 18px;font-size:15px}
+  table.srt td::before{content:attr(data-label);flex:0 0 38%;max-width:38%;color:var(--faint);
+    font-family:var(--mono);font-size:12px;text-transform:uppercase;letter-spacing:.06em}
+  table.srt td.r{text-align:left}
+  table.srt td:empty{display:none}
+  /* The first cell carries the row's identity - give it weight. */
+  table.srt td:first-child{font-size:16.5px;font-weight:620;padding-bottom:6px}
+  table.srt td:first-child::before{display:none}
+}
+/* After the base header rules so these win: media queries add no specificity. */
+@media(max-width:760px){
+  .hin{height:auto;flex-wrap:wrap;padding-top:10px;padding-bottom:10px;gap:10px}
+  .tools{margin-left:0;width:100%;justify-content:flex-start}
+  /* Wrapping makes the header three rows tall - 175 px, and pinned it would
+     hold a quarter of the screen hostage for the whole page. It scrolls away
+     here; the section bar takes over as the thing that stays, which is the
+     part that is actually useful while reading. */
+  header{position:static}
+  .jump{top:0}
+  /* Comfortable to hit with a thumb. Seven controls were under 32 px tall,
+     which is below every platform's guidance. */
+  .hin button, .hin select, .hin a{min-height:40px}
+  #range button{padding-top:9px;padding-bottom:9px}
+
 @media(max-width:720px){
   .hin{gap:10px;overflow-x:auto}.hero{padding:30px var(--pad) 20px}
   .fr{grid-template-columns:1fr;gap:2px}.jump{overflow-x:auto;flex-wrap:nowrap}
+}
+
+/* Placed after the 720 px block on purpose: that one sets .hero padding too,
+   and being later in the file it won. Same width, later position, so these
+   take effect. */
+@media(max-width:760px){
+  .hero{padding:26px var(--pad) 26px}
+  .thesis{font-size:30px;line-height:1.12}
+  .sub{font-size:15px;margin-bottom:22px}
+  .deadline{margin-top:20px;padding:13px 15px}
+  .dnum{font-size:30px}
+  .focus{padding-bottom:20px;gap:10px}
+  .fc{padding:14px 16px}
+
+/* Long unbroken values - SPNs, UNC paths - still pushed a stacked cell past
+   the card edge, which is what clipped them in the first place. */
+@media(max-width:760px){
+  table.srt td{overflow-wrap:anywhere;word-break:break-word}
+  table.srt td .cut{max-width:none;white-space:normal;overflow:visible}
 }
 </style>
 </head>
@@ -1993,10 +2074,14 @@ const emptyBox = (a, b) => '<div class="empty"><b>' + esc(a) + '</b>' + esc(b ||
 // all of them. Sorting happens on the rendered rows rather than on the data:
 // each panel shapes its own rows, and re-sorting the source would mean
 // teaching this helper about a dozen different record shapes.
-const tbl = (heads, rows) => '<table class="srt"><thead><tr>' + heads.map((h, i) =>
+// Wrapped in a scroll container: between the stacked phone layout and a screen
+// wide enough for all columns there is a band - roughly 760 to 1400 px - where
+// the widest tables simply do not fit. The card clipped them and the data was
+// unreachable. Above 1400 px nothing overflows and no scrollbar appears.
+const tbl = (heads, rows) => '<div class="tw"><table class="srt"><thead><tr>' + heads.map((h, i) =>
   '<th tabindex="0" role="button" aria-sort="none" data-col="' + i + '"' +
   (h[1] ? ' class="' + h[1] + '"' : '') + '>' + esc(h[0]) + '</th>').join('') +
-  '</tr></thead><tbody>' + rows + '</tbody></table>';
+  '</tr></thead><tbody>' + rows + '</tbody></table></div>';
 
 // Numbers must not sort as text - "9" before "45" is the classic wrong answer.
 // A cell that parses as a number after stripping spaces and thousands dots is
@@ -2030,6 +2115,21 @@ function sortTable(th){
   rows.forEach(r => body.appendChild(r));
   table.querySelectorAll('th').forEach(o => o.setAttribute('aria-sort', 'none'));
   th.setAttribute('aria-sort', asc ? 'ascending' : 'descending');
+}
+
+// On a narrow screen each row is stacked and every value needs its column name
+// in front of it. Read from the table's own header rather than passed in, so
+// this works for all nine tables without any of them knowing about it. Runs
+// after every render because the panels rebuild their rows each time.
+function labelCells(){
+  document.querySelectorAll('table.srt').forEach(function(t){
+    const heads = [...t.querySelectorAll('thead th')].map(h => h.textContent.trim());
+    t.querySelectorAll('tbody tr').forEach(function(tr){
+      [...tr.cells].forEach(function(td, i){
+        if(heads[i] !== undefined) td.setAttribute('data-label', heads[i]);
+      });
+    });
+  });
 }
 
 document.addEventListener('click', function(e){
@@ -2652,6 +2752,7 @@ const closeDrawer = () => { $('#drawer').classList.remove('on'); $('#scrim').cla
 function render(){
   if(!DATA) return;
   writeUrlState();
+  setTimeout(labelCells, 0);   // after the panels have written their rows
   renderChrome(); renderOsDonut(); renderHero(); renderFocus();
   $('#grid').innerHTML = [secTrend(), secPrograms(), secTargets(), secV1(), secHeat(), secWhy(),
     secDomain(), secIncoming(), secSso(), secKrb(), secKrbAcc(), secAgents(), secEvents()].join('');
