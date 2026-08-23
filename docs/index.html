@@ -181,6 +181,11 @@ code{font-family:var(--mono);font-size:.9em}
      the screenshot in the narrow column, so every other one rendered at 38 %
      and was unreadable. */
   .view--flip{grid-template-columns:minmax(0,62%) minmax(0,38%)}
+  /* The drawer capture is a tall, narrow window rather than a wide panel.
+     Giving its column the image's own width keeps it at 1:1 - stretched to the
+     usual 62 % it was upscaled by 1.4 and visibly soft - and hands the spare
+     room to the text instead. */
+  .view--narrow{grid-template-columns:minmax(0,1fr) auto}
   .view--flip .view__txt{order:2}
 }
 .view__txt h3{font-family:var(--disp);font-size:clamp(22px,2.5vw,31px);font-weight:680;
@@ -194,6 +199,12 @@ code{font-family:var(--mono);font-size:.9em}
 .view figure.in{opacity:1;transform:none}
 .view figure img{border:1px solid var(--rule);background:var(--log2);
   width:100%;height:auto}
+/* Never enlarge a screenshot past its own pixels. The event drawer is a narrow
+   527 px capture and was being stretched to 756 px, which is exactly why it
+   looked soft while every other shot is downscaled. It sits centred in its
+   column instead. */
+.view figure img{max-width:min(100%, var(--nat, 100%))}
+.view figure{display:flex;justify-content:center}
 
 /* ---------- steps (paper) ---------- */
 .steps{counter-reset:s;display:flex;flex-direction:column;gap:1px;background:var(--rule-dark);
@@ -386,7 +397,7 @@ code{font-family:var(--mono);font-size:.9em}
           clickable down to the individual logon.</p>
           <div class="view__note">24 h to 30 days · <b>click any bar</b> to filter everything below</div>
         </div>
-        <figure><img src="img/01-overview.png" alt="Overview panel: headline share, three-colour handover bar, deadline countdown and 30-day trend" loading="lazy" width="2533" height="1151"></figure>
+        <figure><img src="img/01-overview.png" alt="Overview panel: headline share, three-colour handover bar, deadline countdown and 30-day trend" loading="lazy" width="2533" height="1151" style="--nat:2533px"></figure>
       </div>
 
       <div class="view view--flip">
@@ -398,7 +409,7 @@ code{font-family:var(--mono);font-size:.9em}
           the dashboard keeps working.</p>
           <div class="view__note">Status per row · <b>open, in progress, done, accepted</b></div>
         </div>
-        <figure><img src="img/02-programs.png" alt="Program list with per-row sparklines, target servers, user chips and a status dropdown" loading="lazy" width="2469" height="961"></figure>
+        <figure><img src="img/02-programs.png" alt="Program list with per-row sparklines, target servers, user chips and a status dropdown" loading="lazy" width="2469" height="961" style="--nat:2469px"></figure>
       </div>
 
       <div class="view">
@@ -410,7 +421,7 @@ code{font-family:var(--mono);font-size:.9em}
           change, not just what happened.</p>
           <div class="view__note">Every row filters the event list · <b>no guessing</b></div>
         </div>
-        <figure><img src="img/05-why.png" alt="Cause analysis panel listing each reason for NTLM fallback with a concrete remedy" loading="lazy" width="1228" height="513"></figure>
+        <figure><img src="img/05-why.png" alt="Cause analysis panel listing each reason for NTLM fallback with a concrete remedy" loading="lazy" width="1228" height="513" style="--nat:1228px"></figure>
       </div>
 
       <div class="view view--flip">
@@ -422,7 +433,7 @@ code{font-family:var(--mono);font-size:.9em}
           knows about.</p>
           <div class="view__note">Click a cell · <b>see only those events</b></div>
         </div>
-        <figure><img src="img/04-timing.png" alt="Week-by-hour heatmap of NTLM usage with one bright cell on Sunday at 05:00" loading="lazy" width="1228" height="519"></figure>
+        <figure><img src="img/04-timing.png" alt="Week-by-hour heatmap of NTLM usage with one bright cell on Sunday at 05:00" loading="lazy" width="1228" height="519" style="--nat:1228px"></figure>
       </div>
 
       <div class="view">
@@ -434,7 +445,7 @@ code{font-family:var(--mono);font-size:.9em}
           it shows up here.</p>
           <div class="view__note">No agent required · <b>domain-wide by definition</b></div>
         </div>
-        <figure><img src="img/06-domain.png" alt="Domain-wide table of accounts, source machines and target servers from the DC audit log" loading="lazy" width="2467" height="1083"></figure>
+        <figure><img src="img/06-domain.png" alt="Domain-wide table of accounts, source machines and target servers from the DC audit log" loading="lazy" width="2467" height="1083" style="--nat:2467px"></figure>
       </div>
 
       <div class="view view--flip">
@@ -446,10 +457,10 @@ code{font-family:var(--mono);font-size:.9em}
           number on the other panels.</p>
           <div class="view__note">Badges turn green <b>once the policy has landed</b></div>
         </div>
-        <figure><img src="img/10-machines.png" alt="Machine list showing OS build, audit status badges and October 2026 readiness" loading="lazy" width="2461" height="457"></figure>
+        <figure><img src="img/10-machines.png" alt="Machine list showing OS build, audit status badges and October 2026 readiness" loading="lazy" width="2461" height="457" style="--nat:2461px"></figure>
       </div>
 
-      <div class="view">
+      <div class="view view--narrow">
         <div class="view__txt">
           <div class="src">Raw record · every field</div>
           <h3>Down to the single logon</h3>
@@ -458,7 +469,7 @@ code{font-family:var(--mono);font-size:.9em}
           view you are looking at is a link you can send.</p>
           <div class="view__note">CSV export · <b>English and German</b></div>
         </div>
-        <figure><img src="img/12-event-detail.png" alt="Event detail drawer showing all raw fields of a single logon with explanations" loading="lazy" width="527" height="1276"></figure>
+        <figure><img src="img/12-event-detail.png" alt="Event detail drawer showing all raw fields of a single logon with explanations" loading="lazy" width="527" height="820" style="--nat:527px"></figure>
       </div>
 
     </div>
