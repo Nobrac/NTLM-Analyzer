@@ -12,7 +12,7 @@ from Kerberos (and can be fixed), and whether usage is trending toward zero.
 The collector is one Python file with no dependencies; the agent is one
 self-installing EXE.
 
-[![Live demo](https://img.shields.io/badge/live%20demo-open%20dashboard-3ddc97?logo=githubpages&logoColor=white)](https://nobrac.github.io/NTLM-Analyzer/)
+[![Live demo](https://img.shields.io/badge/live%20demo-open%20dashboard-3ddc97?logo=githubpages&logoColor=white)](https://nobrac.github.io/NTLM-Analyzer/demo/)
 &nbsp;
 ![Collector: Python 3.7+](https://img.shields.io/badge/collector-Python%203.7%2B-3776AB?logo=python&logoColor=white)
 &nbsp;
@@ -22,9 +22,11 @@ self-installing EXE.
 &nbsp;
 [![License: GPL v3](https://img.shields.io/badge/license-GPLv3-blue.svg)](LICENSE)
 
-**[▶ Live demo](https://nobrac.github.io/NTLM-Analyzer/)** — the real dashboard
-on synthetic lab data. Charts, drill-downs, search, filters and the per-event
-detail view all work.
+**[▶ Live demo](https://nobrac.github.io/NTLM-Analyzer/demo/)** — the real
+dashboard on synthetic lab data. Charts, drill-downs, search, filters and the
+per-event detail view all work.
+&nbsp;·&nbsp;
+**[Project page](https://nobrac.github.io/NTLM-Analyzer/)** — what it does and why.
 
 </div>
 
