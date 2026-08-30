@@ -80,9 +80,12 @@ code{font-family:var(--mono);font-size:.9em}
   backdrop-filter:blur(20px) saturate(1.5);border-bottom:1px solid var(--rule)}
 .top .inner{max-width:var(--wide);margin:0 auto;padding:11px var(--gut);
   display:flex;align-items:center;gap:14px;flex-wrap:wrap}
-.mark{display:flex;align-items:center;gap:10px;text-decoration:none;color:var(--ink);
-  font-family:var(--mono);font-size:16px;font-weight:600;letter-spacing:-.01em}
-.mark img{width:24px;height:24px}
+/* The wordmark is artwork, not type: exported at twice its display height so
+   it stays crisp on a dense screen, with explicit dimensions so the header
+   does not jump while it loads. */
+.mark{display:flex;align-items:center;text-decoration:none}
+.mark img{height:42px;width:auto;display:block}
+@media(max-width:760px){.mark img{height:34px}}
 .topnav{margin-left:auto;display:flex;gap:9px;flex-wrap:wrap}
 .b{display:inline-flex;align-items:center;min-height:40px;padding:9px 17px;border-radius:2px;
   border:1px solid var(--rule);background:transparent;color:var(--ink);text-decoration:none;
@@ -261,7 +264,7 @@ code{font-family:var(--mono);font-size:.9em}
 
 <div class="top">
   <div class="inner">
-    <a class="mark" href="#top"><img src="img/favicon-32.png" alt="" width="32" height="32"> ntlm-analyzer</a>
+    <a class="mark" href="#top"><img src="img/wordmark.png" width="326" height="96" alt="NTLM-Analyzer"></a>
     <nav class="topnav">
       <a class="b" href="#answers">What it tells you</a>
       <a class="b" href="#setup">Set it up</a>
@@ -550,7 +553,7 @@ code{font-family:var(--mono);font-size:.9em}
 <div class="foot">
   <div class="inner">
     <div>
-      <a class="mark" href="#top"><img src="img/favicon-32.png" alt="" width="32" height="32"> ntlm-analyzer</a>
+      <a class="mark" href="#top"><img src="img/wordmark.png" width="326" height="96" alt="NTLM-Analyzer"></a>
       <p>See the whole NTLM picture in your own Active Directory before you switch
       it off. Self-hosted, no telemetry, GPL-3.0.</p>
     </div>
