@@ -1,214 +1,112 @@
 #!/usr/bin/env python3
-"""Draw the NTLM-Analyzer icon and export it as .ico and .png.
+"""Derive every icon the project needs from the four brand files.
 
-The mark is the product's own statement rather than a generic padlock: a shield
-whose fill is the handover bar from the dashboard - a thin red remnant on the
-left, amber in the middle, the green target state taking most of the width. Read
-left to right it is "NTLMv1 -> NTLMv2 -> Kerberos", which is the whole project.
+This used to draw a shield with PIL. It no longer draws anything: the logo is
+now artwork that lives in assets/, and this script only derives the formats
+Windows, browsers and WiX insist on.
 
-Design constraints that drove it:
+Which source is used where follows from what each one is legible against:
 
-  * it has to survive 16x16 in a taskbar and a services list, so there is no
-    keyhole, no text, no thin line work - only a silhouette and three colour
-    fields, which is the most a 16 px tile can carry
-  * the colours are the dashboard's own (--v1 / --v2 / --krb), so the icon and
-    the UI read as one product
-  * everything is drawn at 8x and downsampled, because Pillow's polygon fill has
-    no antialiasing of its own and a jagged shield edge looks broken
+    logo-badge-dark.png     dark tile, white N   - reads on light surfaces,
+                                                   and its white N still carries
+                                                   on a dark taskbar
+    logo-badge-light.png    white tile, dark N   - for dark surfaces only
+    logo-wordmark-dark.png  dark lettering       - for light surfaces
+    logo-wordmark-light.png white lettering      - for dark surfaces
 
-Usage:
-    python3 make-icon.py --out assets
+Usage:  python3 make-icon.py --out assets
 """
 import argparse
 import os
+from PIL import Image
 
-from PIL import Image, ImageDraw
-
-# Straight from the dashboard's :root block.
-RED = (255, 107, 107, 255)
-AMBER = (245, 184, 65, 255)
-GREEN = (61, 220, 151, 255)
-EDGE = (14, 19, 31, 255)          # --void, as the outline
-RIM = (214, 226, 246, 255)        # light rim so the mark survives a dark tab
-SS = 8                            # supersampling factor
-
-# Share of the shield width per band. Deliberately not equal thirds: the point
-# is that the insecure remnant is small and the target state dominates.
-BANDS = ((RED, 0.00, 0.16), (AMBER, 0.16, 0.38), (GREEN, 0.38, 1.00))
+ICO_SIZES = [16, 20, 24, 32, 40, 48, 64, 128, 256]
+PAPER = (250, 251, 253)      # the MSI dialog background
+PANEL = (236, 240, 246)
+RULE = (203, 212, 226)
 
 
-def bez(p0, p1, p2, p3, steps=40):
-    """Cubic bezier, sampled - Pillow has no curve primitive."""
-    out = []
-    for i in range(steps + 1):
-        t = i / steps
-        u = 1 - t
-        x = (u ** 3) * p0[0] + 3 * (u ** 2) * t * p1[0] + 3 * u * (t ** 2) * p2[0] + (t ** 3) * p3[0]
-        y = (u ** 3) * p0[1] + 3 * (u ** 2) * t * p1[1] + 3 * u * (t ** 2) * p2[1] + (t ** 3) * p3[1]
-        out.append((x, y))
-    return out
+def load(path):
+    im = Image.open(path).convert("RGBA")
+    # The exports are 491x490 and 1668x491 - square them up so a resize never
+    # distorts the mark.
+    w, h = im.size
+    if w != h and abs(w - h) < max(w, h) * 0.05:
+        side = max(w, h)
+        sq = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+        sq.paste(im, ((side - w) // 2, (side - h) // 2), im)
+        return sq
+    return im
 
 
-def shield(w, h, inset):
-    """Classic shield: flat top with eased corners, straight flanks, a point.
-
-    Built from beziers rather than a power curve - the earlier version pinched
-    the flanks and the tip came out looking clipped.
-    """
-    x0, y0 = inset, inset
-    x1, y1 = w - inset, h - inset
-    cx = (x0 + x1) / 2
-    r = (x1 - x0) * 0.13                 # top corner radius
-    flank = y0 + (y1 - y0) * 0.42        # where the taper starts
-
-    pts = [(x0 + r, y0)]
-    pts += [(x1 - r, y0)]
-    # top-right corner
-    pts += bez((x1 - r, y0), (x1 - r * 0.45, y0), (x1, y0 + r * 0.45), (x1, y0 + r), 10)
-    pts += [(x1, flank)]
-    # right flank into the tip
-    # Control points chosen by rendering the alternatives side by side: a low
-    # second handle keeps the flanks convex and gives the tip a real point
-    # instead of the flat-bottomed bucket the first attempt produced.
-    pts += bez((x1, flank), (x1, flank + (y1 - flank) * 0.70),
-               (cx + (x1 - cx) * 0.14, y1), (cx, y1), 34)
-    # tip back up the left flank
-    pts += bez((cx, y1), (cx - (cx - x0) * 0.14, y1),
-               (x0, flank + (y1 - flank) * 0.70), (x0, flank), 34)
-    pts += [(x0, y0 + r)]
-    # top-left corner
-    pts += bez((x0, y0 + r), (x0, y0 + r * 0.45), (x0 + r * 0.45, y0), (x0 + r, y0), 10)
-    return pts
+def fit(im, box_w, box_h):
+    """Scale to fit inside a box without distorting or enlarging."""
+    r = min(box_w / im.width, box_h / im.height, 1.0)
+    return im.resize((max(1, int(im.width * r)), max(1, int(im.height * r))),
+                     Image.LANCZOS)
 
 
-def render(size):
-    """One tile at the requested pixel size, drawn big and downsampled.
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", default="assets")
+    ap.add_argument("--src", default="assets",
+                    help="where the logo-*.png brand files live")
+    a = ap.parse_args()
+    os.makedirs(a.out, exist_ok=True)
 
-    The outline is the difference between the silhouette and an inset copy of
-    it. Drawing it as a line left artefacts at the corners where the segments
-    met, and no join style fixed them.
-    """
-    s = size * SS
-    # Room for the light rim without letting it touch the tile edge.
-    pad = s * 0.095
-    halo_w = max(2, int(s * 0.045))
-    outline_w = max(2, int(s * 0.05))
+    badge_dark = load(os.path.join(a.src, "logo-badge-dark.png"))
+    badge_light = load(os.path.join(a.src, "logo-badge-light.png"))
 
-    def mask_of(inset):
-        m = Image.new("L", (s, s), 0)
-        ImageDraw.Draw(m).polygon(shield(s, s, inset), fill=255)
-        return m
+    # --- Windows application icon -------------------------------------------
+    # The dark tile: Explorer, the Apps list and the installer all show icons
+    # on light backgrounds, and on a dark taskbar the white N still reads.
+    frames = [badge_dark.resize((n, n), Image.LANCZOS) for n in ICO_SIZES]
+    ico = os.path.join(a.out, "ntlm-agent.ico")
+    frames[-1].save(ico, format="ICO",
+                    sizes=[(n, n) for n in ICO_SIZES], append_images=frames[:-1])
+    print("wrote %s (%d sizes)" % (ico, len(ICO_SIZES)))
 
-    # Three concentric silhouettes: a light rim, the dark outline, the fill.
-    # The rim is what makes the mark separate from a dark browser tab or task
-    # bar - the dark outline alone disappeared into them. On a light background
-    # the rim is invisible and the dark outline still carries the shape, so this
-    # costs nothing there. A framed tile was the other option and read better at
-    # 48 px, but at 16 px the frame swallowed the shield.
-    rim = mask_of(pad - halo_w)
-    outer = mask_of(pad)
-    inner = mask_of(pad + outline_w)
+    # --- README header ------------------------------------------------------
+    badge_dark.resize((256, 256), Image.LANCZOS).save(
+        os.path.join(a.out, "icon-256.png"), optimize=True)
+    print("wrote %s" % os.path.join(a.out, "icon-256.png"))
 
-    # The three colour fields, clipped to the inner silhouette.
-    bands = Image.new("RGBA", (s, s), (0, 0, 0, 0))
-    bd = ImageDraw.Draw(bands)
-    left, width = pad, s - 2 * pad
-    for colour, a, b in BANDS:
-        bd.rectangle([left + width * a, 0, left + width * b, s], fill=colour)
+    # --- favicons for the dashboard and the project page --------------------
+    # The dashboard is dark, so the light badge is the one that shows up in a
+    # tab. Two sizes: 16 for normal tabs, 32 for pinned tabs and bookmarks.
+    for n in (16, 32):
+        badge_light.resize((n, n), Image.LANCZOS).save(
+            os.path.join(a.out, "favicon-%d.png" % n), optimize=True)
+        print("wrote %s" % os.path.join(a.out, "favicon-%d.png" % n))
 
-    # A dark seam between bands so they stay separable at small sizes.
-    seam = max(2, int(s * 0.022))
-    for _, _, b in BANDS[:-1]:
-        x = left + width * b
-        bd.rectangle([x - seam / 2, 0, x + seam / 2, s], fill=EDGE)
-
-    img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
-    img.paste(Image.new("RGBA", (s, s), RIM), (0, 0), rim)      # light rim
-    img.paste(Image.new("RGBA", (s, s), EDGE), (0, 0), outer)   # dark outline
-    img.paste(bands, (0, 0), inner)                             # fill
-    return img.resize((size, size), Image.LANCZOS)
-
-
-def msi_art(out, tile):
-    """The two bitmaps WiX's stock UI expects.
-
-    Light, not dark. The dashboard's palette was the obvious choice and the
-    wrong one: WixUI draws every page title and description in **black**, and
-    that is baked into the stock dialogs - so a dark banner meant black text on
-    dark blue. The brand shows through the mark and the three colours instead,
-    on a background the standard text can actually be read against.
-
-    Sizes are fixed by WixUI: 493x58 for the strip across the top of every page,
-    493x312 for the welcome and finish pages. BMP because PNG is ignored.
-    """
-    PAPER = (250, 251, 253)       # near-white, matches the dialog background
-    PANEL = (236, 240, 246)       # left column of the welcome page
-    RULE = (203, 212, 226)
-    MUTED = (90, 104, 128)
-
-    # --- top banner: text space on the left, mark on the right ---
-    # WixUI writes the page title over the left of this strip, so nothing of
-    # ours may sit there.
+    # --- MSI artwork --------------------------------------------------------
+    # Light, because WixUI draws every page title in black. Sizes are fixed by
+    # WixUI: 493x58 for the strip on top of each page, 493x312 for the welcome
+    # and finish pages. BMP because PNG is ignored.
     banner = Image.new("RGB", (493, 58), PAPER)
+    banner.paste(PAPER, (0, 0, 493, 58))
+    from PIL import ImageDraw
     d = ImageDraw.Draw(banner)
     d.rectangle([0, 56, 493, 58], fill=RULE)
-    # Pushed to the edge and kept small: the banner is 493 px wide but the
-    # dialog is 370 units, so every pixel here costs 0.75 units of text space.
-    ico = tile.resize((34, 34), Image.LANCZOS)
-    banner.paste(ico, (493 - 34 - 10, 11), ico)
-    banner.save(os.path.join(out, "msi-banner.bmp"))
-    print("wrote %s" % os.path.join(out, "msi-banner.bmp"))
+    # Mark on the right: WixUI writes its title over the left of this strip,
+    # and 493 px here map to only 370 dialog units, so the mark has to stay
+    # small or the title runs into it.
+    m = fit(badge_dark, 40, 40)
+    banner.paste(m, (493 - m.width - 12, (56 - m.height) // 2), m)
+    banner.save(os.path.join(a.out, "msi-banner.bmp"))
+    print("wrote %s" % os.path.join(a.out, "msi-banner.bmp"))
 
-    # --- welcome/finish panel: mark on the left, text space on the right ---
     dlg = Image.new("RGB", (493, 312), PAPER)
     d = ImageDraw.Draw(dlg)
     d.rectangle([0, 0, 164, 312], fill=PANEL)
     d.rectangle([164, 0, 165, 312], fill=RULE)
-    big = tile.resize((108, 108), Image.LANCZOS)
-    dlg.paste(big, (28, 72), big)
-    y = 206
-    for colour, a, b in BANDS:
-        d.rectangle([28 + 108 * a, y, 28 + 108 * b, y + 6], fill=colour[:3])
-    d.text((28, 222), "NTLMv1", fill=(196, 60, 60))
-    d.text((28, 236), "NTLMv2", fill=(160, 112, 20))
-    d.text((28, 250), "Kerberos", fill=(20, 130, 92))
-    d.text((28, 272), "retire one,", fill=MUTED)
-    d.text((28, 285), "keep the other", fill=MUTED)
-    dlg.save(os.path.join(out, "msi-dialog.bmp"))
-    print("wrote %s" % os.path.join(out, "msi-dialog.bmp"))
-
-
-def main():
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--out", default="assets")
-    args = ap.parse_args()
-    os.makedirs(args.out, exist_ok=True)
-
-    # Windows picks the nearest size, so ship the ones it actually asks for:
-    # 16 in menus and lists, 32 on the desktop, 48 in Explorer, 256 for the
-    # large-tile views and the installer.
-    sizes = [16, 20, 24, 32, 40, 48, 64, 128, 256]
-    tiles = {n: render(n) for n in sizes}
-
-    ico = os.path.join(args.out, "ntlm-agent.ico")
-    tiles[256].save(ico, format="ICO", sizes=[(n, n) for n in sizes])
-    print("wrote %s (%d sizes)" % (ico, len(sizes)))
-
-    png = os.path.join(args.out, "icon-256.png")
-    tiles[256].save(png)
-    print("wrote %s" % png)
-
-    # Side-by-side sheet to judge the small sizes without squinting.
-    sheet = Image.new("RGBA", (sum(sizes) + 20 * len(sizes), 300), (14, 19, 31, 255))
-    x = 10
-    for n in sizes:
-        sheet.paste(tiles[n], (x, 150 - n // 2), tiles[n])
-        x += n + 20
-    sheet.save(os.path.join(args.out, "icon-preview.png"))
-    print("wrote %s" % os.path.join(args.out, "icon-preview.png"))
-
-    msi_art(args.out, tiles[256])
+    # The badge only. The wordmark contains the same mark, so showing both put
+    # it on the panel twice, and the product name is already in the dialog's
+    # own heading.
+    big = fit(badge_dark, 112, 112)
+    dlg.paste(big, ((164 - big.width) // 2, (312 - big.height) // 2), big)
+    dlg.save(os.path.join(a.out, "msi-dialog.bmp"))
+    print("wrote %s" % os.path.join(a.out, "msi-dialog.bmp"))
 
 
 if __name__ == "__main__":

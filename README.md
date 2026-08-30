@@ -1,8 +1,9 @@
 <div align="center">
 
-<img src="assets/icon-256.png" width="96" alt="">
-
-# NTLM-Analyzer
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/logo-wordmark-light.png">
+  <img src="assets/logo-wordmark-dark.png" width="420" alt="NTLM-Analyzer">
+</picture>
 
 ### Find out who still uses NTLM in your Active Directory — so you can retire it for Kerberos.
 
