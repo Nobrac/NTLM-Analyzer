@@ -19,10 +19,7 @@ fn main() {
             let mut res = winresource::WindowsResource::new();
             res.set_icon(icon);
             res.set("ProductName", "NTLM-Analyzer Agent");
-            res.set(
-                "FileDescription",
-                "Collects NTLM usage data for the NTLM-Analyzer",
-            );
+            res.set("FileDescription", "Collects NTLM usage data for the NTLM-Analyzer");
             res.set("CompanyName", "NTLM-Analyzer");
             res.set("LegalCopyright", "GPL-3.0-or-later");
             if let Err(e) = res.compile() {

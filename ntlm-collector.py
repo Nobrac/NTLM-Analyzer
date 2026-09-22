@@ -1007,6 +1007,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   --edge:rgba(158,180,225,.13); --edge2:rgba(158,180,225,.24);
   --ink:#eef2fa; --dim:#a3b1c9; --faint:#7c8aa4;
   --v1:#ff6b6b; --v2:#f5b841; --krb:#3ddc97; --pol:#a78bfa; --grey:#4a5872;
+  /* Brand accent (same muted gold as the logo and the project page), used only
+     for interactive chrome - focus rings, active pills, toggle states. Never
+     for data: v1/v2/krb keep meaning "insecure / outdated / safe" everywhere,
+     and this must not blur into that. */
+  --gold:#d9b84a; --gold-ink:#1b1704;
   --disp:'Segoe UI Variable Display','Segoe UI',system-ui,-apple-system,sans-serif;
   --text:'Segoe UI Variable Text','Segoe UI',system-ui,-apple-system,sans-serif;
   --mono:'Cascadia Mono','IBM Plex Mono',ui-monospace,Consolas,'SF Mono',monospace;
@@ -1026,7 +1031,7 @@ body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:0;
              radial-gradient(1200px 700px at 90% 108%,rgba(61,220,151,.042),transparent 62%)}
 .stage{position:relative;z-index:1}
 ::selection{background:rgba(61,220,151,.25)}
-:focus-visible{outline:2px solid var(--krb);outline-offset:2px;border-radius:6px}
+:focus-visible{outline:2px solid var(--gold);outline-offset:2px;border-radius:6px}
 button{font:inherit}
 a{color:inherit}
 
@@ -1050,13 +1055,14 @@ header{position:sticky;top:0;z-index:60;backdrop-filter:blur(18px) saturate(1.4)
 .pill button{background:none;border:0;color:var(--dim);font-family:var(--mono);font-size:12.5px;
   padding:5px 11px;border-radius:7px;cursor:pointer;transition:.18s;white-space:nowrap}
 .pill button:hover{color:var(--ink)}
-.pill button[aria-pressed=true]{background:rgba(255,255,255,.08);color:var(--ink)}
+.pill button[aria-pressed=true]{background:rgba(217,184,74,.16);color:var(--gold);
+  box-shadow:inset 0 0 0 1px rgba(217,184,74,.4)}
 select,.ghost{background:rgba(255,255,255,.035);border:1px solid var(--edge);color:var(--ink);
   border-radius:9px;padding:6px 10px;font-family:var(--mono);font-size:12.5px;cursor:pointer;transition:.18s}
 select:hover,.ghost:hover{border-color:var(--edge2);background:rgba(255,255,255,.06)}
 select option,.sel-st option{background:#1d2637;color:var(--ink)}
 select option:checked,.sel-st option:checked{background:#26314a;color:#fff}
-.ghost[aria-pressed=true]{background:rgba(61,220,151,.1);border-color:rgba(61,220,151,.35);color:#9ff0cb}
+.ghost[aria-pressed=true]{background:rgba(217,184,74,.14);border-color:rgba(217,184,74,.4);color:var(--gold)}
 
 .herotop{display:flex;gap:clamp(24px,4vw,70px);align-items:flex-start}
 .herotext{flex:1 1 auto;min-width:0}
@@ -1216,8 +1222,8 @@ table{width:100%;border-collapse:collapse}
 thead th{background:rgba(158,180,225,.055);border-bottom:1px solid var(--edge2);
   position:relative;cursor:pointer;user-select:none}
 thead th:hover{color:var(--ink)}
-thead th[aria-sort=ascending]::after{content:" \\2191";color:var(--krb)}
-thead th[aria-sort=descending]::after{content:" \\2193";color:var(--krb)}
+thead th[aria-sort=ascending]::after{content:" \2191";color:var(--gold)}
+thead th[aria-sort=descending]::after{content:" \2193";color:var(--gold)}
 th{font-family:var(--mono);font-size:12.5px;letter-spacing:.1em;text-transform:uppercase;
   color:var(--dim);font-weight:600;text-align:left;padding:12px 22px 12px;white-space:nowrap}
 /* First data row needs no line of its own - the band already draws it. */

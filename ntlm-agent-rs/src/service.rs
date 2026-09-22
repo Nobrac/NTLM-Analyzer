@@ -135,8 +135,8 @@ mod windows_impl {
 
             // Wait for the next interval OR wake up immediately on a stop signal.
             match rx.recv_timeout(interval) {
-                Ok(()) => break,                                    // stop/shutdown
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,   // next cycle
+                Ok(()) => break, // stop/shutdown
+                Err(mpsc::RecvTimeoutError::Timeout) => continue, // next cycle
                 Err(mpsc::RecvTimeoutError::Disconnected) => break, // sender gone
             }
         }
@@ -179,7 +179,7 @@ mod windows_impl {
             .args([
                 "/inheritance:r",
                 "/grant:r",
-                "*S-1-5-18:(OI)(CI)F",     // SYSTEM
+                "*S-1-5-18:(OI)(CI)F", // SYSTEM
                 "*S-1-5-32-544:(OI)(CI)F", // BUILTIN\Administratoren
             ])
             .status();
@@ -271,7 +271,8 @@ mod windows_impl {
                 OsString::from(format!(".\\{a}"))
             }
         });
-        let account_password: Option<OsString> = cfg.service_password.as_ref().map(OsString::from);
+        let account_password: Option<OsString> =
+            cfg.service_password.as_ref().map(OsString::from);
 
         let info = ServiceInfo {
             name: OsString::from(SERVICE_NAME),
@@ -345,8 +346,9 @@ mod windows_impl {
 
     /// Stop the service (if still running) and remove it.
     pub fn uninstall() -> R {
-        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
-            .map_err(|e| format!("connecting to the service manager failed: {e:?}"))?;
+        let manager =
+            ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+                .map_err(|e| format!("connecting to the service manager failed: {e:?}"))?;
         let service = manager
             .open_service(
                 SERVICE_NAME,

@@ -11,558 +11,520 @@
 <link rel="icon" type="image/png" sizes="32x32" href="img/favicon-32.png">
 <style>
 /* ============================================================================
-   Design note, so the next person does not undo it by accident.
+   Design note.
 
-   The page has two voices, because the product has two.
-     · DARK bands are the machine talking: raw events, monospaced headlines,
-       the unreadable material an admin actually starts with.
-     · PAPER bands are the answer: a cool technical off-white, sans display
-       type, plain sentences.
-   The hero performs that handover once, in the open, on a real event record.
-   The signal colours (red NTLMv1, amber NTLMv2, green Kerberos) keep exactly
-   the meaning they have inside the tool, so page and dashboard teach the same
-   vocabulary. No web fonts: the product's own promise is that nothing loads
-   from the internet, and a landing page that breaks that promise is a poor
-   advertisement for it.
+   Editorial grid: hairline borders instead of cards with shadows, a masthead
+   rather than a hero banner, big tabular numerals for the one stat that
+   matters. Reference: a mockup the user built in another tool and handed me
+   as a design spec (not usable as-is - proprietary tags, external web fonts,
+   placeholder asset ids). The structure and much of the copy come from there;
+   two things were changed on purpose, not by oversight:
+
+     · Accent colour is the brand gold (#FACC15, from logo-badge-dark/
+       logo-wordmark), not the mockup's red. Red already means "NTLMv1,
+       insecure" everywhere else on this page and in the dashboard itself -
+       using it as the general call-to-action colour would teach the wrong
+       thing every time a button just happens to be red.
+     · The handover bar keeps its real three colours (red/amber/green). The
+       mockup rendered it red/light-red/grey, which drops the one piece of
+       information the bar exists to carry - that Kerberos (green) is the
+       majority and the safe state.
+
+   No web fonts, same as the dashboard: this page makes the identical promise
+   ("no external requests") and a landing page that quietly breaks it while
+   saying otherwise would be a bad advertisement for the product.
    ========================================================================== */
 :root{
   color-scheme:dark;
-  --log:#080B14;          /* the dark voice - deeper than the app's own bg */
-  --log2:#0F1524;
-  --paper:#E9EDF3;        /* cool paper, not cream: this is a Windows world  */
-  --ink:#F3F6FB;
-  --ink-dark:#131A28;     /* type colour on paper */
-  --dim:#93A1BC;
-  --faint:#63718C;
-  --rule:rgba(147,161,188,.20);
-  --rule-dark:rgba(19,26,40,.16);
-  --v1:#FF5A5A;           /* NTLMv1 - insecure   */
-  --v2:#F5B841;           /* NTLMv2 - outdated   */
-  --krb:#3DDC97;          /* Kerberos - safe     */
-  --krb-ink:#12805A;      /* same green, legible on paper */
+  --bg:#0E0C09;            /* warm near-black, not the dashboard's blue-black -
+                               this page is print/editorial, not a terminal   */
+  --panel:#171310;
+  --ink:#F5F1E8;
+  --dim:#A69C8C;
+  --faint:#786F60;
+  --line:rgba(230,220,200,.16);
+  --line-strong:rgba(230,220,200,.34);
+  --gold:#D9B84A;   /* softened from the brand's #FACC15: same hue, less neon */
+  --gold-ink:#4A3C00;      /* text-on-gold */
+  --v1:#FF5A5A; --v2:#F5B841; --krb:#3DDC97;
   --disp:'Segoe UI Variable Display','Segoe UI',system-ui,-apple-system,'Helvetica Neue',sans-serif;
   --body:'Segoe UI Variable Text','Segoe UI',system-ui,-apple-system,sans-serif;
   --mono:'Cascadia Mono','Cascadia Code','IBM Plex Mono',ui-monospace,Consolas,'SF Mono',monospace;
-  --gut:clamp(20px,5vw,80px);
-  --wide:1320px;
+  --gut:clamp(20px,5vw,72px);
 }
 *{box-sizing:border-box}
 html{scroll-behavior:smooth}
-body{margin:0;background:var(--log);color:var(--ink);font-family:var(--body);
-  font-size:17px;line-height:1.62;-webkit-font-smoothing:antialiased}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--body);
+  font-size:16.5px;line-height:1.6;-webkit-font-smoothing:antialiased}
 img{max-width:100%;display:block}
 a{color:inherit}
-:focus-visible{outline:2px solid var(--krb);outline-offset:3px;border-radius:4px}
-code{font-family:var(--mono);font-size:.9em}
+code{font-family:var(--mono);font-size:.88em}
+:focus-visible{outline:2px solid var(--gold);outline-offset:3px;border-radius:2px}
 
-/* ---------- shared band scaffolding ---------- */
-.band{padding:clamp(56px,9vw,132px) var(--gut)}
-.band > .inner{max-width:var(--wide);margin:0 auto}
-.band--paper{background:var(--paper);color:var(--ink-dark)}
-.band--paper a{color:var(--krb-ink)}
+.kicker{font-family:var(--mono);font-size:11.5px;letter-spacing:.14em;text-transform:uppercase;
+  color:var(--gold);display:flex;align-items:center;gap:9px}
+.kicker::before{content:"";width:20px;height:1px;background:currentColor;flex:none}
 
-/* Eyebrows are not decoration: each one names where the data comes from. */
-.src{font-family:var(--mono);font-size:12px;letter-spacing:.16em;text-transform:uppercase;
-  color:var(--faint);display:flex;align-items:center;gap:10px;margin-bottom:18px}
-.src::before{content:"";width:26px;height:1px;background:currentColor;flex:none}
-.band--paper .src{color:#5A6982}
+/* buttons */
+.b{display:inline-flex;align-items:center;justify-content:center;min-height:42px;
+  padding:9px 18px;border:1px solid var(--line-strong);color:var(--ink);text-decoration:none;
+  font-family:var(--mono);font-size:13.5px;letter-spacing:.01em;background:transparent;
+  transition:border-color .15s,background .15s,color .15s}
+.b:hover{border-color:var(--gold);color:var(--gold)}
+.b--go{background:var(--gold);border-color:var(--gold);color:var(--gold-ink);font-weight:700}
+.b--go:hover{background:#FFE066;border-color:#FFE066;color:var(--gold-ink)}
 
-/* The two headline voices. */
-.h-log{font-family:var(--mono);font-weight:600;letter-spacing:-.02em;line-height:1.16;
-  font-size:clamp(26px,3.9vw,46px);margin:0 0 20px}
-.h-say{font-family:var(--disp);font-weight:700;letter-spacing:-.028em;line-height:1.08;
-  font-size:clamp(30px,4.6vw,58px);margin:0 0 22px;max-width:19ch}
-.lede{font-size:clamp(16.5px,1.5vw,20px);color:var(--dim);max-width:60ch;margin:0}
-.band--paper .lede{color:#44536C}
-
-/* ---------- top bar ---------- */
-.top{position:sticky;top:0;z-index:80;background:rgba(8,11,20,.86);
-  backdrop-filter:blur(20px) saturate(1.5);border-bottom:1px solid var(--rule)}
-.top .inner{max-width:var(--wide);margin:0 auto;padding:11px var(--gut);
-  display:flex;align-items:center;gap:14px;flex-wrap:wrap}
-/* The wordmark is artwork, not type: exported at twice its display height so
-   it stays crisp on a dense screen, with explicit dimensions so the header
-   does not jump while it loads. */
+/* ---------- masthead ---------- */
+.mast{position:sticky;top:0;z-index:80;background:rgba(14,12,9,.88);
+  backdrop-filter:blur(18px) saturate(1.3);border-bottom:2px solid var(--line-strong)}
+.mast__in{padding:12px var(--gut);display:flex;align-items:center;gap:16px;flex-wrap:wrap}
 .mark{display:flex;align-items:center;text-decoration:none}
-.mark img{height:42px;width:auto;display:block}
-@media(max-width:760px){.mark img{height:34px}}
-.topnav{margin-left:auto;display:flex;gap:9px;flex-wrap:wrap}
-.b{display:inline-flex;align-items:center;min-height:40px;padding:9px 17px;border-radius:2px;
-  border:1px solid var(--rule);background:transparent;color:var(--ink);text-decoration:none;
-  font-family:var(--mono);font-size:13.5px;letter-spacing:.01em;
-  transition:border-color .16s,background .16s,color .16s}
-.b:hover{border-color:var(--krb);color:var(--krb)}
-.b--go{background:var(--krb);border-color:var(--krb);color:#04241A;font-weight:700}
-.b--go:hover{background:#5BE8AB;border-color:#5BE8AB;color:#04241A}
-.band--paper .b{border-color:var(--rule-dark);color:var(--ink-dark)}
-.band--paper .b:hover{border-color:var(--krb-ink);color:var(--krb-ink)}
+.mark img{height:32px;width:auto;display:block}
+@media(max-width:760px){.mark img{height:26px}}
+.mnav{margin-left:auto;display:flex;align-items:center;gap:22px;flex-wrap:wrap;
+  font-family:var(--mono);font-size:13px}
+.mnav a{text-decoration:none;color:var(--dim)}
+.mnav a:hover{color:var(--gold)}
+@media(max-width:900px){.mnav a:not(.b){display:none}}
+
+/* ---------- section scaffolding: every band is a bordered strip ---------- */
+.strip{border-bottom:2px solid var(--line-strong)}
+.strip__in{padding:clamp(20px,3vw,var(--gut)) var(--gut)}
+.split{display:grid;grid-template-columns:1fr;min-width:0}
+@media(min-width:820px){.split{grid-template-columns:1fr 1fr}}
+.split > div{padding:clamp(40px,6vw,88px) var(--gut);min-width:0}
+.split > div + div{border-top:2px solid var(--line-strong)}
+@media(min-width:820px){
+  .split > div + div{border-top:0;border-left:2px solid var(--line-strong)}
+}
 
 /* ---------- hero ---------- */
-.hero{padding:clamp(46px,7vw,104px) var(--gut) clamp(40px,6vw,88px)}
-.hero .inner{max-width:var(--wide);margin:0 auto}
-/* Wide screens put the claim and the evidence side by side, so the decoder -
-   the one thing this page is remembered by - is above the fold instead of a
-   scroll away. Below that width they stack in reading order. */
-@media(min-width:1180px){
-  .hero .inner{display:grid;grid-template-columns:minmax(0,46%) minmax(0,54%);min-width:0;
-    gap:clamp(36px,4vw,64px);align-items:center}
-  .hero__say{grid-column:1}
-  .decode{grid-column:2;margin-top:0}
-  .hero__ratio{grid-column:1 / -1;margin-top:8px}
-}
-.chip{display:inline-flex;align-items:center;gap:10px;border:1px solid var(--rule);
-  padding:7px 14px;font-family:var(--mono);font-size:12.5px;color:var(--dim);
-  margin-bottom:30px;border-radius:2px}
-.chip b{color:var(--v2);font-weight:600}
-.chip .pulse{width:7px;height:7px;border-radius:50%;background:var(--v2);flex:none;
-  animation:pulse 2.6s ease-in-out infinite}
+.hero h1{font-family:var(--disp);font-weight:700;letter-spacing:-.03em;line-height:1.04;
+  font-size:clamp(34px,4.6vw,58px);margin:clamp(18px,3vw,26px) 0 0}
+.hero h1 em{font-style:normal;color:var(--gold)}
+.hero p{margin:22px 0 0;max-width:34em;font-size:clamp(16px,1.7vw,18.5px);color:var(--dim)}
+.hero .acts{display:flex;gap:10px;flex-wrap:wrap;margin-top:32px}
+.pulse{width:7px;height:7px;border-radius:50%;background:var(--gold);flex:none;
+  animation:pulse 2.4s ease-in-out infinite}
 @keyframes pulse{0%,100%{opacity:.35}50%{opacity:1}}
 
-.hero h1{font-family:var(--disp);font-weight:700;letter-spacing:-.035em;line-height:1.03;
-  font-size:clamp(36px,5.4vw,68px);margin:0 0 24px;max-width:17ch}
-.hero h1 em{font-style:normal;color:var(--v2)}
-.hero .lede{max-width:56ch;margin-bottom:34px}
-.acts{display:flex;gap:11px;flex-wrap:wrap}
-
-/* ---------- the decoder: the one orchestrated moment ---------- */
-.decode{margin-top:clamp(42px,6vw,76px);border:1px solid var(--rule);background:var(--log2)}
-.decode__bar{display:flex;align-items:center;gap:12px;padding:11px 16px;flex-wrap:wrap;
-  border-bottom:1px solid var(--rule);font-family:var(--mono);font-size:12px;color:var(--faint)}
-.decode__bar .id{color:var(--v2)}
-/* min-width:0 on the children: grid items default to min-width:auto, so the
-   monospaced event block pushed its own track wider than the screen instead of
-   scrolling inside it - 200 px of sideways scroll on a phone. Same reason the
-   command blocks need it inside the steps. */
-.decode__grid{display:grid;grid-template-columns:1fr;min-width:0}
-.decode__grid > *{min-width:0}
-@media(min-width:940px) and (max-width:1179px){.decode__grid{grid-template-columns:1fr 1fr}}
-.decode__raw{padding:22px clamp(16px,2.4vw,28px);font-family:var(--mono);font-size:13px;
-  line-height:1.95;color:var(--dim);overflow-x:auto;white-space:pre;margin:0;
-  border-bottom:1px solid var(--rule)}
-@media(min-width:940px) and (max-width:1179px){
-  .decode__raw{border-bottom:0;border-right:1px solid var(--rule)}}
-.decode__raw mark{background:transparent;color:var(--dim);padding:1px 4px;margin:0 -4px;
-  border-radius:2px;transition:background .45s ease,color .45s ease}
-.decode__raw mark.lit{background:rgba(245,184,65,.17);color:#FFD98A}
-.decode__out{padding:22px clamp(16px,2.4vw,28px);display:flex;flex-direction:column;
-  justify-content:center;gap:16px}
-.oline{opacity:0;transform:translateY(7px);transition:opacity .5s ease,transform .5s ease}
-.oline.in{opacity:1;transform:none}
-.oline .k{font-family:var(--mono);font-size:11.5px;letter-spacing:.15em;text-transform:uppercase;
-  color:var(--faint);display:block;margin-bottom:5px}
-.oline .v{font-family:var(--disp);font-size:clamp(18px,2vw,24px);font-weight:660;
-  letter-spacing:-.02em;line-height:1.28;display:block}
-.oline .v code{color:var(--v2)}
-.oline--fix{border-left:2px solid var(--krb);padding-left:15px}
-.oline--fix .v{font-family:var(--mono);font-size:14px;font-weight:500;color:var(--krb);
-  line-height:1.6;word-break:break-all;letter-spacing:0}
-
-/* the three-band ratio, exactly as the tool draws it */
-.ratio{display:flex;height:10px;gap:2px;margin:34px 0 11px}
-.ratio i{display:block}
-.rkey{display:flex;gap:22px;flex-wrap:wrap;font-family:var(--mono);font-size:12.5px;
+.stat-lbl{font-family:var(--mono);font-size:11.5px;letter-spacing:.1em;text-transform:uppercase;
   color:var(--faint)}
-.rkey b{font-weight:600}
+.stat-num{font-family:var(--disp);font-weight:700;font-size:clamp(64px,8vw,104px);line-height:.86;
+  letter-spacing:-.04em;font-variant-numeric:tabular-nums;margin-top:8px}
+.stat-sub{margin-top:10px;font-size:13px;line-height:1.6;color:var(--dim)}
+.stat-sub b{color:var(--gold);font-weight:600}
 
-/* ---------- answers (paper) ---------- */
-.answers{display:grid;gap:1px;background:var(--rule-dark);margin-top:clamp(34px,4vw,54px);
-  border:1px solid var(--rule-dark)}
-@media(min-width:900px){.answers{grid-template-columns:repeat(3,1fr)}}
-.ans{background:var(--paper);padding:clamp(24px,2.6vw,34px)}
-.ans__q{font-family:var(--mono);font-size:12.5px;color:#5A6982;margin-bottom:14px}
-.ans__a{font-family:var(--disp);font-size:clamp(19px,2vw,23px);font-weight:680;
-  letter-spacing:-.02em;line-height:1.24;margin:0 0 12px}
-.ans p{margin:0;color:#44536C;font-size:15.5px;line-height:1.6}
+.hover-lbl{font-family:var(--mono);font-size:11.5px;letter-spacing:.1em;text-transform:uppercase;
+  color:var(--faint);margin-top:clamp(28px,4vw,44px)}
+.hbar{display:flex;height:12px;margin-top:14px;gap:2px}
+.hbar i{display:block}
+.hlist{margin-top:14px}
+.hrow{display:flex;align-items:center;gap:11px;padding:9px 0;border-top:1px solid var(--line);
+  font-size:14px}
+.hrow .sw{width:9px;height:9px;flex:none}
+.hrow b{font-weight:600}
+/* .note only, not every span - the colour swatch is a span too, and a generic
+   "span{margin-left:auto}" gave it an auto margin as well. Two flex items with
+   margin-left:auto split the remaining space between them, so the swatch drifted
+   right by an amount that depended on how long "NTLMv1"/"NTLMv2"/"Kerberos" was
+   - visibly unaligned rather than a fixed left edge. */
+.hrow .note{margin-left:auto;color:var(--dim);font-size:13px}
 
-/* ---------- tour (dark) ---------- */
-.tour{display:flex;flex-direction:column;gap:clamp(58px,7vw,112px);
-  margin-top:clamp(40px,5vw,70px)}
-.view{display:grid;gap:24px;grid-template-columns:1fr;align-items:center}
-@media(min-width:1000px){
-  .view{grid-template-columns:minmax(0,38%) minmax(0,62%);gap:clamp(32px,4vw,62px)}
-  /* The mirrored rows need mirrored columns too. Only reordering the text left
-     the screenshot in the narrow column, so every other one rendered at 38 %
-     and was unreadable. */
-  .view--flip{grid-template-columns:minmax(0,62%) minmax(0,38%)}
-  /* The drawer capture is a tall, narrow window rather than a wide panel.
-     Giving its column the image's own width keeps it at 1:1 - stretched to the
-     usual 62 % it was upscaled by 1.4 and visibly soft - and hands the spare
-     room to the text instead. */
-  .view--narrow{grid-template-columns:minmax(0,1fr) auto}
-  .view--flip .view__txt{order:2}
+/* ---------- decoder ---------- */
+.dec-top{display:flex;flex-wrap:wrap;align-items:flex-end;gap:20px;margin-bottom:clamp(24px,3vw,40px)}
+.dec-top h2{font-family:var(--disp);font-weight:700;letter-spacing:-.025em;line-height:1.12;
+  font-size:clamp(25px,3.2vw,38px);margin:10px 0 0;max-width:22ch}
+.dec-grid{display:grid;grid-template-columns:1fr;min-width:0}
+@media(min-width:900px){.dec-grid{grid-template-columns:1fr 1fr}}
+.dec-grid > *{min-width:0}
+.dec-raw,.dec-out{padding:clamp(20px,2.6vw,30px)}
+.dec-raw{background:var(--panel);border-bottom:2px solid var(--line-strong)}
+@media(min-width:900px){.dec-raw{border-bottom:0;border-right:2px solid var(--line-strong)}}
+.dec-bar{display:flex;justify-content:space-between;gap:6px 10px;flex-wrap:wrap;min-width:0;
+  font-family:var(--mono);font-size:11.5px;letter-spacing:.06em;text-transform:uppercase;
+  color:var(--faint);margin-bottom:16px}
+.dec-bar span:first-child{color:var(--gold)}
+.dec-line{display:flex;gap:12px;font-family:var(--mono);font-size:13px;line-height:2.05;min-width:0;flex-wrap:wrap}
+.dec-line .k{width:16em;flex:none;color:var(--faint)}
+/* Below ~500 px the fixed 16em label plus a long value (SVC_BACKUP) no longer
+   fits the line even after every other narrow-screen fix - stack instead of
+   truncating silently. */
+@media(max-width:520px){
+  .dec-line{flex-direction:column;gap:2px;line-height:1.5;padding:6px 0}
+  .dec-line .k{width:auto}
 }
-.view__txt h3{font-family:var(--disp);font-size:clamp(22px,2.5vw,31px);font-weight:680;
-  letter-spacing:-.024em;line-height:1.14;margin:0 0 13px}
-.view__txt p{margin:0 0 15px;color:var(--dim);font-size:16.5px}
-.view__note{font-family:var(--mono);font-size:12.5px;color:var(--faint);
-  border-top:1px solid var(--rule);padding-top:11px}
-.view__note b{color:var(--krb);font-weight:600}
-.view figure{margin:0;opacity:0;transform:translateY(18px);
-  transition:opacity .7s ease,transform .7s ease}
-.view figure.in{opacity:1;transform:none}
-.view figure img{border:1px solid var(--rule);background:var(--log2);
-  width:100%;height:auto}
-/* Never enlarge a screenshot past its own pixels. The event drawer is a narrow
-   527 px capture and was being stretched to 756 px, which is exactly why it
-   looked soft while every other shot is downscaled. It sits centred in its
-   column instead. */
-.view figure img{max-width:min(100%, var(--nat, 100%))}
-.view figure{display:flex;justify-content:center}
+.dec-line .v{padding:0 6px;margin:0 -6px;transition:background .4s ease,color .4s ease,font-weight .4s ease}
+.dec-line .v.lit{background:rgba(250,204,21,.18);color:var(--gold);font-weight:600}
+.dec-out .row{display:grid;grid-template-columns:30px 1fr;gap:14px;padding:15px 0;
+  border-top:1px solid var(--line);opacity:0;transform:translateY(8px);
+  transition:opacity .5s ease,transform .5s ease}
+.dec-out .row.in{opacity:1;transform:none}
+.dec-out .row:first-child{border-top:0}
+.rn{font-family:var(--mono);font-size:11.5px;color:var(--gold);padding-top:3px}
+.rlbl{font-family:var(--mono);font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--faint)}
+.rval{margin-top:4px;font-family:var(--disp);font-weight:640;font-size:clamp(16.5px,1.9vw,19.5px);
+  line-height:1.32;letter-spacing:-.012em}
+.rval code{color:var(--gold)}
+.dec-fix{margin-top:18px;padding:15px 16px;background:var(--panel);border-left:2px solid var(--krb);
+  font-family:var(--mono);font-size:13.5px;color:var(--krb);opacity:0;transition:opacity .5s ease;
+  overflow-x:auto;white-space:pre}
+.dec-fix.in{opacity:1}
+.replay{font-family:var(--mono);font-size:12.5px;background:transparent;border:1px solid var(--line-strong);
+  color:var(--dim);padding:8px 14px;cursor:pointer;min-height:38px}
+.replay:hover{border-color:var(--gold);color:var(--gold)}
 
-/* ---------- steps (paper) ---------- */
-.steps{counter-reset:s;display:flex;flex-direction:column;gap:1px;background:var(--rule-dark);
-  border:1px solid var(--rule-dark);margin-top:clamp(32px,4vw,50px)}
-.step{background:var(--paper);padding:clamp(22px,2.6vw,32px);display:grid;gap:6px 26px;
-  grid-template-columns:1fr;min-width:0}
+/* ---------- three answers ---------- */
+.ans-grid{display:grid;grid-template-columns:1fr}
+@media(min-width:760px){.ans-grid{grid-template-columns:repeat(3,1fr)}}
+.ans{padding:clamp(26px,3vw,36px) var(--gut)}
+@media(min-width:760px){
+  .ans{border-left:1px solid var(--line)}
+  .ans:first-child{border-left:0}
+}
+@media(max-width:759px){.ans + .ans{border-top:1px solid var(--line)}}
+.ans .q{font-family:var(--mono);font-size:13.5px;color:var(--gold)}
+.ans h3{font-family:var(--disp);font-weight:680;font-size:22px;letter-spacing:-.02em;line-height:1.22;
+  margin:14px 0 0}
+.ans p{margin:14px 0 0;color:var(--dim);font-size:15px;line-height:1.6}
+
+/* ---------- dashboard preview ---------- */
+.dash-top{display:flex;flex-wrap:wrap;align-items:flex-end;gap:18px;margin-bottom:clamp(24px,3vw,40px)}
+.dash-top h2{font-family:var(--disp);font-weight:700;letter-spacing:-.025em;line-height:1.12;
+  font-size:clamp(25px,3.2vw,38px);margin:10px 0 0;max-width:20ch}
+.browser{border:2px solid var(--line-strong);min-width:0}
+.browser__bar{display:flex;align-items:center;gap:9px;padding:9px 13px;border-bottom:2px solid var(--line-strong);
+  background:var(--panel);font-family:var(--mono);font-size:11.5px;color:var(--faint)}
+.browser__bar i{width:7px;height:7px;background:var(--faint);display:block}
+.browser__bar span{margin-left:8px}
+.browser img{width:100%;height:auto}
+
+.pgrid{display:grid;grid-template-columns:1fr;gap:1px;background:var(--line-strong);
+  border:2px solid var(--line-strong);margin-top:2px;min-width:0}
+@media(min-width:700px){.pgrid{grid-template-columns:repeat(3,1fr)}}
+.pgrid > *{min-width:0}
+.pcard{background:var(--bg);text-decoration:none;color:inherit;display:block}
+.pcard__shot{overflow:hidden;height:168px;border-bottom:1px solid var(--line)}
+.pcard__shot img{width:100%;height:100%;object-fit:cover;object-position:top left;
+  transition:transform .3s ease}
+.pcard:hover .pcard__shot img{transform:scale(1.035)}
+.pcard__txt{padding:18px 20px}
+.pcard .kicker{font-size:10.5px}
+.pcard h4{font-family:var(--disp);font-weight:660;font-size:16.5px;margin:10px 0 0;letter-spacing:-.015em}
+.pcard p{margin:8px 0 0;font-size:13.5px;line-height:1.55;color:var(--dim)}
+
+/* ---------- setup ---------- */
+.setup-top{padding:clamp(40px,6vw,72px) var(--gut) clamp(24px,3vw,32px)}
+.setup-top h2{font-family:var(--disp);font-weight:700;letter-spacing:-.025em;line-height:1.1;
+  font-size:clamp(25px,3.2vw,38px);margin:12px 0 0;max-width:22ch}
+.setup-top p{margin:16px 0 0;max-width:52ch;color:var(--dim);font-size:15.5px}
+.steps{display:flex;flex-direction:column}
+.step{display:grid;grid-template-columns:1fr;border-top:2px solid var(--line-strong);min-width:0}
+@media(min-width:820px){.step{grid-template-columns:1fr 1fr}}
 .step > *{min-width:0}
-@media(min-width:820px){.step{grid-template-columns:64px 1fr}}
-.step::before{counter-increment:s;content:counter(s,decimal-leading-zero);
-  font-family:var(--mono);font-size:13px;color:var(--krb-ink);letter-spacing:.1em}
-.step h3{font-family:var(--disp);font-size:clamp(19px,2vw,23px);font-weight:680;
-  letter-spacing:-.02em;margin:0 0 8px}
-.step p{margin:0 0 14px;color:#44536C;font-size:15.5px;max-width:62ch}
-.step p:last-child{margin-bottom:0}
-.cmd{font-family:var(--mono);font-size:13px;background:var(--log);color:var(--ink);
-  padding:13px 15px;overflow-x:auto;white-space:pre;line-height:1.8;margin:0}
-.cmd .c{color:var(--faint)}
-.cmd .p{color:var(--krb)}
-.warn{border-left:2px solid var(--v2);padding-left:13px;color:#6A5320;font-size:14.5px}
+.step__txt{padding:clamp(26px,3vw,40px) var(--gut);display:flex;gap:16px}
+@media(min-width:820px){.step__txt{border-right:2px solid var(--line-strong)}}
+.step__txt .n{font-family:var(--disp);font-weight:700;font-size:13px;color:var(--gold);flex:none;padding-top:3px}
+.step__txt h4{font-family:var(--disp);font-weight:680;font-size:20px;letter-spacing:-.02em;margin:0 0 10px}
+.step__txt p{margin:0;font-size:15px;line-height:1.6;color:var(--dim);max-width:44ch}
+.step__txt .warn{margin-top:10px;padding-left:12px;border-left:2px solid var(--v2);color:#D9B96A;font-size:13.5px}
+.step__code{display:flex;align-items:center;padding:clamp(22px,3vw,var(--gut));min-width:0}
+.step__code pre{width:100%;margin:0;padding:15px 16px;background:var(--panel);font-family:var(--mono);
+  font-size:13px;line-height:1.85;color:var(--ink);overflow-x:auto;white-space:pre;min-width:0}
+.step__code .c{color:var(--faint)}
+.step__code .p{color:var(--gold)}
 
-/* ---------- principles (dark) ---------- */
-.pri{display:grid;gap:1px;background:var(--rule);border:1px solid var(--rule);
-  margin-top:clamp(34px,4vw,54px)}
-@media(min-width:900px){.pri{grid-template-columns:repeat(3,1fr)}}
-.p1{background:var(--log);padding:clamp(24px,2.6vw,34px)}
-.p1 h3{font-family:var(--mono);font-size:14px;font-weight:600;color:var(--krb);
-  margin:0 0 11px}
-.p1 p{margin:0;color:var(--dim);font-size:15.5px}
+/* ---------- poster ---------- */
+.poster{padding:clamp(56px,8vw,104px) var(--gut);background:var(--gold);color:var(--gold-ink)}
+.poster .kicker{color:var(--gold-ink);opacity:.72}
+.poster .kicker::before{background:var(--gold-ink)}
+.poster h2{font-family:var(--disp);font-weight:700;letter-spacing:-.03em;line-height:1.04;
+  font-size:clamp(30px,4.6vw,54px);margin:16px 0 clamp(36px,5vw,64px);max-width:20ch}
+.pri{display:grid;grid-template-columns:1fr;gap:clamp(24px,3vw,40px);min-width:0}
+@media(min-width:820px){.pri{grid-template-columns:repeat(3,1fr)}}
+.pri > div{min-width:0}
+.pri > div{border-top:2px solid var(--gold-ink);padding-top:16px}
+.pri h3{font-family:var(--disp);font-weight:700;font-size:23px;letter-spacing:-.02em;margin:0}
+.pri p{margin:10px 0 0;font-size:15px;line-height:1.6;opacity:.82}
 
-/* ---------- foot ---------- */
-.foot{border-top:1px solid var(--rule);padding:clamp(40px,5vw,64px) var(--gut) 26px}
-.foot .inner{max-width:var(--wide);margin:0 auto;display:grid;gap:26px}
-@media(min-width:880px){.foot .inner{grid-template-columns:1.5fr 1fr}}
-.foot p{color:var(--dim);max-width:50ch;margin:12px 0 0;font-size:15.5px}
-.foot .topnav{margin-left:0}
-@media(min-width:880px){.foot .topnav{justify-content:flex-end;align-content:start}}
-.fine{max-width:var(--wide);margin:34px auto 0;padding-top:20px;border-top:1px solid var(--rule);
+/* ---------- footer ---------- */
+.foot{padding:clamp(44px,6vw,72px) var(--gut) 30px}
+.foot__top{display:grid;grid-template-columns:1fr;gap:26px;min-width:0}
+@media(min-width:860px){.foot__top{grid-template-columns:1.5fr 1fr}}
+.foot__top > *{min-width:0}
+.foot h3{font-family:var(--disp);font-weight:680;font-size:clamp(21px,2.4vw,29px);letter-spacing:-.02em;
+  line-height:1.16;margin:18px 0 0;max-width:24ch}
+.foot p{margin:12px 0 0;color:var(--dim);font-size:15px;max-width:44ch}
+.foot .acts{display:flex;gap:10px;flex-wrap:wrap;margin-top:26px}
+@media(min-width:860px){.foot .acts{justify-content:flex-end;align-content:start}}
+.fine{margin-top:clamp(36px,5vw,56px);padding-top:18px;border-top:1px solid var(--line);
   font-family:var(--mono);font-size:12px;color:var(--faint);line-height:1.8}
 
 @media(max-width:760px){
-  .top{position:static}
-  .topnav a[href^="#"]{display:none}
+  .mast{position:static}
 }
-/* Nothing here is load-bearing: with motion reduced every element simply
-   starts in its final state. */
 @media(prefers-reduced-motion:reduce){
   html{scroll-behavior:auto}
   *{transition:none!important;animation:none!important}
-  .oline,.view figure{opacity:1;transform:none}
+  .dec-out .row,.dec-fix{opacity:1;transform:none}
 }
 </style>
 </head>
 <body>
 
-<div class="top">
-  <div class="inner">
+<div class="mast">
+  <div class="mast__in">
     <a class="mark" href="#top"><img src="img/wordmark.png" width="326" height="96" alt="NTLM-Analyzer"></a>
-    <nav class="topnav">
-      <a class="b" href="#answers">What it tells you</a>
-      <a class="b" href="#setup">Set it up</a>
-      <a class="b" href="https://github.com/Nobrac/NTLM-Analyzer">Source</a>
+    <nav class="mnav">
+      <a href="#answers">What it tells you</a>
+      <a href="#dashboard">Dashboard</a>
+      <a href="#setup">Set it up</a>
+      <a href="https://github.com/Nobrac/NTLM-Analyzer">Source</a>
       <a class="b b--go" href="demo/">Open the demo</a>
     </nav>
   </div>
 </div>
 
-<!-- ======================= HERO · the machine voice ======================= -->
-<div class="hero" id="top">
-  <div class="inner">
-    <div class="hero__say">
-    <div class="chip">
-      <span class="pulse" aria-hidden="true"></span>
-      <span><b id="dcount">—</b> days until Windows blocks NTLMv1 SSO by itself</span>
-    </div>
-
+<!-- ======================= HERO ============================================ -->
+<div class="split hero" id="top">
+  <div>
+    <div class="kicker"><span class="pulse" aria-hidden="true"></span>NTLMv1 SSO — blocked by default in October 2026</div>
     <h1>Your domain logs every NTLM logon. <em>None of them say who.</em></h1>
-
-    <p class="lede">NTLM-Analyzer reads those events on every machine and turns
-    them into something you can act on: the program, the account, the target,
-    the reason Kerberos was not used — and what to change so that it is.</p>
-
+    <p>NTLM-Analyzer reads those events on every machine and turns them into
+    something you can act on: the program, the account, the target, the reason
+    Kerberos was not used — and what to change so that it is.</p>
     <div class="acts">
       <a class="b b--go" href="demo/">Open the live demo</a>
       <a class="b" href="https://github.com/Nobrac/NTLM-Analyzer">Read the source</a>
       <a class="b" href="#setup">Set it up</a>
     </div>
-    </div>
+  </div>
+  <div>
+    <div class="stat-lbl">Days until Windows blocks it by itself</div>
+    <div class="stat-num" id="dcount">—</div>
+    <div class="stat-sub">14 October 2026<br><b>NTLMv1-derived SSO → enforced</b></div>
 
-    <!-- Signature: one real record, resolved in the open. -->
-    <div class="decode" id="decode">
-      <div class="decode__bar">
-        <span class="id">Event 4624</span><span>·</span>
-        <span>Security log · WS-14 · Sunday 05:03:11</span>
-      </div>
-      <div class="decode__grid">
-<pre class="decode__raw" aria-label="Raw Windows security event">An account was successfully logged on.
-
-  Logon Type:               <mark data-lit="1">3</mark>
-  Account Name:             <mark data-lit="2">SVC_BACKUP</mark>
-  Workstation Name:         WS-14
-  Authentication Package:   <mark data-lit="3">NTLM</mark>
-  Package Name (NTLM only): <mark data-lit="3">NTLM V1</mark>
-  Key Length:               0</pre>
-
-        <div class="decode__out">
-          <div class="oline" data-step="1">
-            <span class="k">What ran</span>
-            <span class="v">veeam.exe on <code>WS-14</code>, 05:03 every Sunday</span>
-          </div>
-          <div class="oline" data-step="2">
-            <span class="k">Reached for</span>
-            <span class="v">the file share <code>fs01</code>, as a service account</span>
-          </div>
-          <div class="oline" data-step="3">
-            <span class="k">Why not Kerberos</span>
-            <span class="v">no SPN registered for that host, so the client fell back</span>
-          </div>
-          <div class="oline oline--fix" data-step="4">
-            <span class="k">Fix</span>
-            <span class="v">setspn -S cifs/fs01.corp.local FS01$</span>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <div class="hero__ratio">
-    <div class="ratio" aria-hidden="true">
+    <div class="hover-lbl">Handover, lab domain</div>
+    <div class="hbar" aria-hidden="true">
       <i style="width:1.1%;background:var(--v1)"></i>
       <i style="width:9.3%;background:var(--v2)"></i>
       <i style="width:89.6%;background:var(--krb)"></i>
     </div>
-    <div class="rkey">
-      <span style="color:var(--v1)"><b>NTLMv1</b> · breaks in October</span>
-      <span style="color:var(--v2)"><b>NTLMv2</b> · your actual work list</span>
-      <span style="color:var(--krb)"><b>Kerberos</b> · already fine</span>
-    </div>
-    </div>
-  </div>
-</div>
-
-<!-- ======================= ANSWERS · the paper voice ====================== -->
-<div class="band band--paper" id="answers">
-  <div class="inner">
-    <div class="src">The questions you cannot answer today</div>
-    <h2 class="h-say">Three answers, and none of them are in Event Viewer.</h2>
-    <p class="lede">Windows records that NTLM happened. It does not record what
-    you actually need to know, and it scatters the pieces across every machine
-    in the domain.</p>
-
-    <div class="answers">
-      <div class="ans">
-        <div class="ans__q">"Which program is doing this?"</div>
-        <h3 class="ans__a">A process name, not a logon type</h3>
-        <p>Every process still authenticating over NTLM, with a sparkline per row
-        so you can see whether your fix worked — and mark it done when it did.</p>
-      </div>
-      <div class="ans">
-        <div class="ans__q">"Why didn't it use Kerberos?"</div>
-        <h3 class="ans__a">A cause, with the command that removes it</h3>
-        <p>A missing SPN, a duplicate SPN, an IP address instead of a hostname, a
-        cross-forest hop. Each cause names the specific change to make.</p>
-      </div>
-      <div class="ans">
-        <div class="ans__q">"Is it safe to switch off yet?"</div>
-        <h3 class="ans__a">A trend, and a list of what is left</h3>
-        <p>The share over time, down to the hour. You switch NTLM off when the
-        remainder is small and known — not when the calendar says so.</p>
-      </div>
+    <div class="hlist">
+      <div class="hrow"><span class="sw" style="background:var(--v1)"></span><b>NTLMv1</b><span class="note">breaks in October</span></div>
+      <div class="hrow"><span class="sw" style="background:var(--v2)"></span><b>NTLMv2</b><span class="note">your actual work list</span></div>
+      <div class="hrow"><span class="sw" style="background:var(--krb)"></span><b>Kerberos</b><span class="note">already fine</span></div>
     </div>
   </div>
 </div>
 
-<!-- ======================= TOUR · back to the machine ===================== -->
-<div class="band" id="tour">
-  <div class="inner">
-    <div class="src">Eleven panels · one page · no external requests</div>
-    <h2 class="h-log">What the dashboard shows you</h2>
-    <p class="lede">These are screenshots of the real thing. The same build runs
-    in the <a href="demo/" style="color:var(--krb)">live demo</a> on synthetic
-    data from a lab domain — clickable, not a video.</p>
-
-    <div class="tour">
-
-      <div class="view">
-        <div class="view__txt">
-          <div class="src">Event 4624 · every machine</div>
-          <h3>One number, and whether it is falling</h3>
-          <p>The share of logons still using NTLM, split across the three
-          protocols, with a countdown to the October deadline. Everything here is
-          clickable down to the individual logon.</p>
-          <div class="view__note">24 h to 30 days · <b>click any bar</b> to filter everything below</div>
-        </div>
-        <figure><img src="img/01-overview.png" alt="Overview panel: headline share, three-colour handover bar, deadline countdown and 30-day trend" loading="lazy" width="2533" height="1151" style="--nat:2533px"></figure>
+<!-- ======================= DECODER ========================================= -->
+<div class="strip" id="answers">
+  <div class="strip__in">
+    <div class="dec-top">
+      <div>
+        <div class="kicker">One event · four answers</div>
+        <h2>Windows records that NTLM happened. It does not record what you need to know.</h2>
       </div>
+      <button class="replay" id="replay" type="button">Replay the trace</button>
+    </div>
 
-      <div class="view view--flip">
-        <div class="view__txt">
-          <div class="src">Event 40xx · Windows 11 24H2 and Server 2025</div>
-          <h3>The work list, in the order you will fix it</h3>
-          <p>Process-level events name the program itself. Where the OS is older
-          the panel says so, rather than showing an empty table while the rest of
-          the dashboard keeps working.</p>
-          <div class="view__note">Status per row · <b>open, in progress, done, accepted</b></div>
-        </div>
-        <figure><img src="img/02-programs.png" alt="Program list with per-row sparklines, target servers, user chips and a status dropdown" loading="lazy" width="2469" height="961" style="--nat:2469px"></figure>
+    <div class="dec-grid" style="border:2px solid var(--line-strong)">
+      <div class="dec-raw">
+        <div class="dec-bar"><span>Event 4624 · Security log</span><span>WS-14 · Sunday 05:03:11</span></div>
+        <div style="font-family:var(--mono);font-size:13px;color:var(--faint);margin-bottom:16px">An account was successfully logged on.</div>
+        <div class="dec-line"><span class="k">Logon Type:</span><span class="v" data-lit="1">3</span></div>
+        <div class="dec-line"><span class="k">Account Name:</span><span class="v" data-lit="2">SVC_BACKUP</span></div>
+        <div class="dec-line"><span class="k">Workstation Name:</span><span class="v">WS-14</span></div>
+        <div class="dec-line"><span class="k">Authentication Package:</span><span class="v" data-lit="3">NTLM</span></div>
+        <div class="dec-line"><span class="k">Package Name (NTLM only):</span><span class="v" data-lit="3">NTLM V1</span></div>
+        <div class="dec-line"><span class="k">Key Length:</span><span class="v">0</span></div>
       </div>
-
-      <div class="view">
-        <div class="view__txt">
-          <div class="src">Event 4769 · Kerberos ticket failures</div>
-          <h3>The cause sits next to the remedy</h3>
-          <p>Kerberos failures are matched against the NTLM fallback that followed
-          them — which is how a cause can be named at all. Each row says what to
-          change, not just what happened.</p>
-          <div class="view__note">Every row filters the event list · <b>no guessing</b></div>
-        </div>
-        <figure><img src="img/05-why.png" alt="Cause analysis panel listing each reason for NTLM fallback with a concrete remedy" loading="lazy" width="1228" height="513" style="--nat:1228px"></figure>
+      <div class="dec-out">
+        <div class="row" data-step="1"><div class="rn">01</div><div><div class="rlbl">What ran</div><div class="rval">veeam.exe on <code>WS-14</code>, 05:03 every Sunday</div></div></div>
+        <div class="row" data-step="2"><div class="rn">02</div><div><div class="rlbl">Reached for</div><div class="rval">the file share <code>fs01</code>, as a service account</div></div></div>
+        <div class="row" data-step="3"><div class="rn">03</div><div><div class="rlbl">Why not Kerberos</div><div class="rval">no SPN registered for that host, so the client fell back</div></div></div>
+        <div class="row" data-step="4"><div class="rn">04</div><div><div class="rlbl">Fix</div><div class="rval">one command, one restart of the backup job</div></div></div>
+        <pre class="dec-fix" id="decfix">setspn -S cifs/fs01.corp.local FS01$</pre>
       </div>
-
-      <div class="view view--flip">
-        <div class="view__txt">
-          <div class="src">168 cells · one week by hour</div>
-          <h3>The bright cell nobody can explain</h3>
-          <p>A scheduled job at 05:00 on a Sunday, on a server whose owner left
-          two years ago. This is the fastest way to find the things no inventory
-          knows about.</p>
-          <div class="view__note">Click a cell · <b>see only those events</b></div>
-        </div>
-        <figure><img src="img/04-timing.png" alt="Week-by-hour heatmap of NTLM usage with one bright cell on Sunday at 05:00" loading="lazy" width="1228" height="519" style="--nat:1228px"></figure>
-      </div>
-
-      <div class="view">
-        <div class="view__txt">
-          <div class="src">Event 8004 · domain controller only</div>
-          <h3>The machines that never got an agent</h3>
-          <p>Read straight from the DC's own audit log: appliances, Linux hosts,
-          the scanner in the print room. If it authenticates against your domain,
-          it shows up here.</p>
-          <div class="view__note">No agent required · <b>domain-wide by definition</b></div>
-        </div>
-        <figure><img src="img/06-domain.png" alt="Domain-wide table of accounts, source machines and target servers from the DC audit log" loading="lazy" width="2467" height="1083" style="--nat:2467px"></figure>
-      </div>
-
-      <div class="view view--flip">
-        <div class="view__txt">
-          <div class="src">Audit configuration · per machine</div>
-          <h3>Whether you are measuring what you think</h3>
-          <p>OS build, each audit setting, and October 2026 readiness per machine.
-          A red badge here means a gap in your data — which matters more than any
-          number on the other panels.</p>
-          <div class="view__note">Badges turn green <b>once the policy has landed</b></div>
-        </div>
-        <figure><img src="img/10-machines.png" alt="Machine list showing OS build, audit status badges and October 2026 readiness" loading="lazy" width="2461" height="457" style="--nat:2461px"></figure>
-      </div>
-
-      <div class="view view--narrow">
-        <div class="view__txt">
-          <div class="src">Raw record · every field</div>
-          <h3>Down to the single logon</h3>
-          <p>Open any event and every raw field is there, with an explanation of
-          what that event ID means. Filter state lives in the URL, so the exact
-          view you are looking at is a link you can send.</p>
-          <div class="view__note">CSV export · <b>English and German</b></div>
-        </div>
-        <figure><img src="img/12-event-detail.png" alt="Event detail drawer showing all raw fields of a single logon with explanations" loading="lazy" width="527" height="837" style="--nat:527px"></figure>
-      </div>
-
     </div>
   </div>
 </div>
 
-<!-- ======================= SETUP · paper ================================== -->
-<div class="band band--paper" id="setup">
-  <div class="inner">
-    <div class="src">Three steps · in this order</div>
-    <h2 class="h-say">Auditing first. Everything else follows.</h2>
-    <p class="lede">The collector is one Python file with no dependencies. The
-    agent is one EXE that installs itself as a service — or an MSI, if you roll
-    out by policy.</p>
+<!-- ======================= THREE ANSWERS =================================== -->
+<div class="strip">
+  <div class="strip__in" style="padding-bottom:0">
+    <div class="kicker">The questions you cannot answer today</div>
+    <h2 style="font-family:var(--disp);font-weight:700;letter-spacing:-.025em;line-height:1.14;
+      font-size:clamp(25px,3.2vw,38px);margin:12px 0 0;max-width:26ch">Three answers, and none of them are in Event Viewer.</h2>
+  </div>
+  <div class="ans-grid" style="border-top:2px solid var(--line-strong);margin-top:clamp(20px,3vw,32px)">
+    <div class="ans">
+      <div class="q">"Which program is doing this?"</div>
+      <h3>A process name, not a logon type</h3>
+      <p>Every process still authenticating over NTLM, with a sparkline per row
+      so you can see whether your fix worked — and mark it done when it did.</p>
+    </div>
+    <div class="ans">
+      <div class="q">"Why didn't it use Kerberos?"</div>
+      <h3>A cause, with the command that removes it</h3>
+      <p>A missing SPN, a duplicate SPN, an IP address instead of a hostname, a
+      cross-forest hop. Each cause names the specific change to make.</p>
+    </div>
+    <div class="ans">
+      <div class="q">"Is it safe to switch off yet?"</div>
+      <h3>A trend, and a list of what is left</h3>
+      <p>The share over time, down to the hour. You switch NTLM off when the
+      remainder is small and known — not when the calendar says so.</p>
+    </div>
+  </div>
+</div>
 
-    <div class="steps">
-      <div class="step">
+<!-- ======================= DASHBOARD PREVIEW ================================ -->
+<div class="strip" id="dashboard">
+  <div class="strip__in">
+    <div class="dash-top">
+      <div>
+        <div class="kicker">Eleven panels · one page · no external requests</div>
+        <h2>What the dashboard shows you</h2>
+      </div>
+      <a href="demo/" class="b" style="margin-left:auto">Clickable, not a video →</a>
+    </div>
+
+    <div class="browser">
+      <div class="browser__bar">
+        <i></i><i></i><i></i><span>collector.corp.local:8443</span>
+      </div>
+      <img src="img/01-overview.png" width="2533" height="1151"
+           alt="Overview panel: headline share, three-colour handover bar, deadline countdown and 30-day trend" loading="lazy">
+    </div>
+
+    <div class="pgrid">
+      <a class="pcard" href="demo/">
+        <div class="pcard__shot"><img src="img/02-programs.png" width="2469" height="961" alt="Program list with sparklines" loading="lazy"></div>
+        <div class="pcard__txt">
+          <div class="kicker">Event 40xx</div>
+          <h4>The work list, in the order you'll fix it</h4>
+          <p>Process-level events name the program itself. Status per row: open, in progress, done, accepted.</p>
+        </div>
+      </a>
+      <a class="pcard" href="demo/">
+        <div class="pcard__shot"><img src="img/04-timing.png" width="1228" height="519" alt="Week-by-hour heatmap" loading="lazy"></div>
+        <div class="pcard__txt">
+          <div class="kicker">168 cells · one week by hour</div>
+          <h4>The bright cell nobody can explain</h4>
+          <p>A scheduled job at 05:00 on a Sunday, on a server whose owner left. Click a cell, see only those events.</p>
+        </div>
+      </a>
+      <a class="pcard" href="demo/">
+        <div class="pcard__shot"><img src="img/06-domain.png" width="2467" height="1083" alt="Domain-wide table from the DC audit log" loading="lazy"></div>
+        <div class="pcard__txt">
+          <div class="kicker">Event 8004 · domain controller only</div>
+          <h4>The machines that never got an agent</h4>
+          <p>Appliances, Linux hosts, the scanner in the print room. If it authenticates against your domain, it shows up here.</p>
+        </div>
+      </a>
+    </div>
+  </div>
+</div>
+
+<!-- ======================= SETUP ============================================ -->
+<div class="strip" id="setup">
+  <div class="setup-top">
+    <div class="kicker">Three steps · in this order</div>
+    <h2>Auditing first. Everything else follows.</h2>
+    <p>The collector is one Python file with no dependencies. The agent is one
+    EXE that installs itself as a service — or an MSI, if you roll out by policy.</p>
+  </div>
+
+  <div class="steps">
+    <div class="step">
+      <div class="step__txt">
+        <div class="n">01</div>
         <div>
-          <h3>Turn on auditing by GPO</h3>
+          <h4>Turn on auditing by GPO</h4>
           <p>Five settings under Security Options and Advanced Audit Policy. The
           README lists each one with its exact value.</p>
-          <p class="warn">Events are written from the moment auditing is on, never
-          retroactively. Do this first, or you will measure an empty domain.</p>
+          <div class="warn">Events are written from the moment auditing is on, never
+          retroactively. Do this first, or you will measure an empty domain.</div>
         </div>
       </div>
-      <div class="step">
+      <div class="step__code">
+<pre><span class="c">:: after linking the GPO</span>
+<span class="p">&gt;</span> gpupdate /force</pre>
+      </div>
+    </div>
+
+    <div class="step">
+      <div class="step__txt">
+        <div class="n">02</div>
         <div>
-          <h3>Install the collector on any Linux host</h3>
+          <h4>Install the collector on any Linux host</h4>
           <p>Creates a hardened systemd service, keeps secrets off the command
           line, and prints the finished agent command when it is done.</p>
-<pre class="cmd"><span class="p">$</span> git clone https://github.com/Nobrac/NTLM-Analyzer.git
+        </div>
+      </div>
+      <div class="step__code">
+<pre><span class="p">$</span> git clone https://github.com/Nobrac/NTLM-Analyzer.git
 <span class="p">$</span> cd NTLM-Analyzer && sudo ./install.sh</pre>
-        </div>
       </div>
-      <div class="step">
+    </div>
+
+    <div class="step">
+      <div class="step__txt">
+        <div class="n">03</div>
         <div>
-          <h3>Roll out the agent, then open the dashboard</h3>
-          <p>Elevated, once per machine. The Machines panel shows each agent with
-          a heartbeat as it arrives.</p>
-<pre class="cmd"><span class="c">:: unattended, by policy</span>
-<span class="p">&gt;</span> msiexec /i ntlm-agent.msi /qn COLLECTORURL=https://collector:8443</pre>
+          <h4>Roll out the agent, then open the dashboard</h4>
+          <p>Elevated, once per machine. The Machines panel shows each agent
+          with a heartbeat as it arrives.</p>
         </div>
       </div>
-    </div>
-  </div>
-</div>
-
-<!-- ======================= PRINCIPLES · dark ============================== -->
-<div class="band">
-  <div class="inner">
-    <div class="src">Why it is built this way</div>
-    <h2 class="h-log">A migration tool you can argue with</h2>
-    <p class="lede">The useful part is not a confident number. It is knowing
-    which events produced it — and where the data stops.</p>
-
-    <div class="pri">
-      <div class="p1">
-        <h3>Nothing is estimated</h3>
-        <p>Every figure traces back to an event that was actually logged. Where
-        data is missing, the panel names the setting that is off, and on which
-        machine.</p>
-      </div>
-      <div class="p1">
-        <h3>Nothing leaves the network</h3>
-        <p>The dashboard makes no external requests — no fonts, no CDN, no
-        telemetry. Content-Security-Policy is <code>default-src 'none'</code>.</p>
-      </div>
-      <div class="p1">
-        <h3>Nothing is changed</h3>
-        <p>The tool reads the event log and nothing else. It never touches an
-        authentication setting. It measures; you decide when to switch.</p>
+      <div class="step__code">
+<pre><span class="c">:: unattended, by policy</span>
+<span class="p">&gt;</span> msiexec /i ntlm-agent.msi /qn COLLECTORURL=https://collector:8443</pre>
       </div>
     </div>
   </div>
 </div>
 
-<!-- ======================= FOOT =========================================== -->
+<!-- ======================= POSTER =========================================== -->
+<div class="poster">
+  <div class="kicker">Why it is built this way</div>
+  <h2>A migration tool you can argue with.</h2>
+  <div class="pri">
+    <div>
+      <h3>Nothing is estimated</h3>
+      <p>Every figure traces back to an event that was actually logged. Where
+      data is missing, the panel names the setting that is off, and on which
+      machine.</p>
+    </div>
+    <div>
+      <h3>Nothing leaves the network</h3>
+      <p>The dashboard makes no external requests — no fonts, no CDN, no
+      telemetry. Content-Security-Policy is <code>default-src 'none'</code>.</p>
+    </div>
+    <div>
+      <h3>Nothing is changed</h3>
+      <p>The tool reads the event log and nothing else. It never touches an
+      authentication setting. It measures; you decide when to switch.</p>
+    </div>
+  </div>
+</div>
+
+<!-- ======================= FOOTER ============================================ -->
 <div class="foot">
-  <div class="inner">
+  <div class="foot__top">
     <div>
       <a class="mark" href="#top"><img src="img/wordmark.png" width="326" height="96" alt="NTLM-Analyzer"></a>
-      <p>See the whole NTLM picture in your own Active Directory before you switch
-      it off. Self-hosted, no telemetry, GPL-3.0.</p>
+      <h3>See the whole NTLM picture in your own Active Directory before you switch it off.</h3>
+      <p>Self-hosted, no telemetry, GPL-3.0.</p>
     </div>
-    <nav class="topnav">
+    <div class="acts">
       <a class="b b--go" href="demo/">Open the demo</a>
       <a class="b" href="https://github.com/Nobrac/NTLM-Analyzer">Source</a>
       <a class="b" href="https://github.com/Nobrac/NTLM-Analyzer/blob/main/docs/OPERATIONS.md">Operations guide</a>
       <a class="b" href="https://github.com/Nobrac/NTLM-Analyzer/releases/latest">Download</a>
-    </nav>
+    </div>
   </div>
   <div class="fine">
     Screenshots and demo use synthetic data from a lab domain · Built with AI
@@ -574,61 +536,60 @@ code{font-family:var(--mono);font-size:.9em}
 (function(){
   var reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
 
-  // Days until Windows blocks NTLMv1 SSO (14 October 2026) - the same date the
-  // dashboard counts down to.
+  // Same deadline the dashboard itself counts down to (14 October 2026).
   var d = document.getElementById('dcount');
   if(d){
     var days = Math.max(0, Math.ceil((Date.UTC(2026, 9, 14) - Date.now()) / 86400000));
     d.textContent = days;
   }
 
-  // The decoder: raw fields light up, then each conclusion appears. Runs once,
-  // when the block is first on screen, so someone landing mid-page still sees
-  // it - and it is never replayed on scrolling back.
-  var dec = document.getElementById('decode');
-  if(dec){
-    var lines = [].slice.call(dec.querySelectorAll('.oline'));
-    var marks = [].slice.call(dec.querySelectorAll('mark'));
-    var played = false;
-    var play = function(){
-      if(played) return;
-      played = true;
-      if(reduce){
-        marks.forEach(function(m){ m.classList.add('lit'); });
-        lines.forEach(function(l){ l.classList.add('in'); });
-        return;
-      }
-      lines.forEach(function(l, i){
-        setTimeout(function(){
-          var step = l.getAttribute('data-step');
-          marks.forEach(function(m){
-            if(m.getAttribute('data-lit') === step) m.classList.add('lit');
-          });
-          l.classList.add('in');
-        }, 420 + i * 560);
-      });
-    };
-    if('IntersectionObserver' in window){
-      var io = new IntersectionObserver(function(es){
-        es.forEach(function(e){ if(e.isIntersecting) play(); });
-      // 0.15, not 0.3: stacked on a phone the block is taller than the
-      // viewport, and a high threshold can never be satisfied there.
-      }, {threshold: 0.15});
-      io.observe(dec);
-    } else { play(); }
+  // The decoder: raw fields light up, then each conclusion appears. Plays once
+  // automatically when first scrolled into view, and again on demand via the
+  // Replay button - useful for someone who wants to point it out to a
+  // colleague without re-loading the page.
+  var rows = [].slice.call(document.querySelectorAll('.dec-out .row'));
+  var fix = document.getElementById('decfix');
+  var vals = [].slice.call(document.querySelectorAll('.dec-line .v[data-lit]'));
+  var playing = false;
+
+  function reset(){
+    rows.forEach(function(r){ r.classList.remove('in'); });
+    vals.forEach(function(v){ v.classList.remove('lit'); });
+    fix.classList.remove('in');
+  }
+  function play(){
+    if(playing) return;
+    playing = true;
+    if(reduce){
+      rows.forEach(function(r){ r.classList.add('in'); });
+      vals.forEach(function(v){ v.classList.add('lit'); });
+      fix.classList.add('in');
+      playing = false;
+      return;
+    }
+    reset();
+    rows.forEach(function(r, i){
+      setTimeout(function(){
+        var step = r.getAttribute('data-step');
+        vals.forEach(function(v){ if(v.getAttribute('data-lit') === step) v.classList.add('lit'); });
+        r.classList.add('in');
+        if(i === rows.length - 1) setTimeout(function(){ fix.classList.add('in'); playing = false; }, 400);
+      }, i * 620);
+    });
   }
 
-  // Screenshots settle in as they arrive - the only motion in the tour.
-  var figs = [].slice.call(document.querySelectorAll('.view figure'));
-  if(reduce || !('IntersectionObserver' in window)){
-    figs.forEach(function(f){ f.classList.add('in'); });
-  } else {
-    var io2 = new IntersectionObserver(function(es){
-      es.forEach(function(e){
-        if(e.isIntersecting){ e.target.classList.add('in'); io2.unobserve(e.target); }
-      });
-    }, {threshold: 0.12, rootMargin: '0px 0px -8% 0px'});
-    figs.forEach(function(f){ io2.observe(f); });
+  var replayBtn = document.getElementById('replay');
+  if(replayBtn) replayBtn.addEventListener('click', function(){ playing = false; play(); });
+
+  var dec = document.querySelector('.dec-grid');
+  if(dec){
+    var played = false;
+    if('IntersectionObserver' in window){
+      var io = new IntersectionObserver(function(es){
+        es.forEach(function(e){ if(e.isIntersecting && !played){ played = true; play(); } });
+      }, {threshold: 0.2});
+      io.observe(dec);
+    } else { play(); }
   }
 })();
 </script>

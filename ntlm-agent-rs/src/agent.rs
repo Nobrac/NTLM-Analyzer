@@ -31,7 +31,8 @@ const LSA: &str = r"SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0";
 const LSA_ROOT: &str = r"SYSTEM\CurrentControlSet\Control\Lsa";
 const NTLM_CHANNEL: &str =
     r"SOFTWARE\Microsoft\Windows\CurrentVersion\WINEVT\Channels\Microsoft-Windows-NTLM/Operational";
-const DEVGUARD_CG: &str = r"SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\CredentialGuard";
+const DEVGUARD_CG: &str =
+    r"SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\CredentialGuard";
 const NETLOGON: &str = r"SYSTEM\CurrentControlSet\Services\Netlogon\Parameters";
 const WINNT_CV: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion";
 
@@ -147,9 +148,7 @@ struct IngestBody<'a> {
 pub fn run_cycle(cfg: &Config) -> Result<(), String> {
     if cfg.enable_outgoing_audit {
         if let Err(e) = enable_outgoing_audit() {
-            config::log(&format!(
-                "Could not enable outgoing audit (admin rights?): {e}"
-            ));
+            config::log(&format!("Could not enable outgoing audit (admin rights?): {e}"));
         }
     }
 
@@ -196,33 +195,13 @@ pub fn run_cycle(cfg: &Config) -> Result<(), String> {
 
     if dc {
         gather(
-            "Security",
-            "Security#4624",
-            "EventID=4624",
-            DATA_4624,
-            window_ms,
-            &state,
-            &me,
-            map_4624,
-            &mut collected,
-            &mut new_seen,
-            false,
-            false,
+            "Security", "Security#4624", "EventID=4624", DATA_4624, window_ms,
+            &state, &me, map_4624, &mut collected, &mut new_seen, false, false,
         );
         if !cfg.skip_kerberos {
             gather(
-                "Security",
-                "Security#4769",
-                "EventID=4769",
-                "",
-                window_ms,
-                &state,
-                &me,
-                map_4769,
-                &mut collected,
-                &mut new_seen,
-                false,
-                false,
+                "Security", "Security#4769", "EventID=4769", "", window_ms,
+                &state, &me, map_4769, &mut collected, &mut new_seen, false, false,
             );
         }
         gather(
@@ -234,126 +213,54 @@ pub fn run_cycle(cfg: &Config) -> Result<(), String> {
         // DISABLED by default, so these stay silent until an admin turns them on -
         // marked optional so a switched-off channel is not reported as an error.
         gather(
-            LOG_PROTECTED_USER,
-            "AUTH#protected",
-            "(EventID=100 or EventID=101)",
-            "",
-            window_ms,
-            &state,
-            &me,
-            map_auth_policy,
-            &mut collected,
-            &mut new_seen,
-            true,
-            true,
+            LOG_PROTECTED_USER, "AUTH#protected",
+            "(EventID=100 or EventID=101)", "", window_ms,
+            &state, &me, map_auth_policy, &mut collected, &mut new_seen, true, true,
         );
         gather(
-            LOG_AUTH_POLICY,
-            "AUTH#policy",
-            "EventID=301",
-            "",
-            window_ms,
-            &state,
-            &me,
-            map_auth_policy,
-            &mut collected,
-            &mut new_seen,
-            true,
-            true,
+            LOG_AUTH_POLICY, "AUTH#policy",
+            "EventID=301", "", window_ms,
+            &state, &me, map_auth_policy, &mut collected, &mut new_seen, true, true,
         );
         // Enhanced DC audits (Server 2025): they carry the NTLM version straight
         // from the DC log - on older systems the query simply returns nothing.
         gather(
-            "Microsoft-Windows-NTLM/Operational",
-            "NTLM#40dc",
-            "(EventID=4030 or EventID=4031 or EventID=4032 or EventID=4033)",
-            "",
-            window_ms,
-            &state,
-            &me,
-            map_enhanced,
-            &mut collected,
-            &mut new_seen,
-            true,
-            false,
+            "Microsoft-Windows-NTLM/Operational", "NTLM#40dc",
+            "(EventID=4030 or EventID=4031 or EventID=4032 or EventID=4033)", "", window_ms,
+            &state, &me, map_enhanced, &mut collected, &mut new_seen, true, false,
         );
     }
     gather(
-        "Microsoft-Windows-NTLM/Operational",
-        "NTLM#8001",
-        "(EventID=8001 or EventID=4001)",
-        "",
-        window_ms,
-        &state,
-        &me,
-        map_8001,
-        &mut collected,
-        &mut new_seen,
-        false,
-        false,
+        "Microsoft-Windows-NTLM/Operational", "NTLM#8001",
+        "(EventID=8001 or EventID=4001)", "", window_ms,
+        &state, &me, map_8001, &mut collected, &mut new_seen, false, false,
     );
     // Session-security and secret-fallback blocks. Undocumented IDs taken from
     // the provider manifest; harmless where they never fire.
     gather(
-        "Microsoft-Windows-NTLM/Operational",
-        "NTLM#secblock",
-        "(EventID=4010 or EventID=4011 or EventID=4012 or EventID=4015)",
-        "",
-        window_ms,
-        &state,
-        &me,
-        map_sec_block,
-        &mut collected,
-        &mut new_seen,
-        false,
-        false,
+        "Microsoft-Windows-NTLM/Operational", "NTLM#secblock",
+        "(EventID=4010 or EventID=4011 or EventID=4012 or EventID=4015)", "", window_ms,
+        &state, &me, map_sec_block, &mut collected, &mut new_seen, false, false,
     );
     // Credential Guard blocks: without these a Credential-Guard machine shows
     // no findings at all, even while NTLM is being attempted and refused.
     gather(
-        "Microsoft-Windows-NTLM/Operational",
-        "NTLM#cg",
-        "(EventID=4013 or EventID=4014)",
-        "",
-        window_ms,
-        &state,
-        &me,
-        map_credguard,
-        &mut collected,
-        &mut new_seen,
-        false,
-        false,
+        "Microsoft-Windows-NTLM/Operational", "NTLM#cg",
+        "(EventID=4013 or EventID=4014)", "", window_ms,
+        &state, &me, map_credguard, &mut collected, &mut new_seen, false, false,
     );
     // Incoming NTLM: 8002 names the local service that accepts it, 8003 the
     // remote account that came in. Both need the "Audit Incoming NTLM Traffic"
     // policy; without it the queries simply return nothing.
     gather(
-        "Microsoft-Windows-NTLM/Operational",
-        "NTLM#8002",
-        "(EventID=8002 or EventID=4002)",
-        "",
-        window_ms,
-        &state,
-        &me,
-        map_8002,
-        &mut collected,
-        &mut new_seen,
-        false,
-        false,
+        "Microsoft-Windows-NTLM/Operational", "NTLM#8002",
+        "(EventID=8002 or EventID=4002)", "", window_ms,
+        &state, &me, map_8002, &mut collected, &mut new_seen, false, false,
     );
     gather(
-        "Microsoft-Windows-NTLM/Operational",
-        "NTLM#8003",
-        "(EventID=8003 or EventID=4003)",
-        "",
-        window_ms,
-        &state,
-        &me,
-        map_8003,
-        &mut collected,
-        &mut new_seen,
-        false,
-        false,
+        "Microsoft-Windows-NTLM/Operational", "NTLM#8003",
+        "(EventID=8003 or EventID=4003)", "", window_ms,
+        &state, &me, map_8003, &mut collected, &mut new_seen, false, false,
     );
     // Erweiterte Client-/Server-Audits + NTLMv1-SSO (Server 2025 / Win11 24H2).
     // 4024/4025 are the time-critical part: NTLMv1-derived credentials stop
@@ -448,11 +355,7 @@ fn map_4624(e: &RawEvent) -> Option<Event> {
     if u.trim().is_empty() || u == "-" || u == "ANONYMOUS LOGON" {
         return None;
     }
-    let lm = e
-        .named
-        .get("LmPackageName")
-        .map(|s| s.as_str())
-        .unwrap_or("");
+    let lm = e.named.get("LmPackageName").map(|s| s.as_str()).unwrap_or("");
     let ver = if lm.contains("V1") {
         "NTLMv1"
     } else if lm.contains("V2") {
@@ -465,11 +368,7 @@ fn map_4624(e: &RawEvent) -> Option<Event> {
         .get("AuthenticationPackageName")
         .map(|s| s.as_str())
         .unwrap_or("");
-    let auth_method = if apkg == "Negotiate" {
-        "Fallback"
-    } else {
-        "Direct"
-    };
+    let auth_method = if apkg == "Negotiate" { "Fallback" } else { "Direct" };
 
     Some(Event {
         record_id: e.record_id,
@@ -533,12 +432,7 @@ fn map_4769(e: &RawEvent) -> Option<Event> {
         record_id: e.record_id,
         log: "Security".to_string(),
         event_id: e.event_id,
-        kind: if failure.is_some() {
-            "krbfail"
-        } else {
-            "kerberos"
-        }
-        .to_string(),
+        kind: if failure.is_some() { "krbfail" } else { "kerberos" }.to_string(),
         failure_code: failure,
         event_time: e.time.clone(),
         user: Some(u),
@@ -785,7 +679,8 @@ fn map_auth_policy(e: &RawEvent) -> Option<Event> {
         user: account,
         domain: from_message(e, L_DOMAIN),
         workstation: device,
-        target_server: from_message(e, L_TARGET_MACHINE).or_else(|| from_message(e, L_TARGET_RES)),
+        target_server: from_message(e, L_TARGET_MACHINE)
+            .or_else(|| from_message(e, L_TARGET_RES)),
         process: raw_proc.as_deref().map(base_name),
         process_path: raw_proc.as_deref().and_then(full_path),
         auth_method: Some("Blocked".to_string()),
@@ -817,7 +712,8 @@ fn map_sec_block(e: &RawEvent) -> Option<Event> {
         event_time: e.time.clone(),
         user: from_message(e, L_USER).or_else(|| find_named(e, &["user", "account"])),
         domain: from_message(e, L_DOMAIN),
-        target_server: from_message(e, L_TARGET_MACHINE).or_else(|| from_message(e, L_TARGET_RES)),
+        target_server: from_message(e, L_TARGET_MACHINE)
+            .or_else(|| from_message(e, L_TARGET_RES)),
         process: raw_proc.as_deref().map(base_name),
         process_path: raw_proc.as_deref().and_then(full_path),
         auth_method: Some("Blocked".to_string()),
@@ -828,11 +724,7 @@ fn map_sec_block(e: &RawEvent) -> Option<Event> {
 
 fn map_credguard(e: &RawEvent) -> Option<Event> {
     let p = &e.positional;
-    let nonempty = |i: usize| {
-        p.get(i)
-            .cloned()
-            .filter(|s| !s.trim().is_empty() && s != "-")
-    };
+    let nonempty = |i: usize| p.get(i).cloned().filter(|s| !s.trim().is_empty() && s != "-");
 
     if e.event_id == 4013 {
         let raw_proc = nonempty(4);
@@ -984,9 +876,7 @@ fn find_value<F: Fn(&str) -> bool>(e: &RawEvent, pred: F) -> Option<String> {
 fn looks_like_ip(s: &str) -> bool {
     let core = s.trim_start_matches("::ffff:");
     (core.split('.').count() == 4
-        && core
-            .split('.')
-            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())))
+        && core.split('.').all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())))
         || (s.contains(':') && s.chars().all(|c| c.is_ascii_hexdigit() || c == ':'))
 }
 
@@ -1029,27 +919,10 @@ fn from_message(e: &RawEvent, labels: &[&str]) -> Option<String> {
 
 // Beschriftungen laut KB5064479 (en) + gaengige deutsche Entsprechungen.
 const L_PROCESS: &[&str] = &["Process Name", "Prozessname", "Name des Prozesses"];
-const L_USER: &[&str] = &[
-    "Username",
-    "User Name",
-    "Benutzername",
-    "Client Name",
-    "Clientname",
-];
-const L_DOMAIN: &[&str] = &[
-    "Domain",
-    "Domäne",
-    "Domaene",
-    "Client Domain",
-    "Clientdomäne",
-];
+const L_USER: &[&str] = &["Username", "User Name", "Benutzername", "Client Name", "Clientname"];
+const L_DOMAIN: &[&str] = &["Domain", "Domäne", "Domaene", "Client Domain", "Clientdomäne"];
 const L_TARGET_RES: &[&str] = &["Target Resource", "Zielressource", "Service Binding"];
-const L_TARGET_MACHINE: &[&str] = &[
-    "Target Machine",
-    "Zielcomputer",
-    "Server Name",
-    "Servername",
-];
+const L_TARGET_MACHINE: &[&str] = &["Target Machine", "Zielcomputer", "Server Name", "Servername"];
 // For outgoing events (4020/4021) "Target IP" is the remote end; for
 // server-/DC-side events (4022+) it is the client IP of the source.
 const L_IP_OUT: &[&str] = &["Target IP", "Ziel-IP"];
@@ -1077,7 +950,7 @@ fn map_enhanced(e: &RawEvent) -> Option<Event> {
         // Server side: carries the source (client machine + IP), target SPN and
         // version - the same statement as 8004, hence "domain".
         4022 | 4023 => "domain",
-        4030..=4033 => "domain",    // DC-Sicht
+        4030..=4033 => "domain", // DC-Sicht
         4024 | 4025 => "ntlmv1sso", // NTLMv1-derived SSO credentials
         _ => return None,
     };
@@ -1212,17 +1085,10 @@ fn map_enhanced(e: &RawEvent) -> Option<Event> {
         .or_else(|| find_named(e, &["hostname"]))
         .or_else(|| find_named(e, &["workstation"]));
 
-    let ip = from_message(
-        e,
-        if matches!(id, 4020 | 4021) {
-            L_IP_OUT
-        } else {
-            L_IP_IN
-        },
-    )
-    .or_else(|| find_named(e, &["client", "ip"]))
-    .or_else(|| find_named(e, &["ip"]))
-    .or_else(|| find_value(e, looks_like_ip));
+    let ip = from_message(e, if matches!(id, 4020 | 4021) { L_IP_OUT } else { L_IP_IN })
+        .or_else(|| find_named(e, &["client", "ip"]))
+        .or_else(|| find_named(e, &["ip"]))
+        .or_else(|| find_value(e, looks_like_ip));
 
     Some(Event {
         record_id: e.record_id,
@@ -1299,7 +1165,9 @@ fn post_json(url: &str, api_key: &str, body: &str) -> Result<(), String> {
         .redirects(0)
         .timeout(std::time::Duration::from_secs(15))
         .build();
-    let mut req = agent.post(url).set("Content-Type", "application/json");
+    let mut req = agent
+        .post(url)
+        .set("Content-Type", "application/json");
     if !api_key.is_empty() {
         req = req.set("X-Api-Key", api_key);
     }
@@ -1550,11 +1418,7 @@ fn query_functional_levels() -> (Option<String>, Option<String>) {
                   $r=[ADSI]'LDAP://RootDSE';\
                   ''+$r.domainFunctionality;\
                   ''+$r.forestFunctionality";
-    let out = match run_capped(
-        &ps,
-        &["-NoProfile", "-NonInteractive", "-Command", script],
-        15,
-    ) {
+    let out = match run_capped(&ps, &["-NoProfile", "-NonInteractive", "-Command", script], 15) {
         Ok(s) => s,
         Err(e) => {
             config::log(&format!("functional level query failed: {e}"));
@@ -1565,7 +1429,10 @@ fn query_functional_levels() -> (Option<String>, Option<String>) {
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && l.chars().all(|c| c.is_ascii_digit()) && l.len() <= 3);
-    (it.next().map(str::to_string), it.next().map(str::to_string))
+    (
+        it.next().map(str::to_string),
+        it.next().map(str::to_string),
+    )
 }
 
 /// Run a helper and capture stdout, killing it if it outstays its welcome.

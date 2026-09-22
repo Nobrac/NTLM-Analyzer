@@ -126,10 +126,7 @@ fn main() {
                     exit(1);
                 }
                 service::harden_data_dir();
-                println!(
-                    "Configuration written to {}.",
-                    config::config_path().display()
-                );
+                println!("Configuration written to {}.", config::config_path().display());
             }
             Err(e) => {
                 eprintln!("{e}");
