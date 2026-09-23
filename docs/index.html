@@ -257,6 +257,51 @@ code{font-family:var(--mono);font-size:.9em}
   .top{position:static}
   .topnav a[href^="#"]{display:none}
 }
+/* ---------- enlarge a screenshot ----------
+   The dashboard captures are 2,400-2,500 px wide and shown at about 750 px in
+   the tour column - the tables in them stop being readable. Every screenshot
+   opens full-screen on click; a second click shows it at 100 % to pan around.
+   Added by script only: without JS the page is exactly as before. */
+.view figure{position:relative}
+.view figure img.zoomable{cursor:zoom-in}
+.view figure img.zoomable:focus-visible{outline:2px solid var(--gold);outline-offset:3px}
+.zoomhint{position:absolute;right:10px;bottom:10px;pointer-events:none;
+  font-family:var(--mono);font-size:12px;padding:6px 10px;border-radius:2px;
+  background:rgba(11,18,32,.86);border:1px solid var(--rule2);color:var(--ink);
+  opacity:0;transition:opacity .18s ease}
+.view figure:hover .zoomhint,.view figure:focus-within .zoomhint{opacity:1}
+@media(hover:none){.zoomhint{opacity:1}}
+
+.lb{position:fixed;inset:0;z-index:200;display:none;flex-direction:column;
+  background:rgba(5,9,18,.95);backdrop-filter:blur(6px)}
+.lb.on{display:flex}
+.lb__bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+  padding:10px var(--gut);padding-top:max(10px, env(safe-area-inset-top));
+  border-bottom:1px solid var(--rule);font-family:var(--mono);font-size:13px;color:var(--dim)}
+.lb__count{color:var(--faint);min-width:3.5em}
+.lb__cap{flex:1;min-width:0;color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.lb__btn{min-height:40px;min-width:40px;padding:8px 14px;background:transparent;color:var(--ink);
+  border:1px solid var(--rule2);border-radius:2px;font-family:var(--mono);font-size:13px;cursor:pointer}
+.lb__btn:hover{border-color:var(--gold);color:var(--gold)}
+.lb__btn:focus-visible{outline:2px solid var(--gold);outline-offset:2px}
+/* Fit mode centres the image; 100 % mode must start at the top-left edge, or
+   a centred flex child that overflows can never be scrolled to its left side. */
+.lb__stage{flex:1;min-height:0;overflow:auto;display:flex;align-items:center;justify-content:center;
+  padding:16px;overscroll-behavior:contain}
+.lb__stage img{display:block;max-width:100%;max-height:100%;width:auto;height:auto;
+  border:1px solid var(--rule);background:var(--log2)}
+.lb.big .lb__stage img{cursor:zoom-in}
+/* Phones: a 2,500 px wide capture fitted to 360 px of width is as unreadable
+   as the thumbnail. Fitted to the screen HEIGHT instead, the text lands near
+   normal reading size and the rest is a sideways swipe away. */
+.lb.tall .lb__stage{justify-content:flex-start}
+.lb.tall .lb__stage img{max-width:none;height:100%;width:auto}
+.lb.full .lb__stage{align-items:flex-start;justify-content:flex-start}
+.lb.full .lb__stage img{max-width:none;max-height:none;height:auto;cursor:zoom-out}
+.lb__hint{font-family:var(--mono);font-size:12px;color:var(--faint);text-align:center;
+  padding:8px var(--gut);padding-bottom:max(8px, env(safe-area-inset-bottom))}
+@media(max-width:760px){.lb__cap{flex-basis:100%;order:5;white-space:normal}}
+
 /* Nothing here is load-bearing: with motion reduced every element simply
    starts in its final state. */
 @media(prefers-reduced-motion:reduce){
@@ -636,6 +681,147 @@ code{font-family:var(--mono);font-size:.9em}
     }, {threshold: 0.12, rootMargin: '0px 0px -8% 0px'});
     figs.forEach(function(f){ io2.observe(f); });
   }
+})();
+</script>
+
+<script>
+// Enlarge a screenshot: full-screen view, second click for 100 %, arrow keys to
+// browse, Esc to close. Focus goes into the dialog and back to the image that
+// opened it, so it works the same with a keyboard as with a mouse.
+(function(){
+  var imgs = [].slice.call(document.querySelectorAll('.view figure img'));
+  if(!imgs.length) return;
+
+  var lb = document.createElement('div');
+  lb.className = 'lb';
+  lb.setAttribute('role', 'dialog');
+  lb.setAttribute('aria-modal', 'true');
+  lb.setAttribute('aria-label', 'Screenshot');
+  lb.innerHTML =
+    '<div class="lb__bar">' +
+      '<button type="button" class="lb__btn" data-lb="prev" aria-label="Previous screenshot">&#8592;</button>' +
+      '<button type="button" class="lb__btn" data-lb="next" aria-label="Next screenshot">&#8594;</button>' +
+      '<span class="lb__count"></span><span class="lb__cap"></span>' +
+      '<button type="button" class="lb__btn" data-lb="close">Close &#10005;</button>' +
+    '</div>' +
+    '<div class="lb__stage"><img alt=""></div>' +
+    '<div class="lb__hint"></div>';
+  document.body.appendChild(lb);
+
+  var stage = lb.querySelector('.lb__stage');
+  var big = stage.querySelector('img');
+  var cap = lb.querySelector('.lb__cap');
+  var count = lb.querySelector('.lb__count');
+  var hint = lb.querySelector('.lb__hint');
+  var closeBtn = lb.querySelector('[data-lb="close"]');
+  var cur = -1, opener = null;
+
+  function title(i){
+    var v = imgs[i].closest('.view');
+    var h = v && v.querySelector('h3');
+    return h ? h.textContent : imgs[i].alt;
+  }
+  // Only worth offering 100 % when the image is actually larger than the view.
+  function canZoom(){
+    return big.naturalWidth > stage.clientWidth - 32 || big.naturalHeight > stage.clientHeight - 32;
+  }
+  var touch = matchMedia('(hover: none)').matches;
+  // Narrow screen and a wide capture: fit the height, swipe for the rest.
+  function pickMode(){
+    lb.classList.remove('tall');
+    var sw = stage.clientWidth - 32, sh = stage.clientHeight - 32;
+    if(sw < 728 && big.naturalWidth / big.naturalHeight > sw / sh && big.naturalWidth > sw * 1.6)
+      lb.classList.add('tall');
+  }
+  function setHint(){
+    var z = canZoom(), full = lb.classList.contains('full'), tall = lb.classList.contains('tall');
+    lb.classList.toggle('big', z);
+    var act = touch ? 'Tap' : 'Click';
+    var parts = [];
+    if(tall && !full) parts.push('Swipe sideways to see all of it');
+    if(z) parts.push(full ? act + ' the image to fit the screen' : act + ' the image for 100 %');
+    parts.push(touch ? '\u2190 \u2192 browse' : '\u2190 \u2192 browse \u00b7 Esc closes');
+    hint.textContent = parts.join(' \u00b7 ');
+  }
+  function ready(){ pickMode(); setHint(); }
+  function show(i){
+    cur = (i + imgs.length) % imgs.length;
+    lb.classList.remove('full', 'tall');
+    big.alt = imgs[cur].alt;
+    big.src = imgs[cur].currentSrc || imgs[cur].src;
+    cap.textContent = title(cur);
+    count.textContent = (cur + 1) + ' / ' + imgs.length;
+    stage.scrollTop = stage.scrollLeft = 0;
+    if(big.complete && big.naturalWidth) ready(); else big.onload = ready;
+  }
+  function open(i){
+    opener = imgs[i];
+    lb.classList.add('on');
+    document.documentElement.style.overflow = 'hidden';
+    show(i);
+    closeBtn.focus();
+  }
+  function close(){
+    lb.classList.remove('on', 'full', 'tall');
+    document.documentElement.style.overflow = '';
+    big.removeAttribute('src');
+    if(opener) opener.focus();
+  }
+
+  imgs.forEach(function(img, i){
+    img.classList.add('zoomable');
+    img.setAttribute('tabindex', '0');
+    img.setAttribute('role', 'button');
+    img.setAttribute('aria-label', 'Enlarge screenshot: ' + img.alt);
+    var tip = document.createElement('span');
+    tip.className = 'zoomhint';
+    tip.setAttribute('aria-hidden', 'true');
+    tip.textContent = '\u2922 Enlarge';
+    img.parentNode.appendChild(tip);
+    img.addEventListener('click', function(){ open(i); });
+    img.addEventListener('keydown', function(e){
+      if(e.key === 'Enter' || e.key === ' '){ e.preventDefault(); open(i); }
+    });
+  });
+
+  lb.addEventListener('click', function(e){
+    var b = e.target.closest('[data-lb]');
+    if(b){
+      var a = b.getAttribute('data-lb');
+      if(a === 'close') close(); else show(cur + (a === 'next' ? 1 : -1));
+      return;
+    }
+    if(e.target === big){
+      if(!canZoom() && !lb.classList.contains('full')) return;
+      // Keep the clicked spot under the pointer when switching to 100 %.
+      var rx = e.offsetX / big.clientWidth, ry = e.offsetY / big.clientHeight;
+      lb.classList.toggle('full');
+      if(lb.classList.contains('full')){
+        stage.scrollLeft = rx * big.naturalWidth - stage.clientWidth / 2;
+        stage.scrollTop = ry * big.naturalHeight - stage.clientHeight / 2;
+      }
+      setHint();
+      return;
+    }
+    if(e.target === stage || e.target === lb) close();   // click beside the image
+  });
+
+  document.addEventListener('keydown', function(e){
+    if(!lb.classList.contains('on')) return;
+    if(e.key === 'Escape'){ e.preventDefault(); close(); }
+    else if(e.key === 'ArrowRight'){ e.preventDefault(); show(cur + 1); }
+    else if(e.key === 'ArrowLeft'){ e.preventDefault(); show(cur - 1); }
+    else if(e.key === 'Tab'){
+      // keep focus inside the dialog
+      var f = [].slice.call(lb.querySelectorAll('button'));
+      var k = f.indexOf(document.activeElement);
+      e.preventDefault();
+      f[(k + (e.shiftKey ? -1 : 1) + f.length) % f.length].focus();
+    }
+  });
+  window.addEventListener('resize', function(){
+    if(lb.classList.contains('on') && !lb.classList.contains('full')) ready();
+  });
 })();
 </script>
 </body>
