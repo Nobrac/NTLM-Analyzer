@@ -29,7 +29,7 @@
   --disp:'Segoe UI Variable Display','Segoe UI',system-ui,-apple-system,sans-serif;
   --text:'Segoe UI Variable Text','Segoe UI',system-ui,-apple-system,sans-serif;
   --mono:'Cascadia Mono','IBM Plex Mono',ui-monospace,Consolas,'SF Mono',monospace;
-  --r:14px; --pad:clamp(20px,2.8vw,52px);
+  --r:6px; --pad:clamp(20px,2.8vw,52px);   /* crisper panel corners, closer to the reference's hairline-bordered look */
 }
 *{box-sizing:border-box}
 html{scroll-behavior:smooth}
@@ -42,9 +42,9 @@ body{margin:0;background:var(--void);color:var(--ink);font-family:var(--text);fo
   line-height:1.5;-webkit-font-smoothing:antialiased}
 body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:0;
   background:radial-gradient(1200px 600px at 10% -8%,rgba(255,107,107,.05),transparent 62%),
-             radial-gradient(1200px 700px at 90% 108%,rgba(61,220,151,.042),transparent 62%)}
+             radial-gradient(1200px 700px at 90% 108%,rgba(217,184,74,.042),transparent 62%)}
 .stage{position:relative;z-index:1}
-::selection{background:rgba(61,220,151,.25)}
+::selection{background:rgba(217,184,74,.30)}
 :focus-visible{outline:2px solid var(--gold);outline-offset:2px;border-radius:6px}
 button{font:inherit}
 a{color:inherit}
@@ -223,7 +223,7 @@ select option:checked,.sel-st option:checked{background:#26314a;color:#fff}
 .flag.ok{color:var(--krb);border-color:rgba(61,220,151,.3);background:rgba(61,220,151,.06)}
 .mini{background:rgba(255,255,255,.04);border:1px solid var(--edge);color:var(--dim);border-radius:7px;
   padding:3px 9px;font-family:var(--mono);font-size:12px;cursor:pointer;transition:.16s}
-.mini:hover{color:var(--ink);border-color:var(--krb)}
+.mini:hover{color:var(--ink);border-color:var(--gold)}
 
 table{width:100%;border-collapse:collapse}
 .tw{overflow-x:auto}
@@ -247,7 +247,7 @@ tbody tr{transition:background .16s}
 tbody tr:nth-child(even){background:rgba(158,180,225,.028)}
 tbody tr.click{cursor:pointer}
 tbody tr.click:hover{background:rgba(148,170,220,.06)}
-tbody tr.on{background:rgba(61,220,151,.10);box-shadow:inset 3px 0 0 var(--krb)}
+tbody tr.on{background:rgba(217,184,74,.10);box-shadow:inset 3px 0 0 var(--gold)}
 .r{text-align:right;font-family:var(--mono);font-variant-numeric:tabular-nums}
 .mn{font-family:var(--mono);font-size:15px}
 /* Table cells marked .dm carry real content - target servers, accounts,
@@ -283,11 +283,19 @@ tbody tr.on{background:rgba(61,220,151,.10);box-shadow:inset 3px 0 0 var(--krb)}
 .chip:hover{color:var(--ink);border-color:var(--edge2)}
 .chip[aria-pressed=true]{background:rgba(255,255,255,.09);color:var(--ink);border-color:var(--edge2)}
 .active{display:flex;gap:6px;flex-wrap:wrap;padding:0 17px 11px}
-.afl{display:inline-flex;align-items:center;gap:7px;background:rgba(61,220,151,.09);
-  border:1px solid rgba(61,220,151,.28);color:#9ff0cb;border-radius:8px;padding:4px 8px;
+.afl{display:inline-flex;align-items:center;gap:7px;background:rgba(217,184,74,.12);
+  border:1px solid rgba(217,184,74,.32);color:#ffe9a8;border-radius:8px;padding:4px 8px;
   font-family:var(--mono);font-size:12px}
 .afl button{background:none;border:0;color:inherit;cursor:pointer;opacity:.7;padding:0 0 0 2px;font-size:15px}
 .afl button:hover{opacity:1}
+/* Unconfirmed 8001s: dashed and muted on purpose - they are shown, not
+   asserted, and must not read like the solid NTLM tags next to them. */
+.tag.unc{border-style:dashed;color:var(--dim);background:transparent}
+.tag.unc.ph{color:var(--krb);border-color:rgba(61,220,151,.35)}
+.expl.unc{border-style:dashed}
+.unchint{background:none;border:1px dashed var(--edge2);color:var(--dim);font-family:var(--mono);
+  font-size:12px;border-radius:7px;padding:5px 10px;cursor:pointer;margin-left:6px}
+.unchint:hover{color:var(--ink);border-color:var(--gold)}
 .clearall{background:none;border:0;color:var(--faint);font-family:var(--mono);font-size:12px;
   cursor:pointer;text-decoration:underline;text-underline-offset:3px}
 .clearall:hover{color:var(--ink)}
@@ -333,11 +341,11 @@ tbody tr.on{background:rgba(61,220,151,.10);box-shadow:inset 3px 0 0 var(--krb)}
 .hc.in{transform:scale(1);opacity:1}
 .hc{cursor:pointer}
 .hc:hover{outline:1px solid var(--ink);outline-offset:1px}
-.hc.on{outline:2px solid var(--krb);outline-offset:1px}
+.hc.on{outline:2px solid var(--gold);outline-offset:1px}
 .bcol{cursor:pointer}
 .bcol:hover span{filter:brightness(1.25)}
 .bcol.on span{filter:brightness(1.5)}
-.bcol.on{outline:1px solid var(--krb);outline-offset:1px;border-radius:2px}
+.bcol.on{outline:1px solid var(--gold);outline-offset:1px;border-radius:2px}
 .hnote{font-family:var(--mono);font-size:14px;color:var(--dim);margin-top:11px;padding-top:10px;
   border-top:1px solid var(--edge)}
 .hnote b{color:var(--v2);font-weight:500}
@@ -372,7 +380,7 @@ tbody tr.on{background:rgba(61,220,151,.10);box-shadow:inset 3px 0 0 var(--krb)}
 .dact{display:flex;gap:8px;flex-wrap:wrap;margin:19px 22px 0}
 .dact button{flex:1 1 auto;background:rgba(255,255,255,.04);border:1px solid var(--edge);color:var(--dim);
   border-radius:9px;padding:10px 14px;font-family:var(--mono);font-size:14px;cursor:pointer;transition:.18s}
-.dact button:hover{color:var(--ink);border-color:var(--krb);background:rgba(61,220,151,.07)}
+.dact button:hover{color:var(--ink);border-color:var(--gold);background:rgba(217,184,74,.09)}
 .code{margin:15px 22px;background:#0c1119;border:1px solid var(--edge);border-radius:10px;padding:13px 15px;
   font-family:var(--mono);font-size:15px;color:var(--dim);white-space:pre-wrap;word-break:break-all;
   max-height:360px;overflow-y:auto}
@@ -486,7 +494,7 @@ tbody tr.on{background:rgba(61,220,151,.10);box-shadow:inset 3px 0 0 var(--krb)}
 </style>
 <script>
 (function(){
-  var MANIFEST = {"range=30d":"cbd9b757bcdf.json","bucket=2026-08-23&nokrb=1&range=30d":"582fc37e2df3.json","bucket=2026-08-24&nokrb=1&range=30d":"ed0992af1dcc.json","bucket=2026-08-25&nokrb=1&range=30d":"56d151e0133a.json","bucket=2026-08-26&nokrb=1&range=30d":"1da2dd33805d.json","bucket=2026-08-27&nokrb=1&range=30d":"537150327385.json","bucket=2026-08-28&nokrb=1&range=30d":"c304ae13e30d.json","bucket=2026-08-29&nokrb=1&range=30d":"fa15707c57d2.json","bucket=2026-08-30&nokrb=1&range=30d":"bc33d3558815.json","bucket=2026-08-31&nokrb=1&range=30d":"7cb15b63c2cd.json","bucket=2026-09-01&nokrb=1&range=30d":"5bc7a76b727f.json","bucket=2026-09-02&nokrb=1&range=30d":"b7b684500e2f.json","bucket=2026-09-03&nokrb=1&range=30d":"d876cde929a2.json","bucket=2026-09-04&nokrb=1&range=30d":"6b4a3c390be9.json","bucket=2026-09-05&nokrb=1&range=30d":"92c16fe923f7.json","bucket=2026-09-06&nokrb=1&range=30d":"828da58a1f38.json","bucket=2026-09-07&nokrb=1&range=30d":"d1117bf9ae32.json","bucket=2026-09-08&nokrb=1&range=30d":"b422daa7be38.json","bucket=2026-09-09&nokrb=1&range=30d":"21e6cf7c5ec8.json","bucket=2026-09-10&nokrb=1&range=30d":"a398710aef15.json","bucket=2026-09-11&nokrb=1&range=30d":"caf84c81fc8a.json","bucket=2026-09-12&nokrb=1&range=30d":"ff649d8fc433.json","bucket=2026-09-13&nokrb=1&range=30d":"bda516877df9.json","bucket=2026-09-14&nokrb=1&range=30d":"285c911ba17a.json","bucket=2026-09-15&nokrb=1&range=30d":"ef51b97dc045.json","bucket=2026-09-16&nokrb=1&range=30d":"4dd4e833bbe7.json","bucket=2026-09-17&nokrb=1&range=30d":"9e31ad559802.json","bucket=2026-09-18&nokrb=1&range=30d":"25466cdc75e6.json","bucket=2026-09-19&nokrb=1&range=30d":"404a3e026d5f.json","bucket=2026-09-20&nokrb=1&range=30d":"637253ac16a0.json","bucket=2026-09-21&nokrb=1&range=30d":"515c7634a90a.json","hr=10&nokrb=1&range=30d&wd=1":"3f70add31a58.json","hr=11&nokrb=1&range=30d&wd=1":"d3af26e4524a.json","hr=12&nokrb=1&range=30d&wd=1":"a886606f4414.json","hr=13&nokrb=1&range=30d&wd=1":"52e8a06afdc3.json","hr=14&nokrb=1&range=30d&wd=1":"c237bbcdab78.json","hr=15&nokrb=1&range=30d&wd=1":"542359027ebe.json","hr=16&nokrb=1&range=30d&wd=1":"9395556ce757.json","hr=17&nokrb=1&range=30d&wd=1":"d44b64df3025.json","hr=18&nokrb=1&range=30d&wd=1":"a3fe8d01c153.json","hr=19&nokrb=1&range=30d&wd=1":"073677267a54.json","hr=20&nokrb=1&range=30d&wd=1":"4152ea316a6d.json","hr=10&nokrb=1&range=30d&wd=2":"9c5bc86b413d.json","hr=11&nokrb=1&range=30d&wd=2":"6f21a760c060.json","hr=12&nokrb=1&range=30d&wd=2":"5b9be308226e.json","hr=13&nokrb=1&range=30d&wd=2":"d7b033ff062b.json","hr=14&nokrb=1&range=30d&wd=2":"8b3fa0059fa4.json","hr=15&nokrb=1&range=30d&wd=2":"cc6914df3c59.json","hr=16&nokrb=1&range=30d&wd=2":"a18d71372c9b.json","hr=17&nokrb=1&range=30d&wd=2":"98abe76dc491.json","hr=18&nokrb=1&range=30d&wd=2":"75122cb813ba.json","hr=19&nokrb=1&range=30d&wd=2":"40e3f1e795c4.json","hr=10&nokrb=1&range=30d&wd=3":"c41802feb0d1.json","hr=11&nokrb=1&range=30d&wd=3":"0c68de518264.json","hr=12&nokrb=1&range=30d&wd=3":"659dba322cbf.json","hr=13&nokrb=1&range=30d&wd=3":"3a2ce8e167b2.json","hr=14&nokrb=1&range=30d&wd=3":"ec35af6da937.json","hr=15&nokrb=1&range=30d&wd=3":"dfc7dbb9bd4a.json","hr=16&nokrb=1&range=30d&wd=3":"04697ec87270.json","hr=17&nokrb=1&range=30d&wd=3":"4b227ce6a9d0.json","hr=18&nokrb=1&range=30d&wd=3":"d8e14d773cdb.json","hr=19&nokrb=1&range=30d&wd=3":"8b80be39ec90.json","hr=10&nokrb=1&range=30d&wd=4":"5d5f6c338510.json","hr=11&nokrb=1&range=30d&wd=4":"0812c47b5a45.json","hr=12&nokrb=1&range=30d&wd=4":"4b412f161a0a.json","hr=13&nokrb=1&range=30d&wd=4":"91b29ef5446d.json","hr=14&nokrb=1&range=30d&wd=4":"26dea170f3fe.json","hr=15&nokrb=1&range=30d&wd=4":"e2e511578df0.json","hr=16&nokrb=1&range=30d&wd=4":"5a6a67390d36.json","hr=17&nokrb=1&range=30d&wd=4":"ee997bb038e2.json","hr=18&nokrb=1&range=30d&wd=4":"9d04a62e7718.json","hr=19&nokrb=1&range=30d&wd=4":"d0403169ef85.json","hr=10&nokrb=1&range=30d&wd=5":"2ed4915d4570.json","hr=11&nokrb=1&range=30d&wd=5":"14e0f94dd1f8.json","hr=12&nokrb=1&range=30d&wd=5":"8c5db7449204.json","hr=13&nokrb=1&range=30d&wd=5":"0c6f305284d8.json","hr=14&nokrb=1&range=30d&wd=5":"9c0898714902.json","hr=15&nokrb=1&range=30d&wd=5":"32b74604a477.json","hr=16&nokrb=1&range=30d&wd=5":"388130b0bb7a.json","hr=17&nokrb=1&range=30d&wd=5":"77f7eb35706e.json","hr=18&nokrb=1&range=30d&wd=5":"6080f835ff68.json","hr=19&nokrb=1&range=30d&wd=5":"06a55abc9f54.json","hr=10&nokrb=1&range=30d&wd=6":"2bc94665a605.json","hr=11&nokrb=1&range=30d&wd=6":"90dc6b5479b2.json","hr=12&nokrb=1&range=30d&wd=6":"5036f971d978.json","hr=13&nokrb=1&range=30d&wd=6":"c4bd37f38de3.json","hr=14&nokrb=1&range=30d&wd=6":"b8a44a6c9328.json","hr=15&nokrb=1&range=30d&wd=6":"81e4709ff979.json","hr=16&nokrb=1&range=30d&wd=6":"2b1aaf559112.json","hr=17&nokrb=1&range=30d&wd=6":"e9ec7e515c78.json","hr=18&nokrb=1&range=30d&wd=6":"c0778ec23b26.json","hr=19&nokrb=1&range=30d&wd=6":"ff3f62ea41e9.json","hr=5&nokrb=1&range=30d&wd=0":"d585f6b31692.json","hr=10&nokrb=1&range=30d&wd=0":"332f3be3a535.json","hr=11&nokrb=1&range=30d&wd=0":"c19567971357.json","hr=12&nokrb=1&range=30d&wd=0":"5f0371e70f5e.json","hr=13&nokrb=1&range=30d&wd=0":"85ea8b467546.json","hr=14&nokrb=1&range=30d&wd=0":"20da40eea48d.json","hr=15&nokrb=1&range=30d&wd=0":"c0720c8ed2ce.json","hr=16&nokrb=1&range=30d&wd=0":"825522896a48.json","hr=17&nokrb=1&range=30d&wd=0":"e0233498dcaf.json","hr=18&nokrb=1&range=30d&wd=0":"3905208e7fe8.json","hr=19&nokrb=1&range=30d&wd=0":"b9d6fdb6d72d.json","range=30d&rid=1":"b833ff92b999.json","range=30d&rid=6":"5cff11686445.json","fcode=0x7&kind=krbfail&range=30d":"5f6dc4277851.json","range=30d&rid=7":"8bba911fce64.json","fcode=0x25&kind=krbfail&range=30d":"93b112ae96ec.json","fcode=0xe&kind=krbfail&range=30d":"f8151a89efc6.json","range=30d&version=NTLMv1":"f6c367d64e0f.json","range=30d&version=NTLMv2":"746957805b8f.json","kind=kerberos&range=30d":"5a369b14c095.json"};
+  var MANIFEST = {"range=30d":"cbd9b757bcdf.json","bucket=2026-08-24&nokrb=1&range=30d":"ed0992af1dcc.json","bucket=2026-08-25&nokrb=1&range=30d":"56d151e0133a.json","bucket=2026-08-26&nokrb=1&range=30d":"1da2dd33805d.json","bucket=2026-08-27&nokrb=1&range=30d":"537150327385.json","bucket=2026-08-28&nokrb=1&range=30d":"c304ae13e30d.json","bucket=2026-08-29&nokrb=1&range=30d":"fa15707c57d2.json","bucket=2026-08-30&nokrb=1&range=30d":"bc33d3558815.json","bucket=2026-08-31&nokrb=1&range=30d":"7cb15b63c2cd.json","bucket=2026-09-01&nokrb=1&range=30d":"5bc7a76b727f.json","bucket=2026-09-02&nokrb=1&range=30d":"b7b684500e2f.json","bucket=2026-09-03&nokrb=1&range=30d":"d876cde929a2.json","bucket=2026-09-04&nokrb=1&range=30d":"6b4a3c390be9.json","bucket=2026-09-05&nokrb=1&range=30d":"92c16fe923f7.json","bucket=2026-09-06&nokrb=1&range=30d":"828da58a1f38.json","bucket=2026-09-07&nokrb=1&range=30d":"d1117bf9ae32.json","bucket=2026-09-08&nokrb=1&range=30d":"b422daa7be38.json","bucket=2026-09-09&nokrb=1&range=30d":"21e6cf7c5ec8.json","bucket=2026-09-10&nokrb=1&range=30d":"a398710aef15.json","bucket=2026-09-11&nokrb=1&range=30d":"caf84c81fc8a.json","bucket=2026-09-12&nokrb=1&range=30d":"ff649d8fc433.json","bucket=2026-09-13&nokrb=1&range=30d":"bda516877df9.json","bucket=2026-09-14&nokrb=1&range=30d":"285c911ba17a.json","bucket=2026-09-15&nokrb=1&range=30d":"ef51b97dc045.json","bucket=2026-09-16&nokrb=1&range=30d":"4dd4e833bbe7.json","bucket=2026-09-17&nokrb=1&range=30d":"9e31ad559802.json","bucket=2026-09-18&nokrb=1&range=30d":"25466cdc75e6.json","bucket=2026-09-19&nokrb=1&range=30d":"404a3e026d5f.json","bucket=2026-09-20&nokrb=1&range=30d":"637253ac16a0.json","bucket=2026-09-21&nokrb=1&range=30d":"515c7634a90a.json","bucket=2026-09-22&nokrb=1&range=30d":"120f82929f5b.json","hr=10&nokrb=1&range=30d&wd=1":"3f70add31a58.json","hr=11&nokrb=1&range=30d&wd=1":"d3af26e4524a.json","hr=12&nokrb=1&range=30d&wd=1":"a886606f4414.json","hr=13&nokrb=1&range=30d&wd=1":"52e8a06afdc3.json","hr=14&nokrb=1&range=30d&wd=1":"c237bbcdab78.json","hr=15&nokrb=1&range=30d&wd=1":"542359027ebe.json","hr=16&nokrb=1&range=30d&wd=1":"9395556ce757.json","hr=17&nokrb=1&range=30d&wd=1":"d44b64df3025.json","hr=18&nokrb=1&range=30d&wd=1":"a3fe8d01c153.json","hr=19&nokrb=1&range=30d&wd=1":"073677267a54.json","hr=10&nokrb=1&range=30d&wd=2":"9c5bc86b413d.json","hr=11&nokrb=1&range=30d&wd=2":"6f21a760c060.json","hr=12&nokrb=1&range=30d&wd=2":"5b9be308226e.json","hr=13&nokrb=1&range=30d&wd=2":"d7b033ff062b.json","hr=14&nokrb=1&range=30d&wd=2":"8b3fa0059fa4.json","hr=15&nokrb=1&range=30d&wd=2":"cc6914df3c59.json","hr=16&nokrb=1&range=30d&wd=2":"a18d71372c9b.json","hr=17&nokrb=1&range=30d&wd=2":"98abe76dc491.json","hr=18&nokrb=1&range=30d&wd=2":"75122cb813ba.json","hr=19&nokrb=1&range=30d&wd=2":"40e3f1e795c4.json","hr=20&nokrb=1&range=30d&wd=2":"c35da7d4fc4e.json","hr=10&nokrb=1&range=30d&wd=3":"c41802feb0d1.json","hr=11&nokrb=1&range=30d&wd=3":"0c68de518264.json","hr=12&nokrb=1&range=30d&wd=3":"659dba322cbf.json","hr=13&nokrb=1&range=30d&wd=3":"3a2ce8e167b2.json","hr=14&nokrb=1&range=30d&wd=3":"ec35af6da937.json","hr=15&nokrb=1&range=30d&wd=3":"dfc7dbb9bd4a.json","hr=16&nokrb=1&range=30d&wd=3":"04697ec87270.json","hr=17&nokrb=1&range=30d&wd=3":"4b227ce6a9d0.json","hr=18&nokrb=1&range=30d&wd=3":"d8e14d773cdb.json","hr=19&nokrb=1&range=30d&wd=3":"8b80be39ec90.json","hr=10&nokrb=1&range=30d&wd=4":"5d5f6c338510.json","hr=11&nokrb=1&range=30d&wd=4":"0812c47b5a45.json","hr=12&nokrb=1&range=30d&wd=4":"4b412f161a0a.json","hr=13&nokrb=1&range=30d&wd=4":"91b29ef5446d.json","hr=14&nokrb=1&range=30d&wd=4":"26dea170f3fe.json","hr=15&nokrb=1&range=30d&wd=4":"e2e511578df0.json","hr=16&nokrb=1&range=30d&wd=4":"5a6a67390d36.json","hr=17&nokrb=1&range=30d&wd=4":"ee997bb038e2.json","hr=18&nokrb=1&range=30d&wd=4":"9d04a62e7718.json","hr=19&nokrb=1&range=30d&wd=4":"d0403169ef85.json","hr=10&nokrb=1&range=30d&wd=5":"2ed4915d4570.json","hr=11&nokrb=1&range=30d&wd=5":"14e0f94dd1f8.json","hr=12&nokrb=1&range=30d&wd=5":"8c5db7449204.json","hr=13&nokrb=1&range=30d&wd=5":"0c6f305284d8.json","hr=14&nokrb=1&range=30d&wd=5":"9c0898714902.json","hr=15&nokrb=1&range=30d&wd=5":"32b74604a477.json","hr=16&nokrb=1&range=30d&wd=5":"388130b0bb7a.json","hr=17&nokrb=1&range=30d&wd=5":"77f7eb35706e.json","hr=18&nokrb=1&range=30d&wd=5":"6080f835ff68.json","hr=19&nokrb=1&range=30d&wd=5":"06a55abc9f54.json","hr=10&nokrb=1&range=30d&wd=6":"2bc94665a605.json","hr=11&nokrb=1&range=30d&wd=6":"90dc6b5479b2.json","hr=12&nokrb=1&range=30d&wd=6":"5036f971d978.json","hr=13&nokrb=1&range=30d&wd=6":"c4bd37f38de3.json","hr=14&nokrb=1&range=30d&wd=6":"b8a44a6c9328.json","hr=15&nokrb=1&range=30d&wd=6":"81e4709ff979.json","hr=16&nokrb=1&range=30d&wd=6":"2b1aaf559112.json","hr=17&nokrb=1&range=30d&wd=6":"e9ec7e515c78.json","hr=18&nokrb=1&range=30d&wd=6":"c0778ec23b26.json","hr=19&nokrb=1&range=30d&wd=6":"ff3f62ea41e9.json","hr=5&nokrb=1&range=30d&wd=0":"d585f6b31692.json","hr=10&nokrb=1&range=30d&wd=0":"332f3be3a535.json","hr=11&nokrb=1&range=30d&wd=0":"c19567971357.json","hr=12&nokrb=1&range=30d&wd=0":"5f0371e70f5e.json","hr=13&nokrb=1&range=30d&wd=0":"85ea8b467546.json","hr=14&nokrb=1&range=30d&wd=0":"20da40eea48d.json","hr=15&nokrb=1&range=30d&wd=0":"c0720c8ed2ce.json","hr=16&nokrb=1&range=30d&wd=0":"825522896a48.json","hr=17&nokrb=1&range=30d&wd=0":"e0233498dcaf.json","hr=18&nokrb=1&range=30d&wd=0":"3905208e7fe8.json","hr=19&nokrb=1&range=30d&wd=0":"b9d6fdb6d72d.json","range=30d&rid=6":"5cff11686445.json","range=30d&rid=1":"b833ff92b999.json","fcode=0x7&kind=krbfail&range=30d":"5f6dc4277851.json","range=30d&rid=7":"8bba911fce64.json","fcode=0xe&kind=krbfail&range=30d":"f8151a89efc6.json","fcode=0x25&kind=krbfail&range=30d":"93b112ae96ec.json","range=30d&version=NTLMv1":"f6c367d64e0f.json","range=30d&version=NTLMv2":"746957805b8f.json","kind=kerberos&range=30d":"5a369b14c095.json","range=30d&unconf=1":"01b85710e2cd.json"};
   var TZ = 120;
 
   // Every panel is computed in the viewer's local time on the real collector.
@@ -638,6 +646,13 @@ de: {
   drill_hint:'klicken, um die Ereignisse zu sehen', f_day:'Tag',
   osbar_lbl:'Agenten nach Betriebssystem', osbar_other:'weitere', osbar_unknown:'unbekannt',
   ev_capped:'die neuesten {n} geladen',
+  unconf_hint:'{n} unbestätigte Einträge ausgeblendet – anzeigen',
+  unconf_chip:'Nur unbestätigte 8001',
+  unconf_tag:'unbestätigt',
+  unconf_expl:'Diese Maschine schreibt das erweiterte Ereignis 4020, zu diesem 8001 aber keins. Ob dahinter eine NTLM-Anmeldung stand, ist noch nicht geklärt: Dafür müssen alle Domänencontroller für diesen Zeitpunkt ihre 4776-Prüfungen geliefert haben, und das Konto muss ein Domänenkonto sein. Bis dahin zählt der Eintrag in keiner Kennzahl mit.',
+  unconf_hint_ph:'{n} unbestätigte Einträge ausgeblendet, davon {p} vom DC als Phantom belegt – anzeigen',
+  phantom_tag:'Phantom (DC-geprüft)',
+  phantom_expl:'Kein Domänencontroller hat in den zwei Minuten um diesen Zeitpunkt eine NTLM-Anmeldung dieses Kontos geprüft – geprüft gegen {dcs}. Windows hat das 8001 geschrieben, weil NTLM beim Aushandeln in Frage kam; angemeldet hat Kerberos.',
   tip_events:'Ereignisse', tip_share:'Anteil', tip_click:'klicken, um danach zu filtern',
   fl_dom:'Domänenebene', fl_for:'Gesamtstruktur', fl_raw:'Ebene {n}',
   fl_split_t:'Die Agenten melden unterschiedliche Werte',
@@ -739,7 +754,6 @@ de: {
   b_policywarn:'Richtlinie: bricht später', b_policyblock:'von Richtlinie blockiert', b_secblock:'Sitzungssicherheit',
   eid_100:'NTLM abgelehnt, weil das Konto in der Gruppe „Geschützte Benutzer" ist. Für dieses Konto ist NTLM bereits heute gesperrt.',
   eid_101:'NTLM abgelehnt, weil Zugriffssteuerungs-Einschränkungen greifen (Authentifizierungsrichtlinie).',
-  eid_301:'NTLM hat funktioniert, wird aber scheitern, sobald die Authentifizierungsrichtlinie erzwungen wird – eine Vorwarnung wie die Oktober-2026-Frist, nur aus anderer Richtung.',
   eid_4010:'Blockiert durch minimale Client-Sitzungssicherheit (NtlmMinClientSec).',
   eid_4011:'Blockiert durch minimale Server-Sitzungssicherheit (NtlmMinServerSec).',
   eid_4012:'Das DC-generierte NTLM-Geheimnis schlug fehl, der Client fiel auf das Domänenkennwort zurück.',
@@ -811,6 +825,8 @@ de: {
   au_out_on:'Ausgehend', au_out_off:'Ausgehend aus', au_dom_on:'Domäne', au_dom_off:'Domäne aus',
   st_offen:'offen', st_arbeit:'in Arbeit', st_erledigt:'erledigt', again:'wieder aktiv', what:'Was tun?',
   type_dc:'Domänencontroller', type_member:'Server/Client',
+  b_dcval_ok:'4776 kommt an', b_dcval_ok_t:'Liefert NTLM-Prüfungen (4776) für den Phantom-Abgleich, zuletzt {when}.',
+  b_dcval_none:'keine 4776', b_dcval_none_t:'Dieser DC liefert keine NTLM-Prüfungen (4776). Solange auch nur ein DC fehlt, wird kein 8001 als Phantom belegt – den Agent auf Version 2.2.0 oder neuer aktualisieren; „Anmeldeinformationen überprüfen" muss im Audit aktiv sein.',
   hint_smb:'<b>Dateifreigabe-Zugriff über NTLM.</b> Häufigste Ursache: Zugriff per <b>IP statt Hostname</b> – Kerberos braucht einen Namen mit SPN. Netzlaufwerke, Verknüpfungen, Skripte und geplante Tasks von \\\\10.x.x.x auf \\\\SERVERNAME umstellen. Ebenfalls prüfen: Geräte außerhalb der Domäne (NAS, Drucker, Scanner) – die können kein Kerberos zur Domäne.',
   hint_proc:'<b>Programm nutzt NTLM direkt.</b> Prüfen: Unterstützt die Anwendung Kerberos bzw. „Windows-integrierte Anmeldung" (Hersteller-Doku)? Verbindet sie per IP statt Hostname? Hat das Dienstkonto des Ziels einen SPN (<b>setspn -L KONTO</b>)? Wenn nichts davon geht: Kandidat für die NTLM-Ausnahmeliste beim späteren Abschalten.',
   hint_dom:'<b>Quellcomputer nutzt NTLM zum Ziel.</b> Zum Eingrenzen auf dem Quellcomputer das ausgehende Audit aktivieren (Agent mit <b>--enable-outgoing-audit</b>) – dann erscheint dort der auslösende Prozess im Panel „Programme". Klassiker: Zugriff per IP statt Hostname, veraltete Clients, Geräte außerhalb der Domäne.',
@@ -862,6 +878,13 @@ en: {
   drill_hint:'click to see the events', f_day:'Day',
   osbar_lbl:'Agents by OS', osbar_other:'others', osbar_unknown:'unknown',
   ev_capped:'newest {n} loaded',
+  unconf_hint:'{n} unconfirmed entries hidden - show',
+  unconf_chip:'Unconfirmed 8001 only',
+  unconf_tag:'unconfirmed',
+  unconf_expl:'This machine writes the enhanced event 4020, but none for this 8001. Whether an NTLM logon stood behind it is not settled yet: that needs every domain controller to have delivered its 4776 validations for this moment, and the account to be a domain account. Until then it is not counted in any figure.',
+  unconf_hint_ph:'{n} unconfirmed entries hidden, {p} of them shown to be phantoms by the DCs - show',
+  phantom_tag:'Phantom (checked by DC)',
+  phantom_expl:'No domain controller validated an NTLM logon for this account within two minutes of this moment - checked against {dcs}. Windows wrote the 8001 because NTLM was on the table during negotiation; Kerberos did the logon.',
   tip_events:'Events', tip_share:'Share', tip_click:'click to filter by this',
   fl_dom:'Domain level', fl_for:'Forest level', fl_raw:'level {n}',
   fl_split_t:'Agents report different values',
@@ -963,7 +986,6 @@ en: {
   b_policywarn:'Policy: breaks later', b_policyblock:'blocked by policy', b_secblock:'session security',
   eid_100:'NTLM rejected because the account is a member of Protected Users. NTLM is already off for this account today.',
   eid_101:'NTLM rejected because access control restrictions apply (authentication policy).',
-  eid_301:'NTLM succeeded but will fail once the authentication policy is enforced - an early warning like the October 2026 deadline, from a different direction.',
   eid_4010:'Blocked by minimum client session security (NtlmMinClientSec).',
   eid_4011:'Blocked by minimum server session security (NtlmMinServerSec).',
   eid_4012:'The DC-generated NTLM secret failed, so the client fell back to the domain password.',
@@ -1035,6 +1057,8 @@ en: {
   au_out_on:'Outgoing', au_out_off:'Outgoing off', au_dom_on:'Domain', au_dom_off:'Domain off',
   st_offen:'open', st_arbeit:'in progress', st_erledigt:'done', again:'active again', what:'What to do?',
   type_dc:'Domain controller', type_member:'Server/client',
+  b_dcval_ok:'4776 arriving', b_dcval_ok_t:'Delivers NTLM validations (4776) for the phantom check, latest {when}.',
+  b_dcval_none:'no 4776', b_dcval_none_t:'This DC delivers no NTLM validations (4776). While even one DC is missing, no 8001 is shown to be a phantom - update the agent to 2.2.0 or later; "Audit Credential Validation" has to be on.',
   hint_smb:'<b>File-share access over NTLM.</b> Most common cause: access by <b>IP instead of hostname</b> – Kerberos needs a name with an SPN. Switch mapped drives, shortcuts, scripts and scheduled tasks from \\\\10.x.x.x to \\\\SERVERNAME. Also check: devices outside the domain (NAS, printers, scanners) – they cannot do Kerberos against the domain.',
   hint_proc:'<b>Application uses NTLM directly.</b> Check: does the application support Kerberos / "Windows integrated authentication" (vendor docs)? Does it connect by IP instead of hostname? Does the target service account have an SPN (<b>setspn -L ACCOUNT</b>)? If none of that works: a candidate for the NTLM exception list when disabling later.',
   hint_dom:'<b>Source computer uses NTLM towards the target.</b> To narrow it down, enable the outgoing audit on the source computer (agent with <b>--enable-outgoing-audit</b>) – the originating process will then appear in the "Programs" panel there. Classics: access by IP instead of hostname, outdated clients, devices outside the domain.',
@@ -1121,8 +1145,9 @@ const DN = () => LANG === 'de' ? ['So','Mo','Di','Mi','Do','Fr','Sa']
 
 // ---- Zustand -------------------------------------------------------------
 const S = {range:'30d', mach:'', hideDone:false, q:'', kind:'', acct:'all', shown:60,
-           bucket:'', wd:'', hr:'', pick:'', rsn:''};
-           // bucket/wd/hr: drill-down from the charts, pick: from the handover bar
+           bucket:'', wd:'', hr:'', pick:'', rsn:'', unconf:''};
+           // bucket/wd/hr: drill-down from the charts, pick: from the handover bar,
+           // unconf: list only the unconfirmed 8001s (never counted anywhere)
 let DATA = null, TIMER = null;
 
 // ---- shareable state -------------------------------------------------------
@@ -1140,6 +1165,7 @@ const URL_RULES = {
   acct:   v => ['all', 'people', 'computers'].includes(v) ? v : null,
   pick:   v => ['NTLMv1', 'NTLMv2', 'kerberos'].includes(v) ? v : null,
   rsn:    v => /^k?[0-9a-fA-Fx]{1,12}$/.test(v) ? v : null,
+  unconf: v => v === '1' ? v : null,
   bucket: v => /^\d{4}-\d{2}-\d{2}(T\d{2})?$/.test(v) ? v : null,
   wd:     v => /^[0-6]$/.test(v) ? v : null,
   hr:     v => /^([0-9]|1[0-9]|2[0-3])$/.test(v) ? v : null
@@ -1149,7 +1175,7 @@ const URL_RULES = {
 // otherwise going Back to the unfiltered view would keep the old filter in S
 // while the URL claims there is none.
 const URL_DEFAULTS = {range: '30d', mach: '', q: '', kind: '', acct: 'all',
-                      pick: '', rsn: '', bucket: '', wd: '', hr: ''};
+                      pick: '', rsn: '', bucket: '', wd: '', hr: '', unconf: ''};
 
 function readUrlState(){
   let p;
@@ -1212,6 +1238,7 @@ function params(extra){
   }
   else if(S.pick === 'kerberos') p.set('kind', 'kerberos');
   else if(S.pick) p.set('version', S.pick);
+  if(S.unconf) p.set('unconf', '1');
   if(extra) for(const k in extra) if(extra[k]) p.set(k, extra[k]);
   return p;
 }
@@ -1758,6 +1785,10 @@ function secAgents(){
       if(m.incoming_audit && m.incoming_audit !== 'aus') au.push(tag('krb', t('r_in')));
       if(m.domain_audit === 'an') au.push(tag('krb', t('r_dom')));
       if(m.cg) au.push(tag('v1', t('b_cg_machine', {n: m.cg})));
+      // A DC that sends no 4776 blocks every phantom verdict - say which one.
+      if(m.is_dc) au.push(m.dcval
+        ? tag('krb', t('b_dcval_ok'), t('b_dcval_ok_t', {when: when(m.dcval_last)}))
+        : tag('v2', t('b_dcval_none'), t('b_dcval_none_t')));
       if(m.ntlm_log_kb && +m.ntlm_log_kb < 20480) au.push(tag('v2', t('b_logsize')));
       const lm = m.lm_level;
       const oct = m.cred_guard === 'on' ? tag('krb', t('oct_cg'))
@@ -1780,6 +1811,12 @@ function secEvents(){
     '<div class="bar"><input class="search" id="q" placeholder="' + esc(t('search_ph')) + '">' +
     '<div class="chipset" id="kinds"></div></div><div class="active" id="active"></div>' +
     '<div id="events"></div>', 'call');
+}
+// The phantom verdict names the DCs it was checked against, so a reader can
+// tell at once whether one is missing from the list.
+function dcText(key){
+  const dcs = (DATA && DATA.stats && DATA.stats.dcs) || [];
+  return t(key, {dcs: dcs.length ? dcs.join(', ') : '\u2013'});
 }
 function renderEvents(){
   const all = DATA.events || [];
@@ -1814,6 +1851,7 @@ function renderEvents(){
   if(S.kind) act.push(['kind', kindName(S.kind)]);
   if(S.mach) act.push(['mach', S.mach]);
   if(S.rsn) act.push(['rsn', t('rid_' + S.rsn)]);
+  if(S.unconf) act.push(['unconf', t('unconf_chip')]);
   if(S.pick) act.push(['pick', S.pick === 'kerberos' ? 'Kerberos' : S.pick]);
   if(S.bucket) act.push(['bucket', t('f_day') + ': ' + S.bucket]);
   if(S.wd !== '' || S.hr !== ''){
@@ -1821,16 +1859,29 @@ function renderEvents(){
     act.push(['when', (S.wd !== '' ? nm[+S.wd] + ' ' : '') +
                       (S.hr !== '' ? String(S.hr).padStart(2, '0') + ':00' : '')]);
   }
-  $('#active').innerHTML = act.length ? act.map(a => '<span class="afl">' + esc(a[1]) +
+  // Unconfirmed 8001s are never counted, and never mixed into this list: the
+  // hint says how many exist in the current range and offers them on their own.
+  const nUnc = (DATA.stats && DATA.stats.unconfirmed) || 0;
+  const nPh = (DATA.stats && DATA.stats.phantom) || 0;
+  const fmt = v => v.toLocaleString(LANG === 'de' ? 'de-DE' : 'en-GB');
+  const hint = (!S.unconf && nUnc > 0)
+    ? '<button class="unchint" data-unconf="1" title="' + esc(t('unconf_expl')) + '">' +
+      esc(nPh > 0 ? t('unconf_hint_ph', {n: fmt(nUnc), p: fmt(nPh)}) : t('unconf_hint', {n: fmt(nUnc)})) +
+      '</button>'
+    : '';
+  $('#active').innerHTML = (act.length ? act.map(a => '<span class="afl">' + esc(a[1]) +
     '<button data-clr="' + a[0] + '">&times;</button></span>').join('') +
-    '<button class="clearall" data-clr="all">' + esc(t('again')) + '</button>' : '';
+    '<button class="clearall" data-clr="all">' + esc(t('again')) + '</button>' : '') + hint;
   if(!list.length){ $('#events').innerHTML = emptyBox(t('empty_events'), ''); return; }
   $('#events').innerHTML = tbl([[t('th_time')], [t('th_kind')], [t('th_users')], [t('th_prog')],
       [t('th_target')], [t('th_comp')], ['ID', 'r']],
     list.slice(0, S.shown).map((e, i) => '<tr class="click" data-ev="' + i + '">' +
       '<td class="mn dm">' + when(e.event_time) + '</td>' +
       '<td>' + tag(KINDC[e.kind] || 'n', kindName(e.kind)) +
-        (e.ntlm_version ? ' ' + tag(e.ntlm_version === 'NTLMv1' ? 'v1' : 'v2', e.ntlm_version) : '') + '</td>' +
+        (e.ntlm_version ? ' ' + tag(e.ntlm_version === 'NTLMv1' ? 'v1' : 'v2', e.ntlm_version) : '') +
+        (S.unconf ? ' ' + (e.verdict === 'phantom'
+          ? tag('unc ph', t('phantom_tag'), dcText('phantom_expl'))
+          : tag('unc', t('unconf_tag'), t('unconf_expl'))) : '') + '</td>' +
       '<td>' + esc(e.user || '\u2013') + '</td>' +
       '<td class="dm">' + esc(e.process || '\u2013') + '</td>' +
       '<td class="mn dm"><span class="cut">' + esc(e.target_server || e.workstation || '\u2013') + '</span></td>' +
@@ -1872,6 +1923,9 @@ function openEvent(i){
   const fk = e.failure_code ? ('rid_k' + String(e.failure_code).toLowerCase()) : '';
   const fhint = fk && I18N[LANG][fk] ? t(fk) : '';
   $('#dbody').innerHTML =
+    (S.unconf ? (e.verdict === 'phantom'
+      ? '<div class="expl unc ph"><b>' + esc(t('phantom_tag')) + '</b>' + esc(dcText('phantom_expl')) + '</div>'
+      : '<div class="expl unc"><b>' + esc(t('unconf_tag')) + '</b>' + esc(t('unconf_expl')) + '</div>') : '') +
     (eidTxt ? '<div class="expl"><b>' + esc(t('d_eid')) + ' ' + e.event_id + '</b>' + esc(eidTxt) + '</div>' : '') +
     grp(t('d_comp'), [row(t('d_user'), e.user), row(t('d_dom'), e.domain),
       row(t('d_ws'), e.workstation), row(t('d_ip'), e.ip)]) +
@@ -1953,7 +2007,8 @@ document.addEventListener('click', function(ev){
   const clr = el.closest('[data-clr]');
   if(clr){ const k = clr.dataset.clr;
     if(k === 'all'){ S.q = ''; S.kind = ''; S.mach = ''; S.bucket = ''; S.wd = ''; S.hr = '';
-      S.pick = ''; S.rsn = ''; load(); }
+      S.pick = ''; S.rsn = ''; S.unconf = ''; load(); }
+    else if(k === 'unconf'){ S.unconf = ''; S.shown = 60; load(); }
     else if(k === 'pick'){ S.pick = ''; load(); }
     else if(k === 'rsn'){ S.rsn = ''; load(); }
     else if(k === 'mach'){ S.mach = ''; load(); }
@@ -1964,6 +2019,8 @@ document.addEventListener('click', function(ev){
   // Drill-down out of the two charts. Both are server-side filters, so the
   // whole payload is refetched - a day three weeks back is not in the event
   // list the page happens to be holding.
+  const unc = el.closest('[data-unconf]');
+  if(unc){ S.unconf = '1'; S.shown = 60; load().then(goEvents); return; }
   const rw = el.closest('[data-rsn]');
   if(rw){
     S.rsn = S.rsn === rw.dataset.rsn ? '' : rw.dataset.rsn;

@@ -88,7 +88,7 @@ CREATE TABLE IF NOT EXISTS events (
     record_id     INTEGER,
     log           TEXT,
     event_id      INTEGER,
-    kind          TEXT,            -- 'auth' (4624) | 'outgoing' (8001/8002) | 'kerberos' (4769)
+    kind          TEXT,            -- 'auth' (4624) | 'outgoing' (8001/4020) | 'incoming' (8002/8003/4022) | 'domain' (8004/4032) | 'kerberos' (4769)
     event_time    TEXT,
     user          TEXT,
     domain        TEXT,
@@ -127,6 +127,25 @@ CREATE TABLE IF NOT EXISTS agents (
     forest_level    TEXT,          -- msDS-Behavior-Version der Gesamtstruktur
     last_seen       TEXT
 );
+
+-- 4776 from the domain controllers: reference data only, never an event of its
+-- own and never counted. One row per NTLM validation of a domain account. The
+-- collector checks unconfirmed 8001s against it (see PHANTOM). user_key and
+-- workstation are stored upper-cased and without domain part, so the lookup is
+-- a plain index match.
+CREATE TABLE IF NOT EXISTS dc_validations (
+    dc          TEXT NOT NULL,
+    record_id   INTEGER,
+    event_time  TEXT NOT NULL,
+    user_key    TEXT,
+    workstation TEXT,
+    status      TEXT,
+    received_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_dcval ON dc_validations(dc, record_id);
+CREATE INDEX IF NOT EXISTS ix_dcval_user ON dc_validations(user_key, event_time);
+CREATE INDEX IF NOT EXISTS ix_dcval_ws ON dc_validations(workstation, user_key, event_time);
+CREATE INDEX IF NOT EXISTS ix_dcval_dc ON dc_validations(dc, event_time);
 """
 
 # Kerberos-Fehlercodes aus fehlgeschlagenen 4769-Anfragen: auf Systemen ohne
@@ -159,6 +178,47 @@ REASON_IDS = {
 }
 
 
+# The reason text decides the category, not the number. Observed on a real
+# Windows Server 2025 host: two 4020 events both carried Reason ID 10 - which
+# KB5064479 defines as loopback - one with the text "The target name contains an
+# IP address" (the target was indeed an IP) and one with "could not be resolved
+# by Kerberos" (the target was indeed a DNS alias without an SPN). A Windows 11
+# client wrote the same IP case correctly as ID 7. Grouping by the number filed
+# both under loopback and recommended the wrong fix. Keywords, not full
+# sentences, so a German-localised event text is recognised too. Order matters:
+# the IP check runs before "could not be resolved". No match -> the number
+# stands, since a text we do not recognise is no evidence against it.
+REASON_TEXT_KEYS = (
+    ("7",  ("ip address", "ip-adresse")),
+    ("6",  ("could not be resolved", "nicht aufgel", "nicht aufl")),
+    ("8",  ("duplicated", "doppelt", "dupliziert")),
+    ("5",  ("missing or empty", "fehlte oder", "fehlt oder")),
+    ("10", ("loopback",)),
+    ("11", ("null session", "null-session", "nullsitzung")),
+    ("9",  ("line of sight", "sichtverbindung")),
+    ("4",  ("cloud account", "cloud-konto", "cloudkonto")),
+    ("2",  ("local account", "lokalem konto", "lokales konto", "lokalen konto")),
+    ("1",  ("called directly", "directly by the calling", "direkt auf", "direkt aufgerufen")),
+    ("0",  ("unknown reason", "unbekannter grund")),
+)
+
+
+def canonical_reason_id(reason, rid):
+    """Reason ID as the text says it is, falling back to the number sent.
+
+    Only corrects an ID that is there. Events without one (4769 Kerberos
+    failures carry a reason text but no Usage ID) must not have one invented
+    for them, or they would appear in the reasons panel as a 4020 cause."""
+    if rid is None or str(rid).strip() == "":
+        return rid
+    if reason:
+        low = str(reason).lower()
+        for key, words in REASON_TEXT_KEYS:
+            if any(w in low for w in words):
+                return key
+    return rid
+
+
 def normalize_process(p):
     """Vereinheitlicht Prozessnamen fuers Gruppieren: verschiedene Event-Quellen
     liefern denselben Prozess mal mit, mal ohne Endung ("lsass" aus 8001,
@@ -182,6 +242,103 @@ FIELDS = ("record_id", "log", "event_id", "kind", "event_time", "user",
           "workstation", "ip", "logon_type", "enc_type", "auth_method",
           "reason", "reason_id", "mic", "epa", "server_os", "failure_code",
           "process_path")
+
+
+# Outgoing NTLM is logged twice on Windows 11 24H2 / Server 2025 when the
+# classic audit is also on: 8001 (classic) and 4020 (enhanced). Verified on a
+# real machine: a net use against an IP wrote 8001 + 4020 in the same second,
+# plus a second 8001 from the other token of the elevated session - same target,
+# no 4020 of its own. 4020 carries everything 8001 has and more (reason,
+# version, MIC, channel binding, resolved target), so such an 8001 is left out
+# of every count and list. Raw rows stay in the database.
+#
+# Matched per event, not per machine. The same machine also wrote an 8001 from
+# lsass.exe to an LDAP SPN with no 4020 at all - a first version of this rule
+# hid every 8001 on any machine that writes 4020 and would have swallowed that
+# one. Now an 8001 only disappears if a 4020/4021 from the same machine names
+# the same target within 10 seconds; anything without a partner stays visible.
+# The prefix match covers 8001 appending the realm ("ldap/dc/dom@REALM") where
+# the enhanced event may carry the short form ("ldap/dc").
+NOT_SUPERSEDED = (
+    "NOT (event_id = 8001 AND target_server IS NOT NULL AND EXISTS ("
+    "SELECT 1 FROM events f WHERE f.event_id IN (4020, 4021) "
+    "AND f.source = events.source "
+    "AND f.event_time BETWEEN strftime('%Y-%m-%dT%H:%M:%S', events.event_time, '-10 seconds') "
+    "AND strftime('%Y-%m-%dT%H:%M:%S', events.event_time, '+10 seconds') "
+    "AND f.target_server IS NOT NULL "
+    "AND (LOWER(f.target_server) = LOWER(events.target_server) "
+    "OR LOWER(events.target_server) LIKE LOWER(f.target_server) || '/%' "
+    "OR LOWER(events.target_server) LIKE LOWER(f.target_server) || '@%')))")
+
+
+# An 8001 with no 4020 partner, on a machine that does write 4020 around that
+# time. Checked against the domain controllers on a real network: two such
+# 8001 events for one user had no 4776 (NTLM credential validation) on any of
+# three DCs whose Security logs reached back days before - while 4776 was being
+# logged there at 20+ per hour. So no NTLM logon happened; the 8001 was written
+# while NTLM was on the table during negotiation, and Kerberos did the logon.
+# These are not hidden: they are left out of every count and panel, and the
+# event list offers them behind an explicit, labelled filter. Two events from
+# one user is a small sample, which is exactly why they stay one click away.
+UNCONFIRMED_RAW = (
+    "(event_id = 8001 AND EXISTS (SELECT 1 FROM events g "
+    "WHERE g.event_id IN (4020, 4021) AND g.source = events.source "
+    "AND g.event_time BETWEEN strftime('%Y-%m-%dT%H:%M:%S', events.event_time, '-1 day') "
+    "AND strftime('%Y-%m-%dT%H:%M:%S', events.event_time, '+1 day')))")
+
+# ---- Settling them against the DCs' own record ------------------------------
+# Every NTLM validation of a domain account is logged by a DC as 4776, with the
+# account and the client's NetBIOS name (the same name the agent reports as
+# source). So for each unconfirmed 8001:
+#   * a 4776 for the same account from the same machine within two minutes
+#     -> it was real NTLM after all: it leaves UNCONFIRMED and is counted;
+#   * no 4776 for that account from any machine in that window, while every DC
+#     agent demonstrably covered that moment -> PHANTOM, backed by evidence;
+#   * anything in between (same account from another machine, a DC not yet
+#     covering the moment, a local account no DC ever sees) stays unconfirmed.
+# "Any machine" rather than "that machine" for the phantom verdict on purpose: a
+# Citrix host has other users' 4776s every minute, and one that happened to be
+# normalised differently must not turn a real logon into a phantom.
+_T_LO = "strftime('%Y-%m-%dT%H:%M:%S', events.event_time, '-120 seconds')"
+_T_HI = "strftime('%Y-%m-%dT%H:%M:%S', events.event_time, '+120 seconds')"
+_UKEY = ("UPPER(CASE WHEN instr(events.user, '@') > 0 "
+         "THEN substr(events.user, 1, instr(events.user, '@') - 1) "
+         "WHEN instr(events.user, '\\') > 0 "
+         "THEN substr(events.user, instr(events.user, '\\') + 1) "
+         "ELSE events.user END)")
+DCV_EXACT = ("EXISTS (SELECT 1 FROM dc_validations v WHERE v.workstation = UPPER(events.source) "
+             f"AND v.user_key = {_UKEY} AND v.event_time BETWEEN {_T_LO} AND {_T_HI})")
+DCV_USER = ("EXISTS (SELECT 1 FROM dc_validations v WHERE "
+            f"v.user_key = {_UKEY} AND v.event_time BETWEEN {_T_LO} AND {_T_HI})")
+# Every DC agent must have reported at least 30 minutes after the moment - a
+# full later run, so the run that read that moment has finished sending - and
+# must have 4776 data from before it. One DC short and nothing is concluded.
+DC_COVERED = (
+    "(EXISTS (SELECT 1 FROM agents WHERE is_dc = 1) AND NOT EXISTS ("
+    "SELECT 1 FROM agents a WHERE a.is_dc = 1 AND NOT ("
+    "a.last_seen >= strftime('%Y-%m-%dT%H:%M:%S', events.event_time, '+30 minutes') "
+    "AND EXISTS (SELECT 1 FROM dc_validations w WHERE w.dc = a.source "
+    "AND w.event_time <= strftime('%Y-%m-%dT%H:%M:%S', events.event_time, '-5 minutes')))))")
+# Only domain accounts are validated by a DC. A local account shows the machine
+# itself as its domain and would look like a phantom forever.
+JUDGEABLE = (
+    "(events.user IS NOT NULL AND TRIM(events.user) != '' "
+    "AND events.domain IS NOT NULL AND TRIM(events.domain) != '' "
+    "AND UPPER(events.domain) != UPPER(events.source) "
+    "AND UPPER(events.domain) NOT IN ('NT AUTHORITY', 'WORKGROUP', '.', '(NULL)', '-'))")
+
+UNCONFIRMED = f"({UNCONFIRMED_RAW} AND NOT {DCV_EXACT})"
+PHANTOM = f"({UNCONFIRMED} AND {JUDGEABLE} AND {DC_COVERED} AND NOT {DCV_USER})"
+
+
+def user_key(u):
+    """Same normalisation as _UKEY, for the 4776 side at ingest."""
+    u = (u or "").strip()
+    if "@" in u:
+        u = u.split("@", 1)[0]
+    elif "\\" in u:
+        u = u.split("\\", 1)[1]
+    return u.upper() or None
 
 
 def init_db(path):
@@ -211,6 +368,10 @@ def init_db(path):
                 "server_os", "failure_code", "process_path"):
         if col not in have:
             conn.execute(f"ALTER TABLE events ADD COLUMN {col} TEXT")
+    # Stored 4022/4023 from older agents: same correction as at ingest. A no-op
+    # once done - the WHERE finds nothing on the next start.
+    conn.execute("UPDATE events SET kind = 'incoming' "
+                 "WHERE event_id IN (4022, 4023) AND kind != 'incoming'")
     # Indexes for the dashboard queries (time-range filter, aggregates).
     # IF NOT EXISTS -> also runs cleanly against existing databases at startup.
     conn.executescript("""
@@ -226,6 +387,17 @@ def init_db(path):
         updated_at TEXT NOT NULL
     );
     """)
+    conn.execute("DROP TABLE IF EXISTS enhanced_since")   # helper of a short-lived earlier rule
+    # Stored reasons: same correction as at ingest. Walks the distinct
+    # (text, id) pairs only - a handful of rows, not every event.
+    for reason, rid in conn.execute(
+            "SELECT DISTINCT reason, reason_id FROM events "
+            "WHERE reason IS NOT NULL AND reason != '' "
+            "AND reason_id IS NOT NULL AND reason_id != ''").fetchall():
+        fixed = canonical_reason_id(reason, rid)
+        if fixed is not None and str(fixed) != str(rid):
+            conn.execute("UPDATE events SET reason_id = ? WHERE reason = ? AND "
+                         "(reason_id IS ? OR reason_id = ?)", (str(fixed), reason, rid, rid))
     conn.commit()
     return conn
 
@@ -551,10 +723,29 @@ class Handler(BaseHTTPRequestHandler):
             return json.dumps(v, ensure_ascii=False)[:500]
 
         rows = []
+        dcv = []
         for e in events:
             if not isinstance(e, dict):
                 continue                     # skip garbage entries, keep the rest
             e = {k: scalar(v) for k, v in e.items()}
+            # 4776 from a DC is reference data for settling unconfirmed 8001s,
+            # not an event: it goes to its own table and is never counted.
+            if e.get("event_id") in (4776, "4776"):
+                if e.get("event_time") and e.get("user"):
+                    ws = (e.get("workstation") or "").strip().lstrip("\\").upper() or None
+                    dcv.append((source, e.get("record_id"), e.get("event_time"),
+                                user_key(e.get("user")), ws, e.get("failure_code"), now))
+                continue
+            # 4022/4023 are written on the server being accessed, not on the DC:
+            # they belong with 8002/8003 as incoming NTLM. Agents up to 2.1.1
+            # sent them as "domain", which put member-server logons into the
+            # domain-controller panel and counted a domain logon twice there
+            # (once from the server's 4022, once from the DC's 8004/4032).
+            # Normalised here so already-deployed agents are right immediately.
+            if e.get("event_id") in (4022, 4023, "4022", "4023"):
+                e["kind"] = "incoming"
+            if e.get("reason_id") not in (None, ""):
+                e["reason_id"] = str(canonical_reason_id(e.get("reason"), e.get("reason_id")))
             rows.append((
                 source,
                 e.get("record_id"),
@@ -581,15 +772,22 @@ class Handler(BaseHTTPRequestHandler):
                 e.get("process_path"),
                 now,
             ))
-        if not rows:
+        if not rows and not dcv:
             return 0
         cols = "source," + ",".join(FIELDS) + ",received_at"
         placeholders = ",".join(["?"] * (len(FIELDS) + 2))
         sql = f"INSERT OR IGNORE INTO events ({cols}) VALUES ({placeholders})"
         with DB_LOCK:
-            cur = self.server.conn.executemany(sql, rows)
+            n = 0
+            if rows:
+                n += self.server.conn.executemany(sql, rows).rowcount
+            if dcv:
+                n += self.server.conn.executemany(
+                    "INSERT OR IGNORE INTO dc_validations (dc, record_id, event_time, "
+                    "user_key, workstation, status, received_at) VALUES (?,?,?,?,?,?,?)",
+                    dcv).rowcount
             self.server.conn.commit()
-            return cur.rowcount
+            return n
 
     @staticmethod
     def _event_filters(qs):
@@ -607,7 +805,11 @@ class Handler(BaseHTTPRequestHandler):
         if rng in deltas:
             cutoff = (utc_now() - deltas[rng]).strftime("%Y-%m-%dT%H:%M:%S")
 
-        where, params = [], []
+        # Unconfirmed 8001 are either the whole list (explicit filter) or not in
+        # it at all - never mixed in, or a drill-down would list more rows than
+        # the panel row it came from counts.
+        where, params = [NOT_SUPERSEDED], []
+        where.append(UNCONFIRMED if one("unconf") == "1" else "NOT " + UNCONFIRMED)
         if cutoff:
             where.append("event_time >= ?"); params.append(cutoff)
         if one("kind"):
@@ -728,17 +930,45 @@ class Handler(BaseHTTPRequestHandler):
         tzoff = max(-840, min(840, tzoff))          # -14h .. +14h
         tzmod = f"{tzoff:+d} minutes"               # built from an int, never from input
 
-        tf_parts, tp = [], []
+        base_parts, tp = [], []
         if cutoff:
-            tf_parts.append("event_time >= ?"); tp.append(cutoff)
+            base_parts.append("event_time >= ?"); tp.append(cutoff)
         src = one("source")
         if src:
-            tf_parts.append("source = ?"); tp.append(src)
-        tf = " AND ".join(tf_parts) if tf_parts else "1=1"
+            base_parts.append("source = ?"); tp.append(src)
+        # 8001 classification is evaluated ONCE per request into temp.x_cls
+        # (1 = duplicate of a 4020, 2 = unconfirmed, 3 = phantom settled by the
+        # DCs), and every query below only looks it up. Written inline into the
+        # shared filter, the correlated subqueries ran again in each of ~30
+        # queries: 6 s for a month of a busy domain before the DC check, 9 s
+        # with it. Once, it is a fraction of that.
+        base_where = " AND ".join(base_parts) if base_parts else "1=1"
+        cls_sql = (
+            "INSERT INTO x_cls (id, cls) SELECT id, CASE "
+            f"WHEN NOT ({NOT_SUPERSEDED}) THEN 1 "
+            f"WHEN {JUDGEABLE} AND {DC_COVERED} AND NOT {DCV_USER} THEN 3 "
+            "ELSE 2 END FROM events "
+            f"WHERE event_id = 8001 AND {base_where} "
+            f"AND (NOT ({NOT_SUPERSEDED}) OR {UNCONFIRMED})")
+        # Every aggregate leaves out both duplicate and unconfirmed 8001s.
+        tf = " AND ".join(["id NOT IN (SELECT id FROM temp.x_cls)"] + base_parts)
+        # Same range and machine, only the unconfirmed ones / only the phantoms -
+        # for the hint above the event list.
+        tf_unconf = " AND ".join(["id IN (SELECT id FROM temp.x_cls WHERE cls >= 2)"] + base_parts)
+        tf_phantom = " AND ".join(["id IN (SELECT id FROM temp.x_cls WHERE cls = 3)"] + base_parts)
+        # The event list filter (shared with the CSV export, where it stays in its
+        # expanded form) uses the same lookup here.
+        lookup = {NOT_SUPERSEDED: "id NOT IN (SELECT id FROM temp.x_cls WHERE cls = 1)",
+                  UNCONFIRMED: "id IN (SELECT id FROM temp.x_cls WHERE cls >= 2)",
+                  "NOT " + UNCONFIRMED: "id NOT IN (SELECT id FROM temp.x_cls WHERE cls >= 2)"}
+        where = [lookup.get(w, w) for w in where]
         clause = (" WHERE " + " AND ".join(where)) if where else ""
 
         with DB_LOCK:
             c = self.server.conn
+            c.execute("CREATE TEMP TABLE IF NOT EXISTS x_cls (id INTEGER PRIMARY KEY, cls INTEGER)")
+            c.execute("DELETE FROM temp.x_cls")
+            c.execute(cls_sql, tp)
             # Work status (open/in progress/done) for blocker and domain rows
             st_map = {r[0]: (r[1], r[2]) for r in
                       c.execute("SELECT key, status, updated_at FROM item_status").fetchall()}
@@ -752,6 +982,11 @@ class Handler(BaseHTTPRequestHandler):
                 "v1":     c.execute(f"SELECT COUNT(*) FROM events WHERE ntlm_version='NTLMv1' AND {tf}", tp).fetchone()[0],
                 "v2":     c.execute(f"SELECT COUNT(*) FROM events WHERE ntlm_version='NTLMv2' AND {tf}", tp).fetchone()[0],
                 "outbound": c.execute(f"SELECT COUNT(*) FROM events WHERE event_id IN (8001,4001,4020,4021,4013) AND {tf}", tp).fetchone()[0],
+                "unconfirmed": c.execute(f"SELECT COUNT(*) FROM events WHERE {tf_unconf}", tp).fetchone()[0],
+                "phantom": c.execute(f"SELECT COUNT(*) FROM events WHERE {tf_phantom}", tp).fetchone()[0],
+                # Which DCs the phantom verdict was checked against - shown with it.
+                "dcs": [r[0] for r in c.execute(
+                    "SELECT source FROM agents WHERE is_dc = 1 ORDER BY source").fetchall()],
                 "sources": c.execute(f"SELECT COUNT(DISTINCT source) FROM events WHERE {tf}", tp).fetchone()[0],
                 "procs":   c.execute(f"SELECT COUNT(DISTINCT process) FROM events "
                                      f"WHERE process IS NOT NULL AND process NOT LIKE '(%' AND {tf}", tp).fetchone()[0],
@@ -880,7 +1115,7 @@ class Handler(BaseHTTPRequestHandler):
                 f"SELECT COUNT(*) FROM events WHERE {tf} AND "
                 f"(mic IS NOT NULL OR epa IS NOT NULL)", tp).fetchone()[0]
 
-            # Incoming NTLM (8002/8003): which local service accepts NTLM, and
+            # Incoming NTLM (8002/8003, and 4022/4023 on Server 2025): which local service accepts NTLM, and
             # which remote accounts come in. 8002 carries the calling process,
             # 8003 the remote account - grouped per machine + process.
             incoming = [with_status("inc", r[0], r[1],
@@ -900,7 +1135,8 @@ class Handler(BaseHTTPRequestHandler):
                 f"MAX(CASE WHEN event_id=4025 THEN 1 ELSE 0 END) "
                 f"FROM events WHERE kind='ntlmv1sso' AND {tf} "
                 f"GROUP BY user, target_server ORDER BY COUNT(*) DESC LIMIT 50", tp).fetchall()]
-            # NTLM inside the domain (8004, from the DC): most reliable source->target view
+            # NTLM inside the domain (8004 and 4030-4033, from the DC only): most reliable
+            # source->target view. 4022/4023 are deliberately not here - see ingest.
             domain = [with_status("dom", r[0], r[1],
                            dict(workstation=r[0], target=r[1], users=r[2],
                            n=r[3], blocked=r[4], last_seen=r[5], who=r[6])) for r in c.execute(
@@ -908,7 +1144,7 @@ class Handler(BaseHTTPRequestHandler):
                 f"COUNT(DISTINCT user), COUNT(*), "
                 f"SUM(CASE WHEN event_id IN (4004,4005,4006) THEN 1 ELSE 0 END), "
                 f"MAX(event_time), GROUP_CONCAT(DISTINCT user) "
-                f"FROM events WHERE event_id IN (8004,8005,8006,4004,4005,4006,4022,4023,4030,4031,4032,4033) AND {tf} "
+                f"FROM events WHERE event_id IN (8004,8005,8006,4004,4005,4006,4030,4031,4032,4033) AND {tf} "
                 f"GROUP BY workstation, target_server ORDER BY COUNT(*) DESC LIMIT 50", tp).fetchall()]
             # Kerberos (informational): which services/SPNs already use Kerberos
             kerberos = [dict(service=r[0], accounts=r[1], n=r[2],
@@ -938,6 +1174,7 @@ class Handler(BaseHTTPRequestHandler):
                            restrict_out=r[15], restrict_in=r[16],
                            restrict_dom=r[17], exc_client=r[18],
                            exc_dc=r[19], domain_level=r[20], forest_level=r[21],
+                           dcval=r[22] or 0, dcval_last=r[23],
                            cg=cg_by_src.get(r[0], 0)) for r in c.execute(
                 "SELECT a.source, a.is_dc, a.agent_version, a.outgoing_audit, a.incoming_audit, "
                 "a.domain_audit, a.last_seen, "
@@ -947,7 +1184,11 @@ class Handler(BaseHTTPRequestHandler):
                 "(SELECT MIN(event_time) FROM events e WHERE e.source=a.source), "
                 "a.block_v1sso, a.cred_guard, a.ntlm_log_kb, a.os_version, "
                 "a.restrict_out, a.restrict_in, a.restrict_dom, a.exc_client, a.exc_dc, "
-                "a.domain_level, a.forest_level "
+                "a.domain_level, a.forest_level, "
+                # Per DC: does it deliver 4776? One DC without them blocks every
+                # phantom verdict, so the machines panel has to say which one.
+                "(SELECT COUNT(*) FROM dc_validations v WHERE v.dc = a.source), "
+                "(SELECT MAX(event_time) FROM dc_validations v WHERE v.dc = a.source) "
                 "FROM agents a ORDER BY a.last_seen DESC").fetchall()]
 
             # Datenbasis: seit wann liegen ueberhaupt Events vor? Zwei Wochen im
@@ -964,8 +1205,13 @@ class Handler(BaseHTTPRequestHandler):
             stats["coverage_days"] = coverage_days
             stats["coverage_target"] = 14
             cols2 = ["source"] + list(FIELDS)
+            sel = ",".join(cols2)
+            if one("unconf") == "1":
+                # Per row: settled as phantom, or still open.
+                cols2 = cols2 + ["verdict"]
+                sel += ", CASE WHEN id IN (SELECT id FROM temp.x_cls WHERE cls = 3) THEN 'phantom' ELSE '' END"
             rows = c.execute(
-                f"SELECT {','.join(cols2)} FROM events{clause} "
+                f"SELECT {sel} FROM events{clause} "
                 f"ORDER BY event_time DESC, id DESC LIMIT ?",
                 params + [limit]).fetchall()
             events = [dict(zip(cols2, r)) for r in rows]
@@ -1015,7 +1261,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   --disp:'Segoe UI Variable Display','Segoe UI',system-ui,-apple-system,sans-serif;
   --text:'Segoe UI Variable Text','Segoe UI',system-ui,-apple-system,sans-serif;
   --mono:'Cascadia Mono','IBM Plex Mono',ui-monospace,Consolas,'SF Mono',monospace;
-  --r:14px; --pad:clamp(20px,2.8vw,52px);
+  --r:6px; --pad:clamp(20px,2.8vw,52px);   /* crisper panel corners, closer to the reference's hairline-bordered look */
 }
 *{box-sizing:border-box}
 html{scroll-behavior:smooth}
@@ -1028,9 +1274,9 @@ body{margin:0;background:var(--void);color:var(--ink);font-family:var(--text);fo
   line-height:1.5;-webkit-font-smoothing:antialiased}
 body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:0;
   background:radial-gradient(1200px 600px at 10% -8%,rgba(255,107,107,.05),transparent 62%),
-             radial-gradient(1200px 700px at 90% 108%,rgba(61,220,151,.042),transparent 62%)}
+             radial-gradient(1200px 700px at 90% 108%,rgba(217,184,74,.042),transparent 62%)}
 .stage{position:relative;z-index:1}
-::selection{background:rgba(61,220,151,.25)}
+::selection{background:rgba(217,184,74,.30)}
 :focus-visible{outline:2px solid var(--gold);outline-offset:2px;border-radius:6px}
 button{font:inherit}
 a{color:inherit}
@@ -1209,7 +1455,7 @@ select option:checked,.sel-st option:checked{background:#26314a;color:#fff}
 .flag.ok{color:var(--krb);border-color:rgba(61,220,151,.3);background:rgba(61,220,151,.06)}
 .mini{background:rgba(255,255,255,.04);border:1px solid var(--edge);color:var(--dim);border-radius:7px;
   padding:3px 9px;font-family:var(--mono);font-size:12px;cursor:pointer;transition:.16s}
-.mini:hover{color:var(--ink);border-color:var(--krb)}
+.mini:hover{color:var(--ink);border-color:var(--gold)}
 
 table{width:100%;border-collapse:collapse}
 .tw{overflow-x:auto}
@@ -1233,7 +1479,7 @@ tbody tr{transition:background .16s}
 tbody tr:nth-child(even){background:rgba(158,180,225,.028)}
 tbody tr.click{cursor:pointer}
 tbody tr.click:hover{background:rgba(148,170,220,.06)}
-tbody tr.on{background:rgba(61,220,151,.10);box-shadow:inset 3px 0 0 var(--krb)}
+tbody tr.on{background:rgba(217,184,74,.10);box-shadow:inset 3px 0 0 var(--gold)}
 .r{text-align:right;font-family:var(--mono);font-variant-numeric:tabular-nums}
 .mn{font-family:var(--mono);font-size:15px}
 /* Table cells marked .dm carry real content - target servers, accounts,
@@ -1269,11 +1515,19 @@ tbody tr.on{background:rgba(61,220,151,.10);box-shadow:inset 3px 0 0 var(--krb)}
 .chip:hover{color:var(--ink);border-color:var(--edge2)}
 .chip[aria-pressed=true]{background:rgba(255,255,255,.09);color:var(--ink);border-color:var(--edge2)}
 .active{display:flex;gap:6px;flex-wrap:wrap;padding:0 17px 11px}
-.afl{display:inline-flex;align-items:center;gap:7px;background:rgba(61,220,151,.09);
-  border:1px solid rgba(61,220,151,.28);color:#9ff0cb;border-radius:8px;padding:4px 8px;
+.afl{display:inline-flex;align-items:center;gap:7px;background:rgba(217,184,74,.12);
+  border:1px solid rgba(217,184,74,.32);color:#ffe9a8;border-radius:8px;padding:4px 8px;
   font-family:var(--mono);font-size:12px}
 .afl button{background:none;border:0;color:inherit;cursor:pointer;opacity:.7;padding:0 0 0 2px;font-size:15px}
 .afl button:hover{opacity:1}
+/* Unconfirmed 8001s: dashed and muted on purpose - they are shown, not
+   asserted, and must not read like the solid NTLM tags next to them. */
+.tag.unc{border-style:dashed;color:var(--dim);background:transparent}
+.tag.unc.ph{color:var(--krb);border-color:rgba(61,220,151,.35)}
+.expl.unc{border-style:dashed}
+.unchint{background:none;border:1px dashed var(--edge2);color:var(--dim);font-family:var(--mono);
+  font-size:12px;border-radius:7px;padding:5px 10px;cursor:pointer;margin-left:6px}
+.unchint:hover{color:var(--ink);border-color:var(--gold)}
 .clearall{background:none;border:0;color:var(--faint);font-family:var(--mono);font-size:12px;
   cursor:pointer;text-decoration:underline;text-underline-offset:3px}
 .clearall:hover{color:var(--ink)}
@@ -1319,11 +1573,11 @@ tbody tr.on{background:rgba(61,220,151,.10);box-shadow:inset 3px 0 0 var(--krb)}
 .hc.in{transform:scale(1);opacity:1}
 .hc{cursor:pointer}
 .hc:hover{outline:1px solid var(--ink);outline-offset:1px}
-.hc.on{outline:2px solid var(--krb);outline-offset:1px}
+.hc.on{outline:2px solid var(--gold);outline-offset:1px}
 .bcol{cursor:pointer}
 .bcol:hover span{filter:brightness(1.25)}
 .bcol.on span{filter:brightness(1.5)}
-.bcol.on{outline:1px solid var(--krb);outline-offset:1px;border-radius:2px}
+.bcol.on{outline:1px solid var(--gold);outline-offset:1px;border-radius:2px}
 .hnote{font-family:var(--mono);font-size:14px;color:var(--dim);margin-top:11px;padding-top:10px;
   border-top:1px solid var(--edge)}
 .hnote b{color:var(--v2);font-weight:500}
@@ -1358,7 +1612,7 @@ tbody tr.on{background:rgba(61,220,151,.10);box-shadow:inset 3px 0 0 var(--krb)}
 .dact{display:flex;gap:8px;flex-wrap:wrap;margin:19px 22px 0}
 .dact button{flex:1 1 auto;background:rgba(255,255,255,.04);border:1px solid var(--edge);color:var(--dim);
   border-radius:9px;padding:10px 14px;font-family:var(--mono);font-size:14px;cursor:pointer;transition:.18s}
-.dact button:hover{color:var(--ink);border-color:var(--krb);background:rgba(61,220,151,.07)}
+.dact button:hover{color:var(--ink);border-color:var(--gold);background:rgba(217,184,74,.09)}
 .code{margin:15px 22px;background:#0c1119;border:1px solid var(--edge);border-radius:10px;padding:13px 15px;
   font-family:var(--mono);font-size:15px;color:var(--dim);white-space:pre-wrap;word-break:break-all;
   max-height:360px;overflow-y:auto}
@@ -1486,6 +1740,13 @@ de: {
   drill_hint:'klicken, um die Ereignisse zu sehen', f_day:'Tag',
   osbar_lbl:'Agenten nach Betriebssystem', osbar_other:'weitere', osbar_unknown:'unbekannt',
   ev_capped:'die neuesten {n} geladen',
+  unconf_hint:'{n} unbestätigte Einträge ausgeblendet – anzeigen',
+  unconf_chip:'Nur unbestätigte 8001',
+  unconf_tag:'unbestätigt',
+  unconf_expl:'Diese Maschine schreibt das erweiterte Ereignis 4020, zu diesem 8001 aber keins. Ob dahinter eine NTLM-Anmeldung stand, ist noch nicht geklärt: Dafür müssen alle Domänencontroller für diesen Zeitpunkt ihre 4776-Prüfungen geliefert haben, und das Konto muss ein Domänenkonto sein. Bis dahin zählt der Eintrag in keiner Kennzahl mit.',
+  unconf_hint_ph:'{n} unbestätigte Einträge ausgeblendet, davon {p} vom DC als Phantom belegt – anzeigen',
+  phantom_tag:'Phantom (DC-geprüft)',
+  phantom_expl:'Kein Domänencontroller hat in den zwei Minuten um diesen Zeitpunkt eine NTLM-Anmeldung dieses Kontos geprüft – geprüft gegen {dcs}. Windows hat das 8001 geschrieben, weil NTLM beim Aushandeln in Frage kam; angemeldet hat Kerberos.',
   tip_events:'Ereignisse', tip_share:'Anteil', tip_click:'klicken, um danach zu filtern',
   fl_dom:'Domänenebene', fl_for:'Gesamtstruktur', fl_raw:'Ebene {n}',
   fl_split_t:'Die Agenten melden unterschiedliche Werte',
@@ -1587,7 +1848,6 @@ de: {
   b_policywarn:'Richtlinie: bricht später', b_policyblock:'von Richtlinie blockiert', b_secblock:'Sitzungssicherheit',
   eid_100:'NTLM abgelehnt, weil das Konto in der Gruppe „Geschützte Benutzer" ist. Für dieses Konto ist NTLM bereits heute gesperrt.',
   eid_101:'NTLM abgelehnt, weil Zugriffssteuerungs-Einschränkungen greifen (Authentifizierungsrichtlinie).',
-  eid_301:'NTLM hat funktioniert, wird aber scheitern, sobald die Authentifizierungsrichtlinie erzwungen wird – eine Vorwarnung wie die Oktober-2026-Frist, nur aus anderer Richtung.',
   eid_4010:'Blockiert durch minimale Client-Sitzungssicherheit (NtlmMinClientSec).',
   eid_4011:'Blockiert durch minimale Server-Sitzungssicherheit (NtlmMinServerSec).',
   eid_4012:'Das DC-generierte NTLM-Geheimnis schlug fehl, der Client fiel auf das Domänenkennwort zurück.',
@@ -1659,6 +1919,8 @@ de: {
   au_out_on:'Ausgehend', au_out_off:'Ausgehend aus', au_dom_on:'Domäne', au_dom_off:'Domäne aus',
   st_offen:'offen', st_arbeit:'in Arbeit', st_erledigt:'erledigt', again:'wieder aktiv', what:'Was tun?',
   type_dc:'Domänencontroller', type_member:'Server/Client',
+  b_dcval_ok:'4776 kommt an', b_dcval_ok_t:'Liefert NTLM-Prüfungen (4776) für den Phantom-Abgleich, zuletzt {when}.',
+  b_dcval_none:'keine 4776', b_dcval_none_t:'Dieser DC liefert keine NTLM-Prüfungen (4776). Solange auch nur ein DC fehlt, wird kein 8001 als Phantom belegt – den Agent auf Version 2.2.0 oder neuer aktualisieren; „Anmeldeinformationen überprüfen" muss im Audit aktiv sein.',
   hint_smb:'<b>Dateifreigabe-Zugriff über NTLM.</b> Häufigste Ursache: Zugriff per <b>IP statt Hostname</b> – Kerberos braucht einen Namen mit SPN. Netzlaufwerke, Verknüpfungen, Skripte und geplante Tasks von \\\\10.x.x.x auf \\\\SERVERNAME umstellen. Ebenfalls prüfen: Geräte außerhalb der Domäne (NAS, Drucker, Scanner) – die können kein Kerberos zur Domäne.',
   hint_proc:'<b>Programm nutzt NTLM direkt.</b> Prüfen: Unterstützt die Anwendung Kerberos bzw. „Windows-integrierte Anmeldung" (Hersteller-Doku)? Verbindet sie per IP statt Hostname? Hat das Dienstkonto des Ziels einen SPN (<b>setspn -L KONTO</b>)? Wenn nichts davon geht: Kandidat für die NTLM-Ausnahmeliste beim späteren Abschalten.',
   hint_dom:'<b>Quellcomputer nutzt NTLM zum Ziel.</b> Zum Eingrenzen auf dem Quellcomputer das ausgehende Audit aktivieren (Agent mit <b>--enable-outgoing-audit</b>) – dann erscheint dort der auslösende Prozess im Panel „Programme". Klassiker: Zugriff per IP statt Hostname, veraltete Clients, Geräte außerhalb der Domäne.',
@@ -1710,6 +1972,13 @@ en: {
   drill_hint:'click to see the events', f_day:'Day',
   osbar_lbl:'Agents by OS', osbar_other:'others', osbar_unknown:'unknown',
   ev_capped:'newest {n} loaded',
+  unconf_hint:'{n} unconfirmed entries hidden - show',
+  unconf_chip:'Unconfirmed 8001 only',
+  unconf_tag:'unconfirmed',
+  unconf_expl:'This machine writes the enhanced event 4020, but none for this 8001. Whether an NTLM logon stood behind it is not settled yet: that needs every domain controller to have delivered its 4776 validations for this moment, and the account to be a domain account. Until then it is not counted in any figure.',
+  unconf_hint_ph:'{n} unconfirmed entries hidden, {p} of them shown to be phantoms by the DCs - show',
+  phantom_tag:'Phantom (checked by DC)',
+  phantom_expl:'No domain controller validated an NTLM logon for this account within two minutes of this moment - checked against {dcs}. Windows wrote the 8001 because NTLM was on the table during negotiation; Kerberos did the logon.',
   tip_events:'Events', tip_share:'Share', tip_click:'click to filter by this',
   fl_dom:'Domain level', fl_for:'Forest level', fl_raw:'level {n}',
   fl_split_t:'Agents report different values',
@@ -1811,7 +2080,6 @@ en: {
   b_policywarn:'Policy: breaks later', b_policyblock:'blocked by policy', b_secblock:'session security',
   eid_100:'NTLM rejected because the account is a member of Protected Users. NTLM is already off for this account today.',
   eid_101:'NTLM rejected because access control restrictions apply (authentication policy).',
-  eid_301:'NTLM succeeded but will fail once the authentication policy is enforced - an early warning like the October 2026 deadline, from a different direction.',
   eid_4010:'Blocked by minimum client session security (NtlmMinClientSec).',
   eid_4011:'Blocked by minimum server session security (NtlmMinServerSec).',
   eid_4012:'The DC-generated NTLM secret failed, so the client fell back to the domain password.',
@@ -1883,6 +2151,8 @@ en: {
   au_out_on:'Outgoing', au_out_off:'Outgoing off', au_dom_on:'Domain', au_dom_off:'Domain off',
   st_offen:'open', st_arbeit:'in progress', st_erledigt:'done', again:'active again', what:'What to do?',
   type_dc:'Domain controller', type_member:'Server/client',
+  b_dcval_ok:'4776 arriving', b_dcval_ok_t:'Delivers NTLM validations (4776) for the phantom check, latest {when}.',
+  b_dcval_none:'no 4776', b_dcval_none_t:'This DC delivers no NTLM validations (4776). While even one DC is missing, no 8001 is shown to be a phantom - update the agent to 2.2.0 or later; "Audit Credential Validation" has to be on.',
   hint_smb:'<b>File-share access over NTLM.</b> Most common cause: access by <b>IP instead of hostname</b> – Kerberos needs a name with an SPN. Switch mapped drives, shortcuts, scripts and scheduled tasks from \\\\10.x.x.x to \\\\SERVERNAME. Also check: devices outside the domain (NAS, printers, scanners) – they cannot do Kerberos against the domain.',
   hint_proc:'<b>Application uses NTLM directly.</b> Check: does the application support Kerberos / "Windows integrated authentication" (vendor docs)? Does it connect by IP instead of hostname? Does the target service account have an SPN (<b>setspn -L ACCOUNT</b>)? If none of that works: a candidate for the NTLM exception list when disabling later.',
   hint_dom:'<b>Source computer uses NTLM towards the target.</b> To narrow it down, enable the outgoing audit on the source computer (agent with <b>--enable-outgoing-audit</b>) – the originating process will then appear in the "Programs" panel there. Classics: access by IP instead of hostname, outdated clients, devices outside the domain.',
@@ -1969,8 +2239,9 @@ const DN = () => LANG === 'de' ? ['So','Mo','Di','Mi','Do','Fr','Sa']
 
 // ---- Zustand -------------------------------------------------------------
 const S = {range:'30d', mach:'', hideDone:false, q:'', kind:'', acct:'all', shown:60,
-           bucket:'', wd:'', hr:'', pick:'', rsn:''};
-           // bucket/wd/hr: drill-down from the charts, pick: from the handover bar
+           bucket:'', wd:'', hr:'', pick:'', rsn:'', unconf:''};
+           // bucket/wd/hr: drill-down from the charts, pick: from the handover bar,
+           // unconf: list only the unconfirmed 8001s (never counted anywhere)
 let DATA = null, TIMER = null;
 
 // ---- shareable state -------------------------------------------------------
@@ -1988,6 +2259,7 @@ const URL_RULES = {
   acct:   v => ['all', 'people', 'computers'].includes(v) ? v : null,
   pick:   v => ['NTLMv1', 'NTLMv2', 'kerberos'].includes(v) ? v : null,
   rsn:    v => /^k?[0-9a-fA-Fx]{1,12}$/.test(v) ? v : null,
+  unconf: v => v === '1' ? v : null,
   bucket: v => /^\d{4}-\d{2}-\d{2}(T\d{2})?$/.test(v) ? v : null,
   wd:     v => /^[0-6]$/.test(v) ? v : null,
   hr:     v => /^([0-9]|1[0-9]|2[0-3])$/.test(v) ? v : null
@@ -1997,7 +2269,7 @@ const URL_RULES = {
 // otherwise going Back to the unfiltered view would keep the old filter in S
 // while the URL claims there is none.
 const URL_DEFAULTS = {range: '30d', mach: '', q: '', kind: '', acct: 'all',
-                      pick: '', rsn: '', bucket: '', wd: '', hr: ''};
+                      pick: '', rsn: '', bucket: '', wd: '', hr: '', unconf: ''};
 
 function readUrlState(){
   let p;
@@ -2060,6 +2332,7 @@ function params(extra){
   }
   else if(S.pick === 'kerberos') p.set('kind', 'kerberos');
   else if(S.pick) p.set('version', S.pick);
+  if(S.unconf) p.set('unconf', '1');
   if(extra) for(const k in extra) if(extra[k]) p.set(k, extra[k]);
   return p;
 }
@@ -2606,6 +2879,10 @@ function secAgents(){
       if(m.incoming_audit && m.incoming_audit !== 'aus') au.push(tag('krb', t('r_in')));
       if(m.domain_audit === 'an') au.push(tag('krb', t('r_dom')));
       if(m.cg) au.push(tag('v1', t('b_cg_machine', {n: m.cg})));
+      // A DC that sends no 4776 blocks every phantom verdict - say which one.
+      if(m.is_dc) au.push(m.dcval
+        ? tag('krb', t('b_dcval_ok'), t('b_dcval_ok_t', {when: when(m.dcval_last)}))
+        : tag('v2', t('b_dcval_none'), t('b_dcval_none_t')));
       if(m.ntlm_log_kb && +m.ntlm_log_kb < 20480) au.push(tag('v2', t('b_logsize')));
       const lm = m.lm_level;
       const oct = m.cred_guard === 'on' ? tag('krb', t('oct_cg'))
@@ -2628,6 +2905,12 @@ function secEvents(){
     '<div class="bar"><input class="search" id="q" placeholder="' + esc(t('search_ph')) + '">' +
     '<div class="chipset" id="kinds"></div></div><div class="active" id="active"></div>' +
     '<div id="events"></div>', 'call');
+}
+// The phantom verdict names the DCs it was checked against, so a reader can
+// tell at once whether one is missing from the list.
+function dcText(key){
+  const dcs = (DATA && DATA.stats && DATA.stats.dcs) || [];
+  return t(key, {dcs: dcs.length ? dcs.join(', ') : '\u2013'});
 }
 function renderEvents(){
   const all = DATA.events || [];
@@ -2662,6 +2945,7 @@ function renderEvents(){
   if(S.kind) act.push(['kind', kindName(S.kind)]);
   if(S.mach) act.push(['mach', S.mach]);
   if(S.rsn) act.push(['rsn', t('rid_' + S.rsn)]);
+  if(S.unconf) act.push(['unconf', t('unconf_chip')]);
   if(S.pick) act.push(['pick', S.pick === 'kerberos' ? 'Kerberos' : S.pick]);
   if(S.bucket) act.push(['bucket', t('f_day') + ': ' + S.bucket]);
   if(S.wd !== '' || S.hr !== ''){
@@ -2669,16 +2953,29 @@ function renderEvents(){
     act.push(['when', (S.wd !== '' ? nm[+S.wd] + ' ' : '') +
                       (S.hr !== '' ? String(S.hr).padStart(2, '0') + ':00' : '')]);
   }
-  $('#active').innerHTML = act.length ? act.map(a => '<span class="afl">' + esc(a[1]) +
+  // Unconfirmed 8001s are never counted, and never mixed into this list: the
+  // hint says how many exist in the current range and offers them on their own.
+  const nUnc = (DATA.stats && DATA.stats.unconfirmed) || 0;
+  const nPh = (DATA.stats && DATA.stats.phantom) || 0;
+  const fmt = v => v.toLocaleString(LANG === 'de' ? 'de-DE' : 'en-GB');
+  const hint = (!S.unconf && nUnc > 0)
+    ? '<button class="unchint" data-unconf="1" title="' + esc(t('unconf_expl')) + '">' +
+      esc(nPh > 0 ? t('unconf_hint_ph', {n: fmt(nUnc), p: fmt(nPh)}) : t('unconf_hint', {n: fmt(nUnc)})) +
+      '</button>'
+    : '';
+  $('#active').innerHTML = (act.length ? act.map(a => '<span class="afl">' + esc(a[1]) +
     '<button data-clr="' + a[0] + '">&times;</button></span>').join('') +
-    '<button class="clearall" data-clr="all">' + esc(t('again')) + '</button>' : '';
+    '<button class="clearall" data-clr="all">' + esc(t('again')) + '</button>' : '') + hint;
   if(!list.length){ $('#events').innerHTML = emptyBox(t('empty_events'), ''); return; }
   $('#events').innerHTML = tbl([[t('th_time')], [t('th_kind')], [t('th_users')], [t('th_prog')],
       [t('th_target')], [t('th_comp')], ['ID', 'r']],
     list.slice(0, S.shown).map((e, i) => '<tr class="click" data-ev="' + i + '">' +
       '<td class="mn dm">' + when(e.event_time) + '</td>' +
       '<td>' + tag(KINDC[e.kind] || 'n', kindName(e.kind)) +
-        (e.ntlm_version ? ' ' + tag(e.ntlm_version === 'NTLMv1' ? 'v1' : 'v2', e.ntlm_version) : '') + '</td>' +
+        (e.ntlm_version ? ' ' + tag(e.ntlm_version === 'NTLMv1' ? 'v1' : 'v2', e.ntlm_version) : '') +
+        (S.unconf ? ' ' + (e.verdict === 'phantom'
+          ? tag('unc ph', t('phantom_tag'), dcText('phantom_expl'))
+          : tag('unc', t('unconf_tag'), t('unconf_expl'))) : '') + '</td>' +
       '<td>' + esc(e.user || '\u2013') + '</td>' +
       '<td class="dm">' + esc(e.process || '\u2013') + '</td>' +
       '<td class="mn dm"><span class="cut">' + esc(e.target_server || e.workstation || '\u2013') + '</span></td>' +
@@ -2720,6 +3017,9 @@ function openEvent(i){
   const fk = e.failure_code ? ('rid_k' + String(e.failure_code).toLowerCase()) : '';
   const fhint = fk && I18N[LANG][fk] ? t(fk) : '';
   $('#dbody').innerHTML =
+    (S.unconf ? (e.verdict === 'phantom'
+      ? '<div class="expl unc ph"><b>' + esc(t('phantom_tag')) + '</b>' + esc(dcText('phantom_expl')) + '</div>'
+      : '<div class="expl unc"><b>' + esc(t('unconf_tag')) + '</b>' + esc(t('unconf_expl')) + '</div>') : '') +
     (eidTxt ? '<div class="expl"><b>' + esc(t('d_eid')) + ' ' + e.event_id + '</b>' + esc(eidTxt) + '</div>' : '') +
     grp(t('d_comp'), [row(t('d_user'), e.user), row(t('d_dom'), e.domain),
       row(t('d_ws'), e.workstation), row(t('d_ip'), e.ip)]) +
@@ -2801,7 +3101,8 @@ document.addEventListener('click', function(ev){
   const clr = el.closest('[data-clr]');
   if(clr){ const k = clr.dataset.clr;
     if(k === 'all'){ S.q = ''; S.kind = ''; S.mach = ''; S.bucket = ''; S.wd = ''; S.hr = '';
-      S.pick = ''; S.rsn = ''; load(); }
+      S.pick = ''; S.rsn = ''; S.unconf = ''; load(); }
+    else if(k === 'unconf'){ S.unconf = ''; S.shown = 60; load(); }
     else if(k === 'pick'){ S.pick = ''; load(); }
     else if(k === 'rsn'){ S.rsn = ''; load(); }
     else if(k === 'mach'){ S.mach = ''; load(); }
@@ -2812,6 +3113,8 @@ document.addEventListener('click', function(ev){
   // Drill-down out of the two charts. Both are server-side filters, so the
   // whole payload is refetched - a day three weeks back is not in the event
   // list the page happens to be holding.
+  const unc = el.closest('[data-unconf]');
+  if(unc){ S.unconf = '1'; S.shown = 60; load().then(goEvents); return; }
   const rw = el.closest('[data-rsn]');
   if(rw){
     S.rsn = S.rsn === rw.dataset.rsn ? '' : rw.dataset.rsn;
@@ -3050,6 +3353,8 @@ def main():
                     with DB_LOCK:
                         cur = conn.execute(
                             "DELETE FROM events WHERE event_time < ?", (cutoff,))
+                        conn.execute(
+                            "DELETE FROM dc_validations WHERE event_time < ?", (cutoff,))
                         conn.commit()
                     if cur.rowcount:
                         print(f"[NTLM-Analyzer] retention: deleted {cur.rowcount} events "

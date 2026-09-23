@@ -204,6 +204,15 @@ pub fn run_cycle(cfg: &Config) -> Result<(), String> {
                 &state, &me, map_4769, &mut collected, &mut new_seen, false, false,
             );
         }
+        // Every NTLM validation of a domain account happens on a DC and is
+        // logged there as 4776. The collector uses these to settle whether an
+        // 8001 without a 4020 partner was real NTLM or only NTLM considered
+        // during negotiation. Needs "Audit Credential Validation", which is on
+        // in the Default Domain Controllers Policy.
+        gather(
+            "Security", "Security#4776", "EventID=4776", "", window_ms,
+            &state, &me, map_4776, &mut collected, &mut new_seen, false, false,
+        );
         gather(
             "Microsoft-Windows-NTLM/Operational", "NTLM#8004",
             "(EventID=8004 or EventID=8005 or EventID=8006 or EventID=4004 or EventID=4005 or EventID=4006)", "", window_ms,
@@ -214,12 +223,12 @@ pub fn run_cycle(cfg: &Config) -> Result<(), String> {
         // marked optional so a switched-off channel is not reported as an error.
         gather(
             LOG_PROTECTED_USER, "AUTH#protected",
-            "(EventID=100 or EventID=101)", "", window_ms,
+            "EventID=100", "", window_ms,
             &state, &me, map_auth_policy, &mut collected, &mut new_seen, true, true,
         );
         gather(
             LOG_AUTH_POLICY, "AUTH#policy",
-            "EventID=301", "", window_ms,
+            "EventID=101", "", window_ms,
             &state, &me, map_auth_policy, &mut collected, &mut new_seen, true, true,
         );
         // Enhanced DC audits (Server 2025): they carry the NTLM version straight
@@ -393,6 +402,34 @@ fn norm_krb_status(st: &str) -> String {
     let t = st.trim().to_lowercase();
     let hex = t.strip_prefix("0x").unwrap_or(&t).trim_start_matches('0');
     format!("0x{}", if hex.is_empty() { "0" } else { hex })
+}
+
+/// 4776 - "The computer attempted to validate the credentials for an account".
+/// Written on the DC for every NTLM validation of a domain account, success or
+/// failure. It names the account and the client (NetBIOS name), not the target.
+/// Kept lean on purpose: the collector files these separately as reference data
+/// and never counts them as events of their own.
+fn map_4776(e: &RawEvent) -> Option<Event> {
+    let user = e.named.get("TargetUserName").cloned().unwrap_or_default();
+    if user.trim().is_empty() {
+        return None;
+    }
+    let workstation = e
+        .named
+        .get("Workstation")
+        .map(|w| w.trim().trim_start_matches('\\').to_string())
+        .filter(|w| !w.is_empty());
+    Some(Event {
+        record_id: e.record_id,
+        log: "Security".to_string(),
+        event_id: e.event_id,
+        kind: "dcval".to_string(),
+        event_time: e.time.clone(),
+        user: Some(user),
+        workstation,
+        failure_code: e.named.get("Status").cloned(),
+        ..Default::default()
+    })
 }
 
 fn map_4769(e: &RawEvent) -> Option<Event> {
@@ -624,32 +661,32 @@ fn map_8003(e: &RawEvent) -> Option<Event> {
 /// and domain, PID and name of the calling process.
 /// 4014 (NTLMGetCredentialKeyBlockedByCredGuard) only carries the calling
 /// process name and a service host tag.
-/// Blocks and warnings that come from account policy rather than from the NTLM
-/// restriction settings: Protected Users (100/101) and Authentication Policies
-/// (301). Both live in their own DC-only channels.
-///
-/// 301 is the interesting one: the authentication SUCCEEDED but would fail once
-/// the policy is enforced - a dated warning of the same shape as the October
-/// 2026 NTLMv1-SSO deadline, just from a different direction.
+/// Blocks that come from account policy rather than from the NTLM restriction
+/// settings, each in its own DC-only channel (both disabled by default):
+///   100 in ProtectedUserFailures-DomainController - NTLM refused because the
+///       account is in Protected Users
+///   101 in AuthenticationPolicyFailures-DomainController - NTLM refused because
+///       an enforced authentication policy requires access control restrictions
+/// Checked against Microsoft's event table for authentication policies. An
+/// earlier version asked the ProtectedUser channel for 100/101 and the policy
+/// channel for 301; 101 does not occur in the first and 301 does not exist at
+/// all, so policy refusals were never collected. There is no audit-mode event
+/// for NTLM here (305/306 are Kerberos only): NTLM only shows up once refused.
 ///
 /// Field layout for these events is not publicly documented, so nothing is read
 /// by position. Only values that identify themselves (by label or by shape) are
 /// taken; the rest stays in the raw message shown in the detail view.
 fn map_auth_policy(e: &RawEvent) -> Option<Event> {
-    let kind = if e.event_id == 301 {
-        "policywarn"
-    } else {
-        "policyblock"
-    };
+    let kind = "policyblock";
     let reason = match e.event_id {
         100 => "NTLM rejected: account is a member of Protected Users",
-        101 => "NTLM rejected: access control restrictions required",
-        _ => "NTLM succeeded but will fail once the authentication policy is enforced",
+        _ => "NTLM rejected: access control restrictions required",
     };
     // The two channels keep separate record-id sequences, both starting at 1,
     // so they must not share a log name - otherwise deduplication would drop
-    // the second channel's first events as "already seen".
-    let log = if e.event_id == 301 {
+    // the second channel's first events as "already seen". The IDs no longer
+    // overlap between the channels, so the ID says which channel it came from.
+    let log = if e.event_id == 101 {
         "Authentication/AuthPolicy"
     } else {
         "Authentication/ProtectedUser"
@@ -770,8 +807,16 @@ fn map_8001(e: &RawEvent) -> Option<Event> {
     let target = nonempty(0);
     let pid = p.get(3).cloned().unwrap_or_default();
     let pname = nonempty(4);
-    let user = nonempty(6).or_else(|| nonempty(1));
-    let domain = nonempty(7).or_else(|| nonempty(2));
+    // The account that actually authenticates: the supplied one when credentials
+    // were given explicitly (net use /user:...), otherwise the identity of the
+    // calling process. The other way round, a connection with other credentials
+    // was filed under whoever happened to run the process - and could never be
+    // matched against the DC's 4776, which records the supplied account.
+    let supplied = nonempty(1).filter(|s| s != "(NULL)" && s != "-");
+    let (user, domain) = match supplied {
+        Some(u) => (Some(u), nonempty(2).filter(|s| s != "(NULL)" && s != "-")),
+        None => (nonempty(6), nonempty(7)),
+    };
 
     // Keep the full path alongside the grouped file name: for generic names
     // like svchost.exe the path is what identifies the actual application.
@@ -947,9 +992,11 @@ fn map_enhanced(e: &RawEvent) -> Option<Event> {
 
     let kind = match id {
         4020 | 4021 => "outgoing", // client: outgoing NTLM incl. process
-        // Server side: carries the source (client machine + IP), target SPN and
-        // version - the same statement as 8004, hence "domain".
-        4022 | 4023 => "domain",
+        // Server side: written on the server being accessed, so it is incoming
+        // NTLM like 8002/8003 - not the DC's view. Filing it as "domain" put
+        // member-server logons into the DC panel and counted a domain logon
+        // twice there (this server's 4022 plus the DC's 8004/4032).
+        4022 | 4023 => "incoming",
         4030..=4033 => "domain", // DC-Sicht
         4024 | 4025 => "ntlmv1sso", // NTLMv1-derived SSO credentials
         _ => return None,
