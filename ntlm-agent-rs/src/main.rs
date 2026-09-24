@@ -40,7 +40,7 @@ fn main() {
 
     match cmd {
         "service" => {
-            // Vom SCM gestartet -> Dispatcher
+            // Started by the SCM -> dispatcher
             if let Err(e) = service::run() {
                 config::log(&format!("service dispatcher: {e}"));
                 exit(1);

@@ -4,8 +4,8 @@ name: Build agent EXE
 # needing a local Rust toolchain. The binary appears under the workflow run's
 # "Artifacts" section; on a tag it is also attached to the GitHub release.
 on:
-  # Kein "paths"-Filter: der wuerde auch fuer Tag-Pushes gelten, und dann
-  # entstuende bei einem Versions-Tag kein Lauf - und damit kein Release.
+  # No "paths" filter: it would apply to tag pushes too, and then a version
+  # tag would start no run - and so produce no release.
   push:
     branches: [main]
     tags: ['v*']
@@ -22,7 +22,7 @@ concurrency:
 jobs:
   build:
     runs-on: windows-latest
-    # Ohne Schreibrecht kann der Release-Schritt kein Release anlegen (HTTP 403).
+    # Without write permission the release step cannot create a release (HTTP 403).
     permissions:
       contents: write
     defaults:
@@ -51,8 +51,8 @@ jobs:
         run: cargo fmt --check
         continue-on-error: true
 
-      # Stilhinweise sind informativ, nicht blockierend: ohne "-D warnings"
-      # bleiben sie Warnungen und faerben den Lauf nicht rot.
+      # Style hints are informative, not blocking: without "-D warnings" they
+      # stay warnings and do not turn the run red.
       - name: Clippy
         run: cargo clippy --release
         continue-on-error: true

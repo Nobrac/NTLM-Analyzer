@@ -147,7 +147,7 @@ mod windows_impl {
     }
 
     /// Protected install location for the EXE. The default ACL of
-    /// C:\Program Files erlaubt nur Administratoren/SYSTEM Schreibzugriff - damit
+    /// C:\Program Files only lets Administrators/SYSTEM write - so
     /// the service does not run from a user-writable folder (e.g. Downloads),
     /// which would otherwise allow local privilege escalation.
     fn install_dir() -> std::path::PathBuf {
@@ -180,12 +180,12 @@ mod windows_impl {
                 "/inheritance:r",
                 "/grant:r",
                 "*S-1-5-18:(OI)(CI)F", // SYSTEM
-                "*S-1-5-32-544:(OI)(CI)F", // BUILTIN\Administratoren
+                "*S-1-5-32-544:(OI)(CI)F", // BUILTIN\Administrators
             ])
             .status();
         match status {
             Ok(s) if s.success() => {
-                config::log("ACL des Datenordners auf SYSTEM + Administratoren beschraenkt.")
+                config::log("Data folder ACL restricted to SYSTEM + Administrators.")
             }
             Ok(s) => config::log(&format!(
                 "icacls exited with status {s} - please check the data folder ACL manually."
@@ -198,8 +198,8 @@ mod windows_impl {
 
     /// Create the service (auto-start), configure auto-restart and start it.
     pub fn install(cfg: &config::Config) -> R {
-        // Datenordner (config.json/state.json/agent.log) gegen Manipulation durch
-        // against normal users - done here because install has admin rights.
+        // Protect the data folder (config.json/state.json/agent.log) from tampering
+        // by normal users - done here because install has admin rights.
         harden_data_dir();
         // A dedicated service account needs write access to the data folder
         // (state.json, agent.log) - SYSTEM+Administrators is not enough then.

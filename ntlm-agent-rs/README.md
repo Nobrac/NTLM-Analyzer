@@ -15,9 +15,16 @@ machine and pushes them to the central collector (`/ingest` + `/status`).
 
 ## What it collects
 
-- **4624** (DC): NTLM logons including v1/v2 and `auth_method` = `Direct`
+- **4624** (every machine): NTLM logons including v1/v2 and `auth_method` = `Direct`
   (application uses NTLM directly) or `Fallback` (Kerberos attempted, failed).
   Filtered via `LmPackageName`, so it also catches Negotiate→NTLM fallbacks.
+  On a member server this is what tells NTLMv1 from NTLMv2 before Server 2025.
+  Anonymous logons (null sessions) are kept but sent without a version: they
+  carry no credential, and Windows' "NTLM V1" label on them means nothing.
+- **4625** (every machine, needs *Audit Logon: Failure*): **failed** NTLM
+  logons — account, source machine and IP, logon type, process and the NT
+  status (`SubStatus` when `Status` is the generic `0xC000006D`).
+- **4776** (DC): every NTLM validation, successful or failed, with its status.
 - **4769** (DC, informational): Kerberos service tickets including encryption
   (can be disabled with `--skip-kerberos`).
 - **8004** (DC): NTLM within the domain (user + source + target).
@@ -166,7 +173,7 @@ ntlm-agent.exe run
 ntlm-agent.exe run --collector-url https://collector.example.local:8443
 ```
 
-On a DC, reading the Security log (4624/4769) requires elevated rights — as a
+Reading the Security log (4624 on every machine, 4769 on DCs) requires elevated rights — as a
 service the agent runs as `LocalSystem` and has them automatically.
 
 ## Project structure

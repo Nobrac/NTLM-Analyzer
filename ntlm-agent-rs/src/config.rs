@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// Version reported with every status push (shown in the dashboard).
-pub const AGENT_VERSION: &str = "2.2.0";
+pub const AGENT_VERSION: &str = "2.3.0";
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Config {
@@ -275,7 +275,7 @@ pub fn save_state(s: &HashMap<String, i64>) -> Result<(), String> {
     std::fs::rename(&tmp, state_path()).map_err(|e| e.to_string())
 }
 
-/// Einfaches Logging in C:\ProgramData\NtlmAgent\agent.log (+ stderr).
+/// Simple logging to C:\ProgramData\NtlmAgent\agent.log (+ stderr).
 pub fn log(msg: &str) {
     let _ = std::fs::create_dir_all(data_dir());
     // Rotation: once agent.log grows past ~5 MB it becomes agent.log.1 (a

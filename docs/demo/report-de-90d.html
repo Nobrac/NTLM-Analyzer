@@ -1,0 +1,120 @@
+<!doctype html><html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>NTLM-Statusbericht · 90 Tage</title><style>
+:root{--ink:#0f172a;--dim:#475569;--faint:#64748b;--line:#e3e8ef;--soft:#f5f7fa;
+  --gold:#a8841e;--gold2:#d9b84a;--v1:#c62828;--amb:#b45309;--ok:#137a50;
+  --text:'Segoe UI Variable Text','Segoe UI',system-ui,-apple-system,'Helvetica Neue',Arial,sans-serif;
+  --disp:'Segoe UI Variable Display','Segoe UI',system-ui,-apple-system,'Helvetica Neue',Arial,sans-serif;
+  --mono:'Cascadia Mono','IBM Plex Mono',ui-monospace,Consolas,'SF Mono',monospace}
+*{box-sizing:border-box}
+html{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+body{margin:0;background:#e7ebf0;color:var(--ink);font-family:var(--text);font-size:13px;line-height:1.5}
+.tb{position:sticky;top:0;z-index:5;display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:center;
+  padding:10px 16px;background:rgba(15,23,42,.92);color:#e2e8f0;font-size:13px}
+.tb a,.tb button{color:#e2e8f0;text-decoration:none;border:1px solid rgba(226,232,240,.25);border-radius:8px;
+  padding:6px 12px;background:transparent;font:inherit;cursor:pointer}
+.tb a.on{background:#d9b84a;color:#0f172a;border-color:#d9b84a;font-weight:600}
+.tb .grp{display:flex;gap:4px;align-items:center}
+.tb .lbl{color:#94a3b8;margin-right:4px}
+.tb .print{background:#d9b84a;color:#0f172a;border-color:#d9b84a;font-weight:600}
+.sheet{width:210mm;max-width:100%;margin:24px auto 48px;background:#fff;padding:15mm 16mm 12mm;
+  box-shadow:0 10px 40px rgba(15,23,42,.18);border-radius:4px}
+.top{display:flex;justify-content:space-between;align-items:center;gap:12px;padding-bottom:12px;border-bottom:2px solid var(--ink)}
+.brand{display:flex;align-items:center;gap:9px;font-family:var(--disp);font-weight:650;font-size:14px;letter-spacing:.01em}
+.brand img{width:24px;height:24px;border-radius:6px}
+.kick{font-family:var(--mono);font-size:10.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--faint);text-align:right}
+h1{font-family:var(--disp);font-size:34px;line-height:1.1;margin:18px 0 6px;font-weight:700;letter-spacing:-.015em}
+.meta{display:flex;flex-wrap:wrap;gap:4px 18px;color:var(--dim);font-size:12px}
+.meta span+span::before{content:"";}
+.hero{margin:18px 0 4px;font-family:var(--disp);font-size:25px;line-height:1.25;font-weight:500;letter-spacing:-.01em}
+.hero b{color:var(--gold);font-weight:700}
+.delta{display:flex;align-items:center;gap:8px;color:var(--dim);font-size:13.5px;margin-bottom:18px}
+.arrow{display:inline-grid;place-items:center;width:22px;height:22px;border-radius:50%;font-size:13px;font-weight:700;color:#fff}
+.arrow.good{background:var(--ok)}.arrow.bad{background:var(--v1)}.arrow.flat{background:#94a3b8}
+.kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:6px 0 8px}
+.kpi{border:1px solid var(--line);border-radius:12px;padding:12px 13px 11px;background:linear-gradient(180deg,#fff,var(--soft))}
+.kpi .l{font-size:11px;color:var(--dim);font-weight:600}
+.kpi .v{font-family:var(--disp);font-size:26px;font-weight:700;letter-spacing:-.02em;line-height:1.15;margin-top:4px}
+.kpi .v.red{color:var(--v1)}
+.kpi .s{font-size:10.5px;color:var(--faint);margin-top:2px}
+.chip{display:inline-block;font-family:var(--mono);font-size:10px;font-weight:600;border-radius:999px;padding:1px 7px;margin-top:6px}
+.chip.good{background:#e3f4ec;color:var(--ok)}.chip.bad{background:#fdeaea;color:var(--v1)}.chip.flat{background:#eef2f6;color:var(--faint)}
+section{margin-top:22px;break-inside:avoid}
+section.flow{break-inside:auto}
+.sh{display:flex;align-items:baseline;gap:12px;border-bottom:1px solid var(--line);padding-bottom:6px;margin-bottom:12px;break-after:avoid}
+.sh .no{font-family:var(--mono);font-size:11px;color:var(--gold);font-weight:700;letter-spacing:.06em}
+.sh h2{margin:0;font-family:var(--disp);font-size:18px;font-weight:650;letter-spacing:-.005em}
+.sh p{margin:0 0 0 auto;color:var(--faint);font-size:11px;text-align:right;max-width:55%}
+.chart{width:100%;height:auto;display:block}
+.chart .g{stroke:#e8ecf2;stroke-width:1}.chart .g0{stroke:#94a3b8;stroke-width:1.2;stroke-dasharray:4 3}
+.chart .ax{font-family:var(--mono);font-size:10px;fill:#7b8798}
+.chart .goal{font-family:var(--mono);font-size:10px;fill:var(--ok);font-weight:700}
+.chart .ln{fill:none;stroke:var(--gold2);stroke-width:2.6;stroke-linejoin:round;stroke-linecap:round}
+.chart .dot{fill:#fff;stroke:var(--gold2);stroke-width:1.6}
+.chart .end{fill:var(--gold2);stroke:#fff;stroke-width:2}
+.chart .endv{font-family:var(--disp);font-size:13px;font-weight:700;fill:var(--ink)}
+.chart .v1b{fill:var(--v1)}.chart .v1z{fill:#e8ecf2}.chart .v1t{fill:var(--v1);font-weight:700}
+.sublab{font-size:10.5px;color:var(--faint);margin:10px 0 2px 44px;font-weight:600}
+.muted{color:var(--faint)}
+.prog{display:grid;grid-template-columns:1.25fr 1fr;gap:18px}
+.bar{display:flex;height:14px;border-radius:999px;overflow:hidden;background:#eef2f6;margin:8px 0 10px}
+.bar i{display:block;height:100%}
+.bar .d{background:var(--ok)}.bar .p{background:var(--gold2)}.bar .o{background:#cbd5e1}
+.legend{display:flex;flex-wrap:wrap;gap:4px 16px;font-size:12px;color:var(--dim)}
+.legend b{font-family:var(--disp);font-size:18px;color:var(--ink);margin-right:5px}
+.legend i{display:inline-block;width:9px;height:9px;border-radius:3px;margin-right:5px;vertical-align:1px}
+.note{font-size:11.5px;color:var(--dim);margin-top:8px}
+.note.warn{color:var(--amb);font-weight:600}
+.areas{margin-top:10px}
+.areas .ah{font-size:10.5px;font-weight:600;color:var(--faint);margin-bottom:2px}
+.ar{display:flex;justify-content:space-between;border-bottom:1px solid #eef1f5;padding:3px 0;font-size:11.5px}
+.ar b{font-variant-numeric:tabular-nums}
+.box{border:1px solid var(--line);border-radius:12px;padding:12px 14px}
+.box h3{margin:0 0 6px;font-size:12.5px;font-family:var(--disp)}
+.rd{display:flex;gap:14px;margin:4px 0 6px}
+.rd div{flex:1}
+.rd b{display:block;font-family:var(--disp);font-size:20px}
+.rd span{font-size:11px;color:var(--faint)}
+.names{font-family:var(--mono);font-size:10.5px;color:var(--dim);margin-top:6px;word-break:break-word}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+table{width:100%;border-collapse:collapse;font-size:11.5px}
+caption{text-align:left;font-family:var(--disp);font-weight:650;font-size:12.5px;padding-bottom:6px}
+th{font-family:var(--mono);font-weight:600;font-size:9.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--faint);
+  text-align:left;border-bottom:1px solid var(--line);padding:4px 6px 5px 0}
+td{border-bottom:1px solid #eef1f5;padding:6px 6px 6px 0;vertical-align:top}
+tr{break-inside:avoid}
+td.n,th.n{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+td .sub{display:block;color:var(--faint);font-size:10.5px;font-weight:400;word-break:break-all}
+td.nm{font-weight:600;word-break:break-word}
+.tag{display:inline-block;font-family:var(--mono);font-size:9.5px;font-weight:700;border-radius:5px;padding:0 5px;margin-left:4px;vertical-align:1px}
+.tag.v1{background:#fdeaea;color:var(--v1)}.tag.st-open{background:#eef2f6;color:var(--faint)}
+.tag.st-in_progress{background:#fbf3dc;color:#8a6a12}.tag.st-done{background:#e3f4ec;color:var(--ok)}
+.risks{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.risk{border:1px solid var(--line);border-left:4px solid #cbd5e1;border-radius:10px;padding:10px 12px;break-inside:avoid}
+.risk.bad{border-left-color:var(--v1)}.risk.warn{border-left-color:#e0a106}.risk.ok{border-left-color:var(--ok)}
+.risk .rh{display:flex;justify-content:space-between;align-items:center;gap:8px;font-weight:650;font-family:var(--disp);font-size:13px}
+.lv{white-space:nowrap;flex:none;font-family:var(--mono);font-size:9.5px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;border-radius:999px;padding:1px 8px}
+.risk.bad .lv{background:#fdeaea;color:var(--v1)}.risk.warn .lv{background:#fdf3d7;color:var(--amb)}.risk.ok .lv{background:#e3f4ec;color:var(--ok)}
+.risk p{margin:5px 0 0;color:var(--dim);font-size:11.5px}
+ol.steps{list-style:none;counter-reset:s;margin:0;padding:0}
+ol.steps li{counter-increment:s;position:relative;padding:8px 0 9px 38px;border-bottom:1px solid #eef1f5;break-inside:avoid;font-size:12.5px}
+ol.steps li::before{content:counter(s);position:absolute;left:0;top:7px;width:25px;height:25px;border-radius:50%;
+  background:var(--ink);color:#fff;font-family:var(--disp);font-weight:700;font-size:12px;display:grid;place-items:center}
+ol.steps li:first-child::before{background:var(--gold2);color:var(--ink)}
+.method{margin-top:24px;padding:10px 12px;background:var(--soft);border-radius:10px;font-size:10.5px;color:var(--dim);break-inside:avoid}
+.method b{color:var(--ink)}
+.foot{margin-top:14px;display:flex;justify-content:space-between;font-family:var(--mono);font-size:9.5px;color:var(--faint);
+  border-top:1px solid var(--line);padding-top:8px}
+@page{size:A4;margin:13mm 13mm 14mm}
+@media print{
+  body{background:#fff;font-size:12.5px}
+  .tb{display:none}
+  .sheet{width:auto;margin:0;padding:0;box-shadow:none;border-radius:0}
+  .pb{break-before:page}
+}
+@media (max-width:760px){
+  .sheet{padding:18px 16px;margin:0;border-radius:0}
+  .kpis{grid-template-columns:1fr 1fr}
+  .prog,.two,.risks{grid-template-columns:1fr}
+  h1{font-size:27px}.hero{font-size:20px}
+  .sh{flex-wrap:wrap}.sh p{margin:0;text-align:left;max-width:none}
+}
+</style></head><body><nav class="tb"><a href="index.html">← Dashboard</a><span class="grp"><span class="lbl">Zeitraum</span><a href="report-de-7d.html" class="">7 Tage</a><a href="report-de-30d.html" class="">30 Tage</a><a href="report-de-90d.html" class="on">90 Tage</a></span><span class="grp"><a href="report-de-90d.html" class="on">DE</a><a href="report-en-90d.html" class="">EN</a></span><button type="button" class="print" onclick="window.print()">Drucken / als PDF</button></nav><main class="sheet"><div class="top"><div class="brand"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAMAAACdt4HsAAAA/1BMVEX+/v4dKDohLD0PGy4uOEn5yQtUXWv99M774Xn72U/855L70y+UmaL///773mj766n///yPlJoAAACDiZOkqK7n6OpcY3H//v44Q1hja3d0e4extbokLkBETVz///++wcb4zSL+87gBDiJpcHx6gIucoam3u8HKzNDR09fe4OP/0grm3Kf////EvJjAvary34r/4DL/4EsAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB9fbMYAAAAQHRSTlP+//////7/////////1///DP8A/////4f///////8o//7//////////////33//////wAAAAAAAAAAAAAAAAAAJ9C2nAAAAihJREFUeNrtl2lzozAMhn1gHNuAQ4DcPdLu1XbP///n1gcQTJNmLH/b2XcmQBz0IMtCsdBytdyUCKRyY4zR6h5o7hD3K7RMsDeEJfqOkrRBZRog0fy//lkVdWFVP8zGD268Lm7Zd5h6kS78IX9yw7i7RcgwscroLhxf46MZxhm6DfAi9EvoASV2OAIwuzcaYFxo0gBG39IAhOaJHhD6OXEKOOugAJJ7F3ZAAKHt3SwZYgGH1hoQvIUCiuGiAQIaVHiLIRliAfvxKgcDXBRsPEEAu353mJyTIRawNpcPvQvPEICb+a4n2PK2hgA64ivDdoRFAvqltFmBnkGASRz3MMDXsTh9ggEGuyOqgQBb5l1paaGAgzfcFlDAkAB5X6PiAS9kWiXJRSOpjPgVwPhem2DQ7f4KQAhxFTAkA6FZ++sPY0roqCmckyF/+82YEMocZkZcaq0lR/ZzAeCy0LwR+pVJd3vFVAhYMCtxsuhLAPefj3+qRz7Mee4Dt7IndBlwoEeaLxifPJJ/uME44vV8e4FrNX0qq4JVYIME8lucp9AD9ILpj9dp8EUQBS0qLyFR3dRGTTvfYzVvgdcVi96+8RAQeMAXVhqZg6yk/ybfEdh0KAhIv4wVdyel/ekdYDptzjQCzOHsglKQTawcCeJ6GtwgCM1N4jMlhQQRuHDxWZiI2gOMwZ33p5EA7du4J5TwxpM/WsImofU1hFOZ1Hxz6Zpv0/6DG2dj/BcWBhsxYHO2PQAAAABJRU5ErkJggg==" alt="">NTLM-Analyzer</div><div class="kick">Statusbericht · 90 Tage</div></div><h1>NTLM-Statusbericht</h1><div class="meta"><span>Zeitraum 26.06.2026 – 24.09.2026</span><span>8 Agenten · Daten seit 10.08.2026</span><span>Erstellt am 24.09.2026, 23:18</span></div><p class="hero">Noch <b>26,5 %</b> aller Anmeldungen laufen über NTLM.</p><div class="delta"><span>Für einen Vergleich mit den 90 Tagen davor reichen die Daten noch nicht.</span></div><div class="kpis"><div class="kpi"><div class="l">NTLM-Anteil</div><div class="v">26,5 %</div><div class="s">aller Anmeldungen</div></div><div class="kpi"><div class="l">NTLM-Anmeldungen</div><div class="v">1 493</div><div class="s">im Zeitraum</div></div><div class="kpi"><div class="l">davon NTLMv1</div><div class="v red">74</div><div class="s">unsicher, zuerst abstellen</div></div><div class="kpi"><div class="l">Konten mit NTLM</div><div class="v">20</div><div class="s">3 davon mit NTLMv1</div></div></div><section class=""><div class="sh"><span class="no">01</span><h2>Verlauf</h2><p>NTLM-Anteil pro Woche – das Ziel ist die Nulllinie.</p></div><svg class="chart" viewBox="0 0 700 176" role="img" aria-label="Verlauf"><defs><linearGradient id="ga" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#d9b84a" stop-opacity=".38"/><stop offset="1" stop-color="#d9b84a" stop-opacity=".02"/></linearGradient></defs><line x1="44" x2="636" y1="150.0" y2="150.0" class="g0"/><text x="36" y="154.0" class="ax" text-anchor="end">0 %</text><line x1="44" x2="636" y1="111.3" y2="111.3" class="g"/><text x="36" y="115.3" class="ax" text-anchor="end">10 %</text><line x1="44" x2="636" y1="72.7" y2="72.7" class="g"/><text x="36" y="76.7" class="ax" text-anchor="end">20 %</text><line x1="44" x2="636" y1="34.0" y2="34.0" class="g"/><text x="36" y="38.0" class="ax" text-anchor="end">30 %</text><text x="642" y="154.0" class="goal">Ziel 0 %</text><path d="M44.0,150.0 L44.0,54.4 L192.0,48.1 L340.0,44.9 L488.0,48.6 L636.0,46.7 L636.0,150.0 Z" fill="url(#ga)"/><polyline points="44.0,54.4 192.0,48.1 340.0,44.9 488.0,48.6 636.0,46.7" class="ln"/><circle cx="44.0" cy="54.4" r="2.6" class="dot"/><circle cx="192.0" cy="48.1" r="2.6" class="dot"/><circle cx="340.0" cy="44.9" r="2.6" class="dot"/><circle cx="488.0" cy="48.6" r="2.6" class="dot"/><circle cx="636.0" cy="46.7" r="2.6" class="dot"/><circle cx="636.0" cy="46.7" r="5" class="end"/><text x="644.0" y="34.7" class="endv" text-anchor="end">26,7 %<tspan class="ax" dx="6">letzte 7 Tage</tspan></text><text x="44.0" y="168" class="ax" text-anchor="middle">KW 34</text><text x="192.0" y="168" class="ax" text-anchor="middle">KW 35</text><text x="340.0" y="168" class="ax" text-anchor="middle">KW 36</text><text x="488.0" y="168" class="ax" text-anchor="middle">KW 37</text><text x="636.0" y="168" class="ax" text-anchor="middle">KW 38</text></svg><div class="sublab">NTLMv1-Anmeldungen pro Woche</div><svg class="chart v1c" viewBox="0 0 700 66" aria-hidden="true"><line x1="44" x2="636" y1="62" y2="62" class="g0"/><rect x="31.0" y="46.0" width="26.0" height="16.0" rx="2" class="v1b"/><text x="44.0" y="42.0" class="ax v1t" text-anchor="middle">8</text><rect x="179.0" y="16.0" width="26.0" height="46.0" rx="2" class="v1b"/><text x="192.0" y="12.0" class="ax v1t" text-anchor="middle">23</text><rect x="327.0" y="36.0" width="26.0" height="26.0" rx="2" class="v1b"/><text x="340.0" y="32.0" class="ax v1t" text-anchor="middle">13</text><rect x="475.0" y="22.0" width="26.0" height="40.0" rx="2" class="v1b"/><text x="488.0" y="18.0" class="ax v1t" text-anchor="middle">20</text><rect x="623.0" y="42.0" width="26.0" height="20.0" rx="2" class="v1b"/><text x="636.0" y="38.0" class="ax v1t" text-anchor="middle">10</text></svg></section><section class=""><div class="sh"><span class="no">02</span><h2>Fortschritt</h2><p>Arbeitsliste aus dem Dashboard und Maschinen, die NTLM abschalten können.</p></div><div class="prog"><div><div class="bar"><i class="d" style="width:2.33%"></i><i class="p" style="width:2.33%"></i><i class="o" style="width:95.35%"></i></div><div class="legend"><span><i style="background:var(--ok)"></i><b>4</b>erledigt</span><span><i style="background:var(--gold2)"></i><b>4</b>in Arbeit</span><span><i style="background:#cbd5e1"></i><b>164</b>offen</span></div><div class="note">4 im Zeitraum erledigt</div><div class="areas"><div class="ah">Noch nicht erledigt, nach Bereich</div><div class="ar"><span>Programme (ausgehend)</span><b>13</b></div><div class="ar"><span>Dienste (eingehend)</span><b>14</b></div><div class="ar"><span>Verbindungen (DC-Sicht)</span><b>139</b></div><div class="ar"><span>NTLMv1-SSO</span><b>2</b></div></div><div class="note">Jede Zeile der Arbeitslisten im Dashboard ist ein Posten; „erledigt“ setzt, wer ihn abgestellt hat.</div></div><div class="box"><h3>Bereit zum Abschalten</h3><div class="rd"><div><b>2</b><span>ausgehend · von 8 Maschinen</span></div><div><b>2</b><span>eingehend · von 6 Maschinen</span></div></div><div class="names">SRV-PRINT, WKS-0107</div><div class="note">Auditing an, 30 Tage beobachtet, in dieser Zeit kein NTLM: Hier kann „Restrict NTLM: Deny“ gesetzt werden.</div></div></div></section><section class="pb"><div class="sh"><span class="no">03</span><h2>Risiken und Sichtbarkeit</h2><p>Was zuerst Aufmerksamkeit braucht – und wo das Bild unvollständig ist.</p></div><div class="risks"><div class="risk bad"><div class="rh">NTLMv1<span class="lv">handeln</span></div><p>74 Anmeldungen mit NTLMv1 von 10 Konten, vor allem svc_scan, mfp_service, t.hoffmann und 7 weitere. NTLMv1 lässt sich knacken und gehört zuerst abgestellt.</p></div><div class="risk bad"><div class="rh">Oktober 2026<span class="lv">handeln</span></div><p>10 Anmeldungen nutzen aus NTLMv1 abgeleitete Anmeldedaten. Mit der Umstellung im Oktober 2026 brechen sie von selbst.</p></div><div class="risk bad"><div class="rh">Fehlgeschlagene Anmeldungen<span class="lv">handeln</span></div><p>Verdacht auf Password Spraying: UNKNOWN-PC ist mit 8 Konten gescheitert. Rechner und Ursache klären.</p></div><div class="risk warn"><div class="rh">Sichtbarkeit<span class="lv">beobachten</span></div><p>Das Bild ist unvollständig: 2 Maschinen mit abgeschaltetem Auditing, 130 Rechner nutzen NTLM ohne Agent.</p></div><div class="risk warn"><div class="rh">Relay-Angriffe<span class="lv">beobachten</span></div><p>105 Sitzungen ohne MIC-Schutz oder Channel Binding – über NTLM-Relay angreifbar.</p></div></div></section><section class=""><div class="sh"><span class="no">04</span><h2>Nächste Schritte</h2><p>Aus den Daten abgeleitet, wichtigste zuerst.</p></div><ol class="steps"><li><b>NTLMv1 abstellen</b> bei svc_scan, mfp_service, t.hoffmann und 7 weitere. Auf den Rechnern dahinter LmCompatibilityLevel 5 setzen und Geräte, die nur NTLMv1 können, ersetzen oder isolieren.</li><li><b>Vor Oktober 2026</b> die 2 Konten mit NTLMv1-abgeleiteten Anmeldedaten umstellen – sonst fallen sie mit der Umstellung aus.</li><li><b>Password Spraying prüfen:</b> UNKNOWN-PC ist mit 8 Konten gescheitert.</li><li><b>Häufigste Ursache angehen:</b> Anwendung ruft NTLM direkt auf (48×). Anwendung auf Negotiate umstellen – sonst Hersteller fragen.</li><li><b>„Restrict NTLM: Deny“ setzen</b> auf 2 Maschinen, die seit 30 Tagen kein NTLM mehr nutzen: SRV-PRINT, WKS-0107.</li><li><b>Größter offener Posten:</b> svchost.exe → ldap/dc01.demo.nopcap.net mit 80 Anmeldungen im Zeitraum.</li></ol></section><section class="flow pb"><div class="sh"><span class="no">05</span><h2>Was noch offen ist</h2><p>Die größten Posten nach Anzahl Anmeldungen im Zeitraum.</p></div><div class="two"><div><table><caption>Programme, die NTLM senden</caption><thead><tr><th>Programm → Ziel</th><th class="n">Anmeld.</th></tr></thead><tbody><tr><td class="nm">System<span class="tag st-in_progress">in Arbeit</span><span class="sub">→ cifs/fs01.demo.nopcap.net</span></td><td class="n">136</td></tr><tr><td class="nm">svchost.exe<span class="tag st-open">offen</span><span class="sub">→ ldap/dc01.demo.nopcap.net</span></td><td class="n">80</td></tr><tr><td class="nm">msedge.exe<span class="tag st-in_progress">in Arbeit</span><span class="sub">→ HTTP/intranet</span></td><td class="n">59</td></tr><tr><td class="nm">mmc.exe<span class="tag st-open">offen</span><span class="sub">→ cifs/10.14.22.31</span></td><td class="n">49</td></tr><tr><td class="nm">Veeam.Backup.Service.exe<span class="tag st-in_progress">in Arbeit</span><span class="sub">→ cifs/nas01</span></td><td class="n">44</td></tr><tr><td class="nm">powershell.exe<span class="tag st-open">offen</span><span class="sub">→ cifs/10.14.22.31</span></td><td class="n">31</td></tr><tr><td class="nm">robocopy.exe<span class="tag st-in_progress">in Arbeit</span><span class="sub">→ cifs/archive01</span></td><td class="n">27</td></tr><tr><td class="nm">EXCEL.EXE<span class="tag st-open">offen</span><span class="sub">→ cifs/fs01.demo.nopcap.net</span></td><td class="n">25</td></tr><tr><td class="nm">java.exe<span class="tag st-open">offen</span><span class="sub">→ HTTP/erp-test</span></td><td class="n">21</td></tr><tr><td class="nm">wsmprovhost.exe<span class="tag st-open">offen</span><span class="sub">→ HOST/app03</span></td><td class="n">21</td></tr><tr><td class="nm">explorer.exe<span class="tag st-open">offen</span><span class="sub">→ nas01</span></td><td class="n">15</td></tr><tr><td class="nm">excel.exe<span class="tag st-open">offen</span><span class="sub">→ cifs/archive01</span></td><td class="n">1</td></tr><tr><td class="nm">spoolsv.exe<span class="tag st-open">offen</span><span class="sub">→ cifs/fs01</span></td><td class="n">1</td></tr></tbody></table></div><div><table><caption>Konten, die NTLM nutzen</caption><thead><tr><th>Konto</th><th class="n">Anmeld.</th></tr></thead><tbody><tr><td class="nm">svc_backup<span class="sub">von 37 Rechnern zu 10 Servern</span></td><td class="n">112</td></tr><tr><td class="nm">p.neumann<span class="sub">von 44 Rechnern zu 10 Servern</span></td><td class="n">93</td></tr><tr><td class="nm">a.klein<span class="sub">von 52 Rechnern zu 10 Servern</span></td><td class="n">92</td></tr><tr><td class="nm">d.fischer<span class="sub">von 46 Rechnern zu 10 Servern</span></td><td class="n">92</td></tr><tr><td class="nm">m.becker<span class="sub">von 42 Rechnern zu 10 Servern</span></td><td class="n">90</td></tr><tr><td class="nm">svc_web<span class="sub">von 32 Rechnern zu 10 Servern</span></td><td class="n">86</td></tr><tr><td class="nm">t.hoffmann<span class="tag v1">NTLMv1</span><span class="sub">von 47 Rechnern zu 10 Servern</span></td><td class="n">86</td></tr><tr><td class="nm">svc_monitor<span class="sub">von 27 Rechnern zu 10 Servern</span></td><td class="n">84</td></tr><tr><td class="nm">s.wagner<span class="sub">von 42 Rechnern zu 10 Servern</span></td><td class="n">81</td></tr><tr><td class="nm">administrator<span class="sub">von 39 Rechnern zu 10 Servern</span></td><td class="n">77</td></tr><tr><td class="nm">svc_sql<span class="sub">von 22 Rechnern zu 10 Servern</span></td><td class="n">72</td></tr><tr><td class="nm">j.schulz<span class="sub">von 36 Rechnern zu 10 Servern</span></td><td class="n">67</td></tr><tr><td class="nm">k.lorenz<span class="sub">von 44 Rechnern zu 10 Servern</span></td><td class="n">63</td></tr><tr><td class="nm">svc_scan<span class="tag v1">NTLMv1</span><span class="sub">von 4 Rechnern zu 3 Servern</span></td><td class="n">37</td></tr><tr><td class="nm">mfp_service<span class="tag v1">NTLMv1</span><span class="sub">von 3 Rechnern zu 2 Servern</span></td><td class="n">19</td></tr></tbody></table></div></div></section><div class="method"><b>So wird gezählt.</b> Grundlage sind die NTLM- und Anmeldeereignisse der Agenten und Domänencontroller. Dieselbe Anmeldung wird oft mehrfach gesehen – vom Client, vom Server und vom DC; sie zählt einmal. 8001-Einträge ohne Bestätigung durch einen DC zählen nicht. Der NTLM-Anteil ist NTLM geteilt durch NTLM plus Kerberos-Tickets. Fehlgeschlagene Anmeldungen zählen nicht zum Anteil.</div><div class="foot"><span>NTLM-Analyzer · 24.09.2026, 23:18</span><span>90 Tage</span></div></main></body></html>

@@ -24,7 +24,7 @@ use std::collections::HashMap;
 pub struct RawEvent {
     pub record_id: i64,
     pub event_id: i64,
-    pub time: String, // ISO, auf Sekunden gekuerzt (YYYY-MM-DDTHH:MM:SS)
+    pub time: String, // ISO, truncated to seconds (YYYY-MM-DDTHH:MM:SS)
     pub named: HashMap<String, String>,
     pub positional: Vec<String>,
     /// Rendered message text (only populated with /f:RenderedXml). Used for the
@@ -35,7 +35,7 @@ pub struct RawEvent {
 
 /// Collects all new events of a log (with an internal drain loop so that even
 /// large backlogs are caught up within a single cycle).
-/// Rueckgabe: (Events, hoechste tatsaechlich gelesene RecordID).
+/// Returns: (events, highest RecordID actually read).
 pub fn collect(
     log: &str,
     id_clause: &str,
@@ -103,7 +103,7 @@ fn run_wevtutil(log: &str, xpath: &str, count: u32, rendered: bool) -> Result<St
         .arg("/rd:false")
         .arg("/e:Events")
         .output()
-        .map_err(|e| format!("wevtutil-Start: {e}"))?;
+        .map_err(|e| format!("wevtutil start: {e}"))?;
 
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr);
@@ -117,9 +117,9 @@ fn run_wevtutil(log: &str, xpath: &str, count: u32, rendered: bool) -> Result<St
 }
 
 /// wevtutil usually returns UTF-8, but depending on system/locale also UTF-16.
-/// Anhand des Byte-Order-Marks bzw. des ersten Zeichens '<' robust dekodieren,
+/// Decode robustly based on the byte-order mark or the first character '<',
 /// so that parsing does not fail because of the encoding.
-fn decode_output(bytes: &[u8]) -> String {
+pub(crate) fn decode_output(bytes: &[u8]) -> String {
     if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
         return String::from_utf8_lossy(&bytes[3..]).into_owned(); // UTF-8 with BOM
     }

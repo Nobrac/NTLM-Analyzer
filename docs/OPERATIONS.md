@@ -51,7 +51,9 @@ One agent runs per machine — on domain controllers and member machines alike.
 
 | Event | Where | What it contributes |
 | --- | --- | --- |
-| **4624** | DCs (Security log) | NTLM logons with **v1/v2 distinction** via `LmPackageName` — which also catches **Negotiate→NTLM fallbacks** that a filter on `AuthenticationPackageName='NTLM'` would miss. Each event carries `auth_method = Direct \| Fallback`. |
+| **4624** | all machines (Security log) | NTLM logons with **v1/v2 distinction** via `LmPackageName` — which also catches **Negotiate→NTLM fallbacks** that a filter on `AuthenticationPackageName='NTLM'` would miss. Each event carries `auth_method = Direct \| Fallback`. Before Server 2025 this is the only place a member server records which version a logon used: the collector hands that version to the 8003 on the server, the 8004 on the DC and the 8001 on the client of the same logon, so NTLMv1 shows up at the server, in the domain view and at the client program. Where the server has an 8003 for the logon, the 4624 is not counted a second time. |
+| **4625** | all machines (Security log) | **Failed NTLM logons** on the machine that was logged on to: account, source machine and IP, logon type, calling process and the NT status (`SubStatus` when `Status` is the generic `0xC000006D`). Kept in their own table — they never count towards the NTLM share — and shown in the *Failed NTLM attempts* panel. Needs *Audit Logon* with **Failure**. |
+| **4776** | DCs (Security log) | **NTLM validation by the DC**, successful or not. Settles whether a client's 8001 really reached a DC (confirmed / phantom), lists clients that use NTLM but run no agent, and — with its status — the failed attempts seen at the DC. A failure seen by the server (4625) and the DC (4776) counts once. |
 | **8001** | all machines | **Outgoing** NTLM including the originating process — the "shutdown blocker" list. Requests handled in kernel mode (PID 4) are labeled `(Kernel: SMB/HTTP.sys)` — that covers file shares as well as WinRM, ADWS, SSRS and the Remote Desktop Gateway, none of which can be attributed to a single process. |
 | **8002** | all machines *(optional)* | **Incoming** NTLM that needs *no* domain controller to validate it — local accounts and loopback authentication. Carries the **calling process**, so it names the local service involved. |
 | **8003** | member servers *(optional)* | **Incoming** NTLM with a **domain account** (validated by a DC): remote account, client machine, logon type and the **process that was accessed** (e.g. `w3wp.exe`). Together with 8002 this answers "which service accepts NTLM". |
@@ -79,6 +81,11 @@ Watermarks are tracked per source and purpose, so only new events are transferre
 - Dark, technical design. No external chart libraries, so it works on hosts without internet access.
 - **Time-range filter** (24 h / 7 days / 30 days / all), applied server-side to every metric, table and the event list.
 - **Trend chart**: NTLM activity per day (per hour in the 24 h view), stacked by v1 / v2 / unversioned — the curve that has to reach zero.
+- **Status report** (*Report* in the header, `/report?range=30d&lang=de`): a printable page for management — NTLM share and its change against the period before, weekly trend, work-list progress, machines ready to switch off, risks rated act/watch/fine, next steps derived from the data, and the largest remaining programs and accounts. 7, 30 or 90 days, German or English; the browser saves it as PDF.
+- **Accounts using NTLM** and an **account detail** view: per account its NTLM logons with v1/v2, from which machines, to which servers, with which programs, its failed attempts and whether it already uses Kerberos. The same logon is often seen by the client (8001), the server (8003) and the DC (8004) — per account and server the side that saw the most counts, never the sum. **Anonymous logons** (null sessions) are listed as such; Windows labels them "NTLM V1", which is ignored because they carry no credential.
+- **Failed NTLM attempts**: 4625 from the servers and failed 4776 from the DCs, merged per account and source machine. The reason is spelled out (wrong password, no such account, locked out, expired, …); **password spraying** is flagged when one machine fails with five or more accounts. The panel also says on how many machines *Audit Logon: Failure* is off.
+- **Auditing gaps are named**: a machine with outgoing, incoming or (on a DC) domain NTLM auditing off gets a red or amber badge in the machine list, and the panel says how many are affected — an empty list there is never read as "no NTLM".
+- **Complete lists**: panels receive up to 500 rows and fold to ten with *show all*; the jump bar says "500+" when that cap is reached.
 - **Work lists with status**: blocker and domain entries can be set to *open / in progress / done* (persisted). If a "done" entry produces new events, a red **"active again"** badge appears automatically.
 - **Credential Guard blind spot**: on machines with Credential Guard (default on Server 2025 / Windows 11 24H2) blocked NTLM attempts bypass the normal audit events entirely. Events 4013/4014 are collected so those machines show *what was attempted and refused* instead of an empty — and misleading — findings list.
 - **Timing heatmap**: weekday against hour of day. Batch jobs, maintenance windows and weekend scripts are the stragglers that break a shutdown — as single numbers they hide in the daily trend, as a pattern they stand out. The busiest slot is named below the grid.
@@ -148,7 +155,8 @@ The agent only reads events that Windows actually writes. Enable the following v
 
 | Category → Subcategory | Value | Produces |
 | --- | --- | --- |
-| Logon/Logoff → **Audit Logon** | `Success` | **Event 4624** — the only source of the NTLMv1/v2 distinction and of Kerberos-fallback detection |
+| Logon/Logoff → **Audit Logon** | `Success and Failure` | **Event 4624** — before Server 2025 the only source of the NTLMv1/v2 distinction, and of Kerberos-fallback detection. Needed on **DCs and member servers**: on a server it records which version each logon to it used. **Failure** adds **event 4625**, the failed NTLM logons on that machine (without it, they only show up when a DC checks them). Success is on by default on Windows Server — check that no GPO turns it off. |
+| Account Logon → **Audit Credential Validation** *(DCs)* | `Success and Failure` | **Event 4776** — every NTLM validation at the DC, including failed ones. On by default on domain controllers. |
 | Account Logon → **Audit Kerberos Service Ticket Operations** *(optional)* | `Success and Failure` | **Event 4769** — successes show Kerberos services and accounts ("the safe side"); **failures feed the *Why NTLM?* panel** with the cause (e.g. `0x7` = SPN not found) on systems without the 40xx events |
 
 #### Applying and verifying
@@ -162,7 +170,7 @@ The two Protected Users / authentication policy channels (events 100, 101, 301) 
 
 The enhanced 40xx auditing (Windows 11 24H2 / Server 2025) is **enabled by default** — no additional GPO is required. If it has been disabled centrally, the switches live under `Computer Configuration → Policies → Administrative Templates → System → NTLM → NTLM Enhanced Logging` (clients/servers) and `… → System → Netlogon → Log Enhanced Domain-wide NTLM Logs` (domain controllers). Both require the current ADMX templates in your central store.
 
-`auditpol` must report **Success** for the Logon subcategory. In the dashboard, the **Machines & auditing status** panel turns its audit badges green as soon as each agent reports in — use it to confirm the policy actually landed on every machine.
+`auditpol` must report **Success and Failure** for the Logon subcategory. In the dashboard, the **Machines & auditing status** panel turns its audit badges green as soon as each agent reports in — use it to confirm the policy actually landed on every machine.
 
 ### Collector (central server)
 

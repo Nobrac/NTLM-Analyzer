@@ -39,12 +39,14 @@ import hmac
 import io
 import json
 import os
+import re
 import secrets
 import sqlite3
 import ssl
 import threading
 import time
-from datetime import datetime, timedelta, timezone, timezone
+from datetime import datetime, timedelta, timezone
+from html import escape as _h
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -61,7 +63,7 @@ LOGIN_LOCK_SECS = 300                 # ... lock this IP for 5 minutes
 
 # ---- Auth / sessions (browser pages / and /api/data only) ------------------
 SESSION_COOKIE = "ntlm_session"
-SESSION_TTL = 12 * 60 * 60          # 12 Stunden
+SESSION_TTL = 12 * 60 * 60          # 12 hours
 SESSIONS_LOCK = threading.Lock()
 
 
@@ -75,7 +77,7 @@ def utc_now():
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 def hash_password(password, salt=None):
-    """PBKDF2-HMAC-SHA256. Gibt (salt, derived_key) zurueck."""
+    """PBKDF2-HMAC-SHA256. Returns (salt, derived_key)."""
     if salt is None:
         salt = secrets.token_bytes(16)
     dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 200_000)
@@ -98,8 +100,8 @@ CREATE TABLE IF NOT EXISTS events (
     workstation   TEXT,
     ip            TEXT,
     logon_type    TEXT,
-    enc_type      TEXT,            -- Kerberos-Verschluesselung, z. B. AES256 / RC4
-    auth_method   TEXT,            -- 'Direct' (App nutzt NTLM) | 'Fallback' (Kerberos scheiterte)
+    enc_type      TEXT,            -- Kerberos encryption, e.g. AES256 / RC4
+    auth_method   TEXT,            -- 'Direct' (the app uses NTLM) | 'Fallback' (Kerberos failed)
     received_at   TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ux_dedup ON events(source, log, record_id);
@@ -110,22 +112,24 @@ CREATE TABLE IF NOT EXISTS agents (
     source          TEXT PRIMARY KEY,
     is_dc           INTEGER,
     agent_version   TEXT,
-    outgoing_audit  TEXT,          -- aus/audit/deny/unknown
+    outgoing_audit  TEXT,          -- off/audit/deny/unknown
     incoming_audit  TEXT,
-    domain_audit    TEXT,          -- nur DC
-    lm_level        TEXT,          -- LmCompatibilityLevel: welche NTLM-Versionen erlaubt sind
+    domain_audit    TEXT,          -- DC only: on/off
+    logon_audit     TEXT,          -- "Audit Logon" (4624): success/failure/success_failure/none/unknown
+    lm_level        TEXT,          -- LmCompatibilityLevel: which NTLM versions are allowed
     block_v1sso     TEXT,          -- BlockNtlmv1SSO: audit/enforce/unset
-    cred_guard      TEXT,          -- Credential Guard: on/off/unknown (aus der Registry)
-    ntlm_log_kb     TEXT,          -- Maximalgröße des NTLM/Operational-Logs in KB
-    os_version      TEXT,          -- Produktname + Build der meldenden Maschine
-    restrict_out    TEXT,          -- Deny-Richtlinien: allow/deny-accounts/deny-all
+    cred_guard      TEXT,          -- Credential Guard: on/off/unknown (from the registry)
+    ntlm_log_kb     TEXT,          -- maximum size of the NTLM/Operational log in KB
+    os_version      TEXT,          -- product name + build of the reporting machine
+    restrict_out    TEXT,          -- Deny policies: allow/deny-accounts/deny-all
     restrict_in     TEXT,
     restrict_dom    TEXT,
-    exc_client      TEXT,          -- bereits konfigurierte GPO-Ausnahmelisten
+    exc_client      TEXT,          -- GPO exception lists already configured
     exc_dc          TEXT,
-    domain_level    TEXT,          -- msDS-Behavior-Version der Domaene (roh)
-    forest_level    TEXT,          -- msDS-Behavior-Version der Gesamtstruktur
-    last_seen       TEXT
+    domain_level    TEXT,          -- msDS-Behavior-Version of the domain (raw)
+    forest_level    TEXT,          -- msDS-Behavior-Version of the forest
+    last_seen       TEXT,
+    first_seen      TEXT           -- first status ever received; start of observation
 );
 
 -- 4776 from the domain controllers: reference data only, never an event of its
@@ -146,25 +150,45 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_dcval ON dc_validations(dc, record_id);
 CREATE INDEX IF NOT EXISTS ix_dcval_user ON dc_validations(user_key, event_time);
 CREATE INDEX IF NOT EXISTS ix_dcval_ws ON dc_validations(workstation, user_key, event_time);
 CREATE INDEX IF NOT EXISTS ix_dcval_dc ON dc_validations(dc, event_time);
+-- Failed NTLM logons (4625) on the machine that was logged on to. Kept apart
+-- from events like the 4776 above: a failure is an attempt, not NTLM in use,
+-- and one password spray must not bend the NTLM share or the trend.
+CREATE TABLE IF NOT EXISTS ntlm_failures (
+    source       TEXT NOT NULL,
+    record_id    INTEGER,
+    event_time   TEXT NOT NULL,
+    user         TEXT,
+    user_key     TEXT,
+    domain       TEXT,
+    workstation  TEXT,
+    ip           TEXT,
+    logon_type   TEXT,
+    process      TEXT,
+    status       TEXT,
+    ntlm_version TEXT,
+    received_at  TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_fail ON ntlm_failures(source, record_id);
+CREATE INDEX IF NOT EXISTS ix_fail_time ON ntlm_failures(event_time);
+CREATE INDEX IF NOT EXISTS ix_fail_user ON ntlm_failures(user_key, event_time);
 """
 
-# Kerberos-Fehlercodes aus fehlgeschlagenen 4769-Anfragen: auf Systemen ohne
-# die 40xx-Ereignisse (2016/2019/2022) die einzige Fruehwarnung fuer die
-# Ursachen hinter NTLM-Fallback. Kategorie -> dieselben Abhilfe-Texte wie beim
-# Why-panel; unknown codes pass through as "unclear" with the raw code.
+# Kerberos failure codes from failed 4769 requests: on systems without the
+# 40xx events (2016/2019/2022) the only early warning of the causes behind an
+# NTLM fallback. Category -> the same remedy texts as in the Why panel; unknown codes pass through as "unclear" with the raw code.
 KRB_FAIL = {
-    "0x6":  ("Kerberos: client account unknown", "unklar"),
+    "0x6":  ("Kerberos: client account unknown", "unclear"),
     "0x7":  ("Kerberos: SPN not found (service principal unknown)", "spn"),
     "0xe":  ("Kerberos: encryption type not supported", "etype"),
     "0x12": ("Kerberos: account disabled, expired or locked out", "acct"),
-    "0x1b": ("Kerberos: principal not allowed to delegate", "unklar"),
+    "0x1b": ("Kerberos: principal not allowed to delegate", "unclear"),
     "0x25": ("Kerberos: clock skew too great", "clock"),
 }
 
-# Usage-IDs des Client-Logs laut KB5064479. Jede Ursache hat eine eigene
-# Abhilfe - deshalb wird nach ihr gruppiert statt nur nach Programm.
+# Usage IDs of the client log per KB5064479. Each cause has its own remedy -
+# which is why findings are grouped by cause rather than only by program.
 REASON_IDS = {
-    "0":  ("Unknown reason", "unklar"),
+    "0":  ("Unknown reason", "unclear"),
     "1":  ("Application called NTLM directly", "app"),
     "2":  ("Local account logon", "local"),
     "4":  ("Cloud account logon", "cloud"),
@@ -220,18 +244,19 @@ def canonical_reason_id(reason, rid):
 
 
 def normalize_process(p):
-    """Vereinheitlicht Prozessnamen fuers Gruppieren: verschiedene Event-Quellen
-    liefern denselben Prozess mal mit, mal ohne Endung ("lsass" aus 8001,
-    "lsass.exe" aus 4020) - das ergab doppelte Zeilen in der Programmliste.
-    Konservativ: Klammer-Labels ("(Kernel: SMB/HTTP.sys)", "(PID 4)"), Werte
-    mit Punkt (haben schon eine Endung) und Platzhalter bleiben unangetastet."""
+    """Normalises process names for grouping: different event sources report
+    the same process sometimes with, sometimes without an extension ("lsass"
+    from 8001, "lsass.exe" from 4020) - which produced duplicate rows in the
+    program list. Conservative: bracketed labels ("(Kernel: SMB/HTTP.sys)",
+    "(PID 4)"), values with a dot (they already have an extension) and
+    placeholders are left untouched."""
     if not p:
         return p
     v = p.strip()
     if not v or v == "-" or v.startswith("(") or "." in v:
         return p
-    # Pseudo-Namen sind Konten, keine Programme ("SYSTEM" aus 8002-Loopback);
-    # echte Prozessnamen ohne Endung enthalten auch nie Leerzeichen.
+    # Pseudo names are accounts, not programs ("SYSTEM" from 8002 loopback);
+    # real process names without an extension never contain spaces either.
     if " " in v or v.lower() in ("system", "anonymous logon"):
         return p
     return v + ".exe"
@@ -328,6 +353,26 @@ JUDGEABLE = (
     "AND UPPER(events.domain) NOT IN ('NT AUTHORITY', 'WORKGROUP', '.', '(NULL)', '-'))")
 
 UNCONFIRMED = f"({UNCONFIRMED_RAW} AND NOT {DCV_EXACT})"
+
+# ---- 4624 on member servers ------------------------------------------------
+# The classic NTLM events carry no version; a member server's 4624 does. The
+# same logon is usually also its 8003 (or 8002/4022), which keeps the service
+# that accepted it. So the 4624 hides behind that partner and hands it the
+# version (see enrich_versions); without a partner - incoming audit off - the
+# 4624 itself is the incoming event. Matched per logon: same machine, same
+# account, same client (when both name one), within ten seconds.
+ukey_of = lambda col: _UKEY.replace("events.user", col)
+_SUP_4624 = (
+    "(event_id = 4624 AND kind = 'incoming' AND EXISTS (SELECT 1 FROM events p "
+    "WHERE p.event_id IN (8002, 8003, 4022, 4023) AND p.source = events.source "
+    "AND p.event_time BETWEEN strftime('%Y-%m-%dT%H:%M:%S', events.event_time, '-10 seconds') "
+    "AND strftime('%Y-%m-%dT%H:%M:%S', events.event_time, '+10 seconds') "
+    f"AND {ukey_of('p.user')} = {_UKEY} "
+    "AND (p.workstation IS NULL OR events.workstation IS NULL "
+    "OR UPPER(p.workstation) = UPPER(events.workstation))))")
+NOT_SUPERSEDED = f"NOT ({NOT_SUPERSEDED[len('NOT '):]} OR {_SUP_4624})"
+# Every query that sets duplicates aside looks at both kinds of twin.
+_TWIN_IDS = "event_id IN (8001, 4624)"
 PHANTOM = f"({UNCONFIRMED} AND {JUDGEABLE} AND {DC_COVERED} AND NOT {DCV_USER})"
 
 
@@ -341,27 +386,478 @@ def user_key(u):
     return u.upper() or None
 
 
+# How many rows a list panel receives. Panels show ten and fold the rest
+# behind "show all"; the cap only guards the page against a pathological
+# domain. The jump bar says "500+" when it is reached.
+PANEL_LIMIT = 500
+
+
+# Work status of a program/domain row. Earlier versions stored German words;
+# they are translated when read from a request and rewritten once in the
+# database at start-up (see init_db).
+LEGACY_STATUS = {"offen": "open", "arbeit": "in_progress", "erledigt": "done"}
+# Audit state from agents before 2.3 ("aus" = off, "an" = on).
+LEGACY_AUDIT = {"aus": "off", "an": "on"}
+
+
+# ---- Ready to switch off -----------------------------------------------------
+# Per machine and direction: can "Restrict NTLM ... Deny" be set there now?
+#   ready   - auditing on, watched for the full 30 days, no counted NTLM in them
+#   busy    - NTLM seen in the last 30 days (with who/what would break)
+#   active  - already denied
+#   young / noaudit / stale - not enough to say either way
+# 30 days so a monthly job (payroll, month-end close) has had its chance to run -
+# and all 30 must have been watched: 20 quiet days of a machine seen for 20 days
+# say nothing about the job that runs on the 25th.
+# Incoming evidence comes from three sides, so a server with its own auditing
+# off still shows up when other machines or the DCs saw NTLM going to it: the
+# machine's own incoming events, the DCs' domain view, and other machines'
+# outgoing events naming it as target. Duplicates and phantom 8001s are not
+# evidence. DCs get no incoming verdict: that is a domain-wide decision.
+READY_QUIET_DAYS = 30
+READY_MIN_OBS_DAYS = READY_QUIET_DAYS
+AGENT_STALE_DAYS = 2
+_ENHANCED_OS = re.compile(r"2600\d|2[6-9]\d{3}")   # Windows 11 24H2 / Server 2025 and later
+_TS = "%Y-%m-%dT%H:%M:%S"
+
+
+def host_key(target):
+    """'cifs/FS01.corp.local', 'ldap/dc1/corp@REALM', 'FS01:445' -> 'FS01'."""
+    if not target:
+        return None
+    t = str(target).strip()
+    if "/" in t:
+        t = t.split("/", 2)[1]
+    t = t.split("@")[0].split(":")[0].strip("\\ ")
+    if not t:
+        return None
+    if t.replace(".", "").isdigit():
+        return t                       # an IP address stays as it is
+    return t.split(".")[0].upper()[:15] or None
+
+
+def _ts(v):
+    try:
+        return datetime.strptime(str(v)[:19], _TS)
+    except (TypeError, ValueError):
+        return None
+
+
+# ---- Carrying the version across one logon ---------------------------------
+# One NTLM logon to a member server can leave four traces: 8001 on the client,
+# 8003 (or 8002/4022) and 4624 on the server, 8004 on the DC. Only the 4624 -
+# and the enhanced 40xx events - say which version was used. When a batch
+# arrives, each new 4624 hands its version to the traces of the same logon
+# that lack one, and each new version-less trace looks for a 4624 to take it
+# from: whichever arrives first. Same account and client, within ten seconds
+# on the same machine and two minutes across machines (clock skew between
+# domain members is small, Kerberos itself tolerates five). Nothing is
+# counted differently by this - the traces just stop saying "unknown version".
+_LOCAL_TWINS = (8002, 8003, 4022, 4023)
+_DC_TWINS = (8004, 8005, 8006)
+
+
+def enrich_versions(conn, source, received_at):
+    def window(t, sec):
+        d = _ts(t)
+        return ((d - timedelta(seconds=sec)).strftime(_TS), (d + timedelta(seconds=sec)).strftime(_TS)) if d else (None, None)
+    uk = ukey_of("user")
+    fresh = conn.execute("SELECT id, event_id, kind, event_time, user, workstation, target_server, ntlm_version "
+                         "FROM events WHERE source = ? AND received_at = ?", (source, received_at)).fetchall()
+    me = (source or "").upper()[:15]
+    for eid_, event_id, kind, t, user, ws, tgt, ver in fresh:
+        ukey = user_key(user)
+        if not ukey or not t:
+            continue
+        wsu = (ws or "").strip().lstrip("\\").upper() or None
+        if event_id == 4624 and kind == "incoming" and ver:
+            lo, hi = window(t, 10)
+            conn.execute(f"UPDATE events SET ntlm_version = ? WHERE ntlm_version IS NULL AND source = ? "
+                         f"AND event_id IN {_LOCAL_TWINS} AND event_time BETWEEN ? AND ? AND {uk} = ? "
+                         "AND (workstation IS NULL OR ? IS NULL OR UPPER(workstation) = ?)",
+                         (ver, source, lo, hi, ukey, wsu, wsu))
+            lo, hi = window(t, 120)
+            if wsu:
+                for oid, otgt in conn.execute(
+                        f"SELECT id, target_server FROM events WHERE ntlm_version IS NULL AND event_id IN {_DC_TWINS} "
+                        f"AND event_time BETWEEN ? AND ? AND {uk} = ? AND UPPER(workstation) = ?",
+                        (lo, hi, ukey, wsu)).fetchall():
+                    if host_key(otgt) == me:
+                        conn.execute("UPDATE events SET ntlm_version = ? WHERE id = ?", (ver, oid))
+                for oid, otgt in conn.execute(
+                        f"SELECT id, target_server FROM events WHERE ntlm_version IS NULL AND event_id = 8001 "
+                        f"AND UPPER(source) = ? AND event_time BETWEEN ? AND ? AND {uk} = ?",
+                        (wsu, lo, hi, ukey)).fetchall():
+                    if host_key(otgt) == me:
+                        conn.execute("UPDATE events SET ntlm_version = ? WHERE id = ?", (ver, oid))
+        elif not ver and event_id in _LOCAL_TWINS:
+            lo, hi = window(t, 10)
+            got = conn.execute(f"SELECT ntlm_version FROM events WHERE source = ? AND event_id = 4624 "
+                               f"AND ntlm_version IS NOT NULL AND event_time BETWEEN ? AND ? AND {uk} = ? "
+                               "AND (workstation IS NULL OR ? IS NULL OR UPPER(workstation) = ?) LIMIT 1",
+                               (source, lo, hi, ukey, wsu, wsu)).fetchone()
+            if got:
+                conn.execute("UPDATE events SET ntlm_version = ? WHERE id = ?", (got[0], eid_))
+        elif not ver and (event_id in _DC_TWINS or event_id == 8001):
+            server = host_key(tgt)
+            client = wsu if event_id in _DC_TWINS else me
+            if not server or not client:
+                continue
+            lo, hi = window(t, 120)
+            got = conn.execute(f"SELECT ntlm_version FROM events WHERE UPPER(source) = ? AND event_id = 4624 "
+                               f"AND ntlm_version IS NOT NULL AND event_time BETWEEN ? AND ? AND {uk} = ? "
+                               "AND UPPER(workstation) = ? LIMIT 1",
+                               (server, lo, hi, ukey, client)).fetchone()
+            if got:
+                conn.execute("UPDATE events SET ntlm_version = ? WHERE id = ?", (got[0], eid_))
+
+
+def compute_readiness(c):
+    now = utc_now()
+    win = (now - timedelta(days=READY_QUIET_DAYS)).strftime(_TS)
+    # 8001s that are duplicates, unconfirmed or phantoms are no evidence.
+    c.execute("CREATE TEMP TABLE IF NOT EXISTS x_rdy (id INTEGER PRIMARY KEY)")
+    c.execute("DELETE FROM temp.x_rdy")
+    c.execute(f"INSERT INTO x_rdy (id) SELECT id FROM events WHERE {_TWIN_IDS} "
+              f"AND event_time >= ? AND (NOT ({NOT_SUPERSEDED}) OR {UNCONFIRMED})", (win,))
+    counted = "id NOT IN (SELECT id FROM temp.x_rdy)"
+
+    def bump(d, key, item, n, last):
+        e = d.setdefault(key, {"n": 0, "last": None, "items": {}})
+        e["n"] += n
+        if last and (not e["last"] or last > e["last"]):
+            e["last"] = last
+        e["items"][item] = e["items"].get(item, 0) + n
+
+    out, inc = {}, {}
+    for src, proc, tgt, user, n, last in c.execute(
+            "SELECT source, process, target_server, user, COUNT(*), MAX(event_time) FROM events "
+            f"WHERE kind = 'outgoing' AND event_time >= ? AND {counted} "
+            "GROUP BY source, process, target_server, user", (win,)):
+        bump(out, (src or "").upper()[:15], (proc or "", tgt or ""), n, last)
+        h = host_key(tgt)
+        if h:
+            bump(inc, h, (user or "", (src or "").upper()), n, last)
+    for src, user, ws, n, last in c.execute(
+            "SELECT source, user, workstation, COUNT(*), MAX(event_time) FROM events "
+            f"WHERE kind = 'incoming' AND event_time >= ? AND {counted} GROUP BY source, user, workstation", (win,)):
+        bump(inc, (src or "").upper()[:15], (user or "", (ws or "").upper()), n, last)
+    for tgt, user, ws, n, last in c.execute(
+            "SELECT target_server, user, workstation, COUNT(*), MAX(event_time) FROM events "
+            "WHERE kind = 'domain' AND event_time >= ? GROUP BY target_server, user, workstation", (win,)):
+        h = host_key(tgt)
+        if h:
+            bump(inc, h, (user or "", (ws or "").upper()), n, last)
+    # Last NTLM before the window, so a ready machine can say since when it is quiet.
+    before = {(s or "").upper()[:15]: t for s, t in c.execute(
+        "SELECT source, MAX(event_time) FROM events WHERE kind = 'outgoing' AND event_time < ? "
+        "GROUP BY source", (win,))}
+
+    rows = []
+    for (src, is_dc, oa, ia, r_in, osv, last_seen, first_seen, first_ev) in c.execute(
+            "SELECT a.source, a.is_dc, a.outgoing_audit, a.incoming_audit, a.restrict_in, "
+            "a.os_version, a.last_seen, a.first_seen, "
+            "(SELECT MIN(event_time) FROM events e WHERE e.source = a.source) FROM agents a"):
+        key = (src or "").upper()[:15]
+        starts = [t for t in (_ts(first_seen), _ts(first_ev)) if t]
+        obs = (now - min(starts)).days if starts else 0
+        seen = _ts(last_seen)
+        stale = not seen or (now - seen).days >= AGENT_STALE_DAYS
+        enhanced = bool(_ENHANCED_OS.search(osv or ""))
+
+        def verdict(direction):
+            if direction == "in" and is_dc:
+                return {"st": "dc"}
+            ev = (out if direction == "out" else inc).get(key)
+            denied = (oa == "deny") if direction == "out" else (r_in in ("deny-accounts", "deny-all"))
+            audit = (oa in ("audit", "deny") if direction == "out" else ia == "audit") or enhanced
+            if denied:
+                return {"st": "active"}
+            if ev and ev["n"]:
+                top = sorted(ev["items"].items(), key=lambda kv: -kv[1])[:3]
+                return {"st": "busy", "n": ev["n"], "last": ev["last"], "who": len(ev["items"]),
+                        "top": [[a, b, k] for (a, b), k in top]}
+            if stale:
+                return {"st": "stale"}
+            if not audit:
+                return {"st": "noaudit"}
+            if obs < READY_MIN_OBS_DAYS:
+                return {"st": "young", "d": obs}
+            return {"st": "ready", "d": min(obs, READY_QUIET_DAYS) if not before.get(key) or direction == "in"
+                    else (now - _ts(before[key])).days,
+                    "since": before.get(key) if direction == "out" else None}
+
+        rows.append({"machine": src, "is_dc": bool(is_dc), "obs": obs,
+                     "out": verdict("out"), "in": verdict("in")})
+
+    order = {"ready": 0, "busy": 1, "young": 2, "noaudit": 3, "stale": 4, "active": 5, "dc": 6}
+    rows.sort(key=lambda r: (min(order[r["out"]["st"]], order[r["in"]["st"]]),
+                             r["out"].get("n", 0) + r["in"].get("n", 0), r["machine"] or ""))
+    return {"rows": rows, "quiet_days": READY_QUIET_DAYS, "min_obs": READY_MIN_OBS_DAYS,
+            "out_ready": sum(1 for r in rows if r["out"]["st"] == "ready"),
+            "in_ready": sum(1 for r in rows if r["in"]["st"] == "ready")}
+
+
+# Both panels are 30-day (or whole-range) verdicts and cost a second or more on a
+# busy domain, while the dashboard asks every minute. They are kept for five
+# minutes: whether a server has been quiet for 30 days does not change in five,
+# and it keeps the one-minute refresh cheap. A fresh collector start computes
+# them anew.
+_PANEL_CACHE = {}
+_PANEL_TTL = 300
+
+
+def cached(key, fn):
+    hit = _PANEL_CACHE.get(key)
+    if hit and time.time() - hit[0] < _PANEL_TTL:
+        return hit[1]
+    val = fn()
+    _PANEL_CACHE[key] = (time.time(), val)
+    return val
+
+
+# ---- Key figures: this week against the week before -------------------------
+# The tiles under the handover bar answer "are we getting better?": the last
+# seven days against the seven before, and a daily line for the last fourteen.
+# Counted exactly like the trend chart (same version buckets, duplicates and
+# unconfirmed 8001s left out), independent of the range picked above so the
+# comparison always means the same thing. Cached like the other two panels.
+def compute_kpi(c, tzoff, src):
+    now = utc_now()
+    w14 = (now - timedelta(days=14)).strftime(_TS)
+    w7 = (now - timedelta(days=7)).strftime(_TS)
+    sw, sp = (" AND source = ?", [src]) if src else ("", [])
+    c.execute("CREATE TEMP TABLE IF NOT EXISTS x_kpi (id INTEGER PRIMARY KEY)")
+    c.execute("DELETE FROM temp.x_kpi")
+    c.execute(f"INSERT INTO x_kpi (id) SELECT id FROM events WHERE {_TWIN_IDS} "
+              f"AND event_time >= ?{sw} AND (NOT ({NOT_SUPERSEDED}) OR {UNCONFIRMED})", [w14] + sp)
+    tzmod = f"{tzoff:+d} minutes"
+    rows = c.execute(
+        "SELECT substr(datetime(event_time, ?),1,10), CASE WHEN event_time >= ? THEN 1 ELSE 0 END, "
+        "SUM(CASE WHEN ntlm_version='NTLMv1' THEN 1 ELSE 0 END), "
+        "SUM(CASE WHEN ntlm_version='NTLMv2' THEN 1 ELSE 0 END), "
+        "SUM(CASE WHEN kind!='kerberos' AND ntlm_version IS NULL THEN 1 ELSE 0 END), "
+        "SUM(CASE WHEN kind='kerberos' THEN 1 ELSE 0 END) "
+        f"FROM events WHERE event_time >= ?{sw} AND id NOT IN (SELECT id FROM temp.x_kpi) "
+        "GROUP BY 1, 2", [tzmod, w7, w14] + sp).fetchall()
+    local_now = now + timedelta(minutes=tzoff)
+    days = [(local_now - timedelta(days=13 - i)).strftime("%Y-%m-%d") for i in range(14)]
+    per = {d: [0, 0, 0, 0] for d in days}
+    week = {1: [0, 0, 0, 0], 0: [0, 0, 0, 0]}
+    for b, cur, v1, v2, oth, krb in rows:
+        vals = [v1 or 0, v2 or 0, oth or 0, krb or 0]
+        if b in per:
+            per[b] = [a + x for a, x in zip(per[b], vals)]
+        week[cur] = [a + x for a, x in zip(week[cur], vals)]
+    def share(v):
+        n = v[0] + v[1] + v[2]
+        return round(100.0 * n / (n + v[3]), 1) if (n + v[3]) else None
+    fold = lambda v: {"v1": v[0], "v2": v[1], "ntlm": v[0] + v[1] + v[2], "krb": v[3], "share": share(v)}
+    return {"days": days, "v1": [per[d][0] for d in days], "v2": [per[d][1] for d in days],
+            "krb": [per[d][3] for d in days], "share": [share(per[d]) for d in days],
+            "cur": fold(week[1]), "prev": fold(week[0])}
+
+
+# ---- Failed NTLM attempts ------------------------------------------------------
+# Two sides see a failure: the machine logged on to (4625, with its agent) and
+# the DC that checked a domain account (4776 with a status). One failed logon to
+# a member server shows up on both, so each (account, client) pair counts with
+# the higher of the two numbers - never their sum - and says who saw it.
+def norm_status(v):
+    """NT status as one spelling: '0xc000006a' / '0xC000006A' -> '0xC000006A'; success -> None."""
+    t = str(v or "").strip()
+    if not t.lower().startswith("0x"):
+        return None
+    try:
+        n = int(t, 16)
+    except ValueError:
+        return None
+    return f"0x{n:08X}" if n else None
+
+
+SPRAY_MIN_ACCOUNTS = 5      # one client failing for this many accounts looks like spraying
+
+
+def compute_failures(c, cutoff, src):
+    tw, tp = ("AND event_time >= ? ", [cutoff]) if cutoff else ("", [])
+    pairs = {}
+
+    def add(ukey, user, client, status, n, last, via, target=None):
+        if not ukey:
+            return
+        k = (ukey, (client or "").upper())
+        e = pairs.setdefault(k, {"key": ukey, "user": user or ukey, "from": (client or "").upper(),
+                                 "to": set(), "codes": {}, "local": 0, "dc": 0, "last": None})
+        e[via] += n
+        if status:
+            e["codes"][status] = e["codes"].get(status, 0) + n
+        if target:
+            e["to"].add(target.upper())
+        if last and (not e["last"] or last > e["last"]):
+            e["last"] = last
+
+    sw, sp = (" AND (source = ? OR workstation = ?)", [src, (src or "").upper()]) if src else ("", [])
+    for source, user, ukey, ws, st, n, last in c.execute(
+            "SELECT source, MAX(user), user_key, workstation, status, COUNT(*), MAX(event_time) "
+            f"FROM ntlm_failures WHERE 1=1 {tw}{sw} GROUP BY source, user_key, workstation, status", tp + sp):
+        add(ukey, user, ws, st, n, last, "local", source)
+    dw, dp = (" AND workstation = ?", [(src or "").upper()]) if src else ("", [])
+    for ukey, ws, st, n, last in c.execute(
+            "SELECT user_key, workstation, status, COUNT(*), MAX(event_time) FROM dc_validations "
+            f"WHERE status IS NOT NULL AND status NOT IN ('0x0', '0x00000000') {tw}{dw} "
+            "GROUP BY user_key, workstation, status", tp + dp):
+        add(ukey, ukey, ws, norm_status(st), n, last, "dc")
+    rows = []
+    for e in pairs.values():
+        n = max(e["local"], e["dc"])
+        code = max(e["codes"].items(), key=lambda kv: kv[1])[0] if e["codes"] else None
+        rows.append({"key": e["key"], "user": e["user"], "from": e["from"], "to": sorted(e["to"])[:4],
+                     "code": code, "locked": "0xC0000234" in e["codes"], "n": n, "last": e["last"],
+                     "via": "both" if e["local"] and e["dc"] else ("local" if e["local"] else "dc")})
+    rows.sort(key=lambda r: (-r["n"], r["key"]))
+    by_client = {}
+    for r in rows:
+        if r["from"]:
+            b = by_client.setdefault(r["from"], {"accounts": set(), "n": 0})
+            b["accounts"].add(r["key"]); b["n"] += r["n"]
+    spray = sorted(([k, len(v["accounts"]), v["n"]] for k, v in by_client.items()
+                    if len(v["accounts"]) >= SPRAY_MIN_ACCOUNTS), key=lambda x: -x[1])
+    return {"rows": rows[:PANEL_LIMIT], "rows_all": rows, "total": len(rows), "n": sum(r["n"] for r in rows),
+            "accounts": len({r["key"] for r in rows}), "spray": spray[:10]}
+
+
+# ---- Accounts using NTLM --------------------------------------------------------
+# One row per account across every direction: what the machines send, what the
+# servers accept and what the DCs see. The same logon can be seen from several
+# sides, so these are sightings rather than logons; the panel says so. Failed
+# attempts and Kerberos use come from their own tables and sit alongside.
+NTLM_USE_KINDS = "('outgoing', 'incoming', 'domain', 'auth', 'ntlmv1sso')"
+
+
+def account_label(k):
+    if not k:
+        return ""
+    return k if k.endswith("$") or k == "ANONYMOUS LOGON" else k.lower()
+
+
+# One NTLM logon to a server can leave three traces with the same account: the
+# client's 8001, the server's 8003 and the DC's 8004. Per account and server
+# the side that saw most counts, never the sum - so "logons" means logons, and
+# server names are unified ("cifs/fs04.corp.local" and "FS04" are one server).
+_ACCT_COLS = ("SELECT {k} AS k, kind, UPPER(source), target_server, UPPER(workstation), "
+              "SUM(CASE WHEN ntlm_version = 'NTLMv1' THEN 1 ELSE 0 END), "
+              "SUM(CASE WHEN ntlm_version = 'NTLMv2' THEN 1 ELSE 0 END), COUNT(*), MAX(event_time) FROM events ")
+
+
+def acct_rollup(rows):
+    acc = {}
+    for k, kind, src, tgt, ws, v1, v2, n, last in rows:
+        if not k:
+            continue
+        a = acc.setdefault(k, {"sides": {}, "clients": set(), "targets": set(), "last": None})
+        host = (src or "")[:15] if kind in ("incoming", "auth") else (host_key(tgt) or "")
+        side = {"outgoing": "agent", "domain": "dc"}.get(kind, "server")
+        e = a["sides"].setdefault(host, {}).setdefault(side, [0, 0, 0])
+        e[0] += n; e[1] += v1 or 0; e[2] += v2 or 0
+        client = src if kind == "outgoing" else ws
+        if client:
+            a["clients"].add(client.lstrip("\\")[:15])
+        if host:
+            a["targets"].add(host)
+        if last and (not a["last"] or last > a["last"]):
+            a["last"] = last
+    out = {}
+    for k, a in acc.items():
+        n = v1 = v2 = 0
+        for sides in a["sides"].values():
+            best = max(sides.values(), key=lambda x: x[0])
+            n += best[0]; v1 += best[1]; v2 += best[2]
+        out[k] = {"n": n, "v1": v1, "v2": v2, "machines": len(a["clients"]),
+                  "targets": len(a["targets"]), "last": a["last"]}
+    return out
+
+
+def compute_accounts(c, tf, tp, failures):
+    rows = {}
+    agg = acct_rollup(c.execute(
+        _ACCT_COLS.format(k=_UKEY) +
+        f"WHERE kind IN {NTLM_USE_KINDS} AND user IS NOT NULL AND TRIM(user) NOT IN ('', '-') AND {tf} "
+        "GROUP BY 1, 2, 3, 4, 5", tp))
+    for k, a in agg.items():
+        rows[k] = dict(a, key=k, name=account_label(k), krb=0, failed=0)
+    for f in failures.get("rows_all", []):
+        r = rows.setdefault(f["key"], {"key": f["key"], "name": account_label(f["key"]), "n": 0, "v1": 0,
+                                       "v2": 0, "machines": 0, "targets": 0, "last": f["last"], "krb": 0, "failed": 0})
+        r["failed"] += f["n"]
+        if f["last"] and (not r["last"] or f["last"] > r["last"]):
+            r["last"] = f["last"]
+    if rows:
+        for k, n in c.execute(f"SELECT {_UKEY} AS k, COUNT(*) FROM events WHERE kind = 'kerberos' AND {tf} "
+                              "GROUP BY k", tp):
+            if k in rows:
+                rows[k]["krb"] = n
+    out = sorted(rows.values(), key=lambda r: (-(r["n"] + r["failed"]), r["key"]))
+    return {"rows": out[:PANEL_LIMIT], "total": len(out),
+            "v1": sum(1 for r in out if r["v1"]), "anon": any(r["key"] == "ANONYMOUS LOGON" for r in out)}
+
+
+# ---- Machines without an agent -------------------------------------------------
+# Every NTLM logon of a domain account is validated by a DC and logged as 4776
+# with the client's name. Any such client that has no agent is a machine the
+# dashboard otherwise never sees - often exactly the forgotten server.
+def compute_agentless(c, cutoff):
+    params, tw = [], ""
+    if cutoff:
+        tw = "AND event_time >= ? "
+        params.append(cutoff)
+    rows = []
+    for ws, n, users, last, names in c.execute(
+            "SELECT workstation, COUNT(*), COUNT(DISTINCT user_key), MAX(event_time), "
+            "GROUP_CONCAT(DISTINCT user_key) FROM dc_validations "
+            "WHERE workstation IS NOT NULL AND workstation NOT IN ('', '-', 'LOCALHOST', '::1', '127.0.0.1') "
+            f"{tw}AND workstation NOT IN (SELECT UPPER(source) FROM agents) "
+            "GROUP BY workstation ORDER BY COUNT(*) DESC LIMIT 100", params):
+        who = [u.lower() for u in (names or "").split(",") if u][:4]
+        rows.append({"machine": ws, "n": n, "users": users, "who": who, "last": last})
+    dcs = c.execute("SELECT COUNT(DISTINCT dc) FROM dc_validations").fetchone()[0]
+    total = c.execute(
+        "SELECT COUNT(DISTINCT workstation) FROM dc_validations "
+        "WHERE workstation IS NOT NULL AND workstation NOT IN ('', '-', 'LOCALHOST', '::1', '127.0.0.1') "
+        f"{tw}AND workstation NOT IN (SELECT UPPER(source) FROM agents)", params).fetchone()[0]
+    return {"rows": rows, "dcs": dcs, "total": total}
+
+
 def init_db(path):
     conn = sqlite3.connect(path, check_same_thread=False)
     conn.executescript(SCHEMA)
-    # Migration: fehlende Spalten in bestehenden DBs nachziehen
+    # Migration: add missing columns to existing databases
     have = {r[1] for r in conn.execute("PRAGMA table_info(events)").fetchall()}
-    # agents-Tabelle nachziehen (aeltere Installationen kennen lm_level nicht)
+    # Bring the agents table up to date (older installations lack lm_level)
     have_a = {r[1] for r in conn.execute("PRAGMA table_info(agents)")}
     for col in ("lm_level", "block_v1sso", "cred_guard", "ntlm_log_kb",
                 "os_version", "restrict_out", "restrict_in", "restrict_dom",
-                "exc_client", "exc_dc", "domain_level", "forest_level"):
+                "exc_client", "exc_dc", "domain_level", "forest_level", "logon_audit"):
         if have_a and col not in have_a:
             conn.execute(f"ALTER TABLE agents ADD COLUMN {col} TEXT")
-    # Bestandsdaten: Prozessnamen ohne Endung angleichen (einmalig wirksam,
-    # danach findet das WHERE nichts mehr). Dieselben Regeln wie beim Ingest.
+    # first_seen: when observation of a machine began. Older databases never
+    # recorded it; the earliest event from that machine is the best available
+    # stand-in, otherwise the moment of this upgrade - conservative on purpose,
+    # since "ready to switch off" must not be claimed for a machine nobody watched.
+    if have_a and "first_seen" not in have_a:
+        conn.execute("ALTER TABLE agents ADD COLUMN first_seen TEXT")
+        conn.execute(
+            "UPDATE agents SET first_seen = COALESCE("
+            "(SELECT MIN(event_time) FROM events e WHERE e.source = agents.source), "
+            "substr(last_seen, 1, 19))")
+    # Existing data: align process names without an extension (takes effect
+    # once; after that the WHERE finds nothing). Same rules as at ingest.
     conn.execute(
         "UPDATE events SET process = process || '.exe' "
         "WHERE process IS NOT NULL AND TRIM(process) != '' AND process != '-' "
         "AND process NOT LIKE '(%' AND process NOT LIKE '%.%' "
         "AND process NOT LIKE '% %' AND LOWER(process) != 'system'")
-    # Rueckbau: eine fruehere Version dieser Migration hat den Pseudo-Namen
-    # SYSTEM faelschlich zu SYSTEM.exe gemacht - es gibt keinen solchen Prozess.
+    # Undo: an earlier version of this migration wrongly turned the pseudo
+    # name SYSTEM into SYSTEM.exe - there is no such process.
     conn.execute("UPDATE events SET process = substr(process, 1, length(process)-4) "
                  "WHERE LOWER(process) = 'system.exe'")
     for col in ("enc_type", "auth_method", "reason", "reason_id", "mic", "epa",
@@ -380,14 +876,26 @@ def init_db(path):
     CREATE INDEX IF NOT EXISTS idx_ev_ver    ON events(ntlm_version, event_time);
     CREATE INDEX IF NOT EXISTS idx_ev_eid    ON events(event_id, event_time);
     CREATE INDEX IF NOT EXISTS idx_ev_source ON events(source);
+    CREATE INDEX IF NOT EXISTS idx_ev_src_eid ON events(source, event_id, event_time);
     -- Work status for blocker/domain entries (open = no row)
     CREATE TABLE IF NOT EXISTS item_status (
-        key        TEXT PRIMARY KEY,   -- 'proc|<prozess>|<ziel>' bzw. 'dom|<quelle>|<ziel>'
-        status     TEXT NOT NULL,      -- 'arbeit' | 'erledigt'
+        key        TEXT PRIMARY KEY,   -- 'proc|<process>|<target>' or 'dom|<source>|<target>'
+        status     TEXT NOT NULL,      -- 'in_progress' | 'done' (open = no row)
         updated_at TEXT NOT NULL
     );
     """)
     conn.execute("DROP TABLE IF EXISTS enhanced_since")   # helper of a short-lived earlier rule
+    # Agents before 2.3 reported audit state as German words; one-off rewrite.
+    for col in ("outgoing_audit", "incoming_audit", "domain_audit"):
+        for old_v, new_v in LEGACY_AUDIT.items():
+            conn.execute(f"UPDATE agents SET {col} = ? WHERE {col} = ?", (new_v, old_v))
+    # Status values were German words ('arbeit', 'erledigt') before 2.2; a
+    # no-op once rewritten. 'open' is never stored - it is the missing row.
+    for old_v, new_v in LEGACY_STATUS.items():
+        if new_v == "open":
+            conn.execute("DELETE FROM item_status WHERE status = ?", (old_v,))
+        else:
+            conn.execute("UPDATE item_status SET status = ? WHERE status = ?", (new_v, old_v))
     # Stored reasons: same correction as at ingest. Walks the distinct
     # (text, id) pairs only - a handful of rows, not every event.
     for reason, rid in conn.execute(
@@ -400,6 +908,732 @@ def init_db(path):
                          "(reason_id IS ? OR reason_id = ?)", (str(fixed), reason, rid, rid))
     conn.commit()
     return conn
+
+
+# ---- Status report ---------------------------------------------------------------
+# One printable page for the people who do not open the dashboard: where NTLM
+# stands, whether it is going down, what has been done, what is left and what
+# comes next. Rendered on the server as plain HTML with inline SVG - no
+# script is needed to read it, the browser prints it to PDF as it is, and the
+# static demo can store it as a file.
+REPORT_RANGES = {"7d": 7, "30d": 30, "90d": 90}
+
+_UI_TEXT = {}
+
+
+def ui_text(lang, key, default=""):
+    """A text from the dashboard's own translation table, so the report names
+    reasons, fixes and status codes exactly as the dashboard does."""
+    if not _UI_TEXT:
+        src = DASHBOARD_HTML
+        i = src.find("const I18N = {")
+        de_at = src.find("\nde: {", i)
+        en_at = src.find("\nen: {", de_at)
+        end = src.find("\n};", en_at)
+        pair = re.compile(r"(\w+):'((?:[^'\\]|\\.)*)'")
+        for code, block in (("de", src[de_at:en_at]), ("en", src[en_at:end])):
+            _UI_TEXT[code] = {k: v.replace("\\'", "'") for k, v in pair.findall(block)}
+    return _UI_TEXT.get(lang, {}).get(key, default)
+
+
+REPORT_TEXT = {
+    "de": {
+        "title": "NTLM-Statusbericht",
+        "kicker": "Statusbericht",
+        "range": "{d} Tage",
+        "period": "Zeitraum {a} – {b}",
+        "made": "Erstellt am {when}",
+        "basis": "{a} Agenten · Daten seit {since}",
+        "hero": "Noch <b>{p}</b> aller Anmeldungen laufen über NTLM.",
+        "hero_zero": "Im Zeitraum lief <b>keine</b> Anmeldung mehr über NTLM.",
+        "hero_none": "Für diesen Zeitraum liegen noch keine Anmeldungen vor.",
+        "d_down": "{d} Prozentpunkte weniger als in den {n} Tagen davor.",
+        "d_up": "{d} Prozentpunkte mehr als in den {n} Tagen davor.",
+        "d_flat": "Praktisch unverändert gegenüber den {n} Tagen davor.",
+        "d_none": "Für einen Vergleich mit den {n} Tagen davor reichen die Daten noch nicht.",
+        "k_share": "NTLM-Anteil", "k_share_s": "aller Anmeldungen",
+        "k_ntlm": "NTLM-Anmeldungen", "k_ntlm_s": "im Zeitraum",
+        "k_v1": "davon NTLMv1", "k_v1_s": "unsicher, zuerst abstellen",
+        "k_acc": "Konten mit NTLM", "k_acc_s": "{n} davon mit NTLMv1",
+        "k_acc_s0": "keins davon mit NTLMv1",
+        "vs": "vs. davor", "pp": "Pp",
+        "s1": "Verlauf", "s1_sub": "NTLM-Anteil pro Woche – das Ziel ist die Nulllinie.",
+        "goal": "Ziel 0 %", "wk": "KW", "last7": "letzte 7 Tage", "v1_week": "NTLMv1-Anmeldungen pro Woche",
+        "few_weeks": "Für einen Verlauf braucht es mindestens zwei Wochen Daten.",
+        "s2": "Fortschritt", "s2_sub": "Arbeitsliste aus dem Dashboard und Maschinen, die NTLM abschalten können.",
+        "st_done": "erledigt", "st_prog": "in Arbeit", "st_open": "offen",
+        "done_period": "{n} im Zeitraum erledigt",
+        "by_area": "Noch nicht erledigt, nach Bereich",
+        "a_blockers": "Programme (ausgehend)", "a_incoming": "Dienste (eingehend)",
+        "a_domain": "Verbindungen (DC-Sicht)", "a_v1sso": "NTLMv1-SSO",
+        "work_t": "Jede Zeile der Arbeitslisten im Dashboard ist ein Posten; „erledigt“ setzt, wer ihn abgestellt hat.",
+        "reopened": "{n} wieder aktiv – nach „erledigt“ kam erneut NTLM",
+        "no_items": "Noch keine Einträge in der Arbeitsliste.",
+        "ready_h": "Bereit zum Abschalten",
+        "ready_out": "ausgehend", "ready_in": "eingehend",
+        "ready_of": "von {m} Maschinen",
+        "ready_t": "Auditing an, {d} Tage beobachtet, in dieser Zeit kein NTLM: Hier kann „Restrict NTLM: Deny“ gesetzt werden.",
+        "ready_none": "Noch keine Maschine erfüllt die Bedingungen.",
+        "s3": "Was noch offen ist", "s3_sub": "Die größten Posten nach Anzahl Anmeldungen im Zeitraum.",
+        "t_prog": "Programme, die NTLM senden", "t_acc": "Konten, die NTLM nutzen",
+        "c_prog": "Programm → Ziel", "c_n": "Anmeld.", "c_st": "Status",
+        "c_acc": "Konto", "c_mach": "von", "c_tgt": "zu",
+        "c_mach_v": "{n} Rechnern", "c_tgt_v": "{n} Servern",
+        "none_left": "Nichts offen.",
+        "s4": "Risiken und Sichtbarkeit", "s4_sub": "Was zuerst Aufmerksamkeit braucht – und wo das Bild unvollständig ist.",
+        "r_v1": "NTLMv1",
+        "r_v1_bad": "{n} Anmeldungen mit NTLMv1 von {a} Konten, vor allem {top}. NTLMv1 lässt sich knacken und gehört zuerst abgestellt.",
+        "r_v1_ok": "Keine NTLMv1-Anmeldung im Zeitraum.",
+        "r_oct": "Oktober 2026",
+        "r_oct_bad": "{n} Anmeldungen nutzen aus NTLMv1 abgeleitete Anmeldedaten. Mit der Umstellung im Oktober 2026 brechen sie von selbst.",
+        "r_oct_warn": "{m} Maschinen sind von der Umstellung betroffen; betroffene Anmeldungen wurden bisher nicht gesehen.",
+        "r_oct_ok": "Keine Maschine erkennbar betroffen.",
+        "r_fail": "Fehlgeschlagene Anmeldungen",
+        "r_fail_spray": "Verdacht auf Password Spraying: {c} ist mit {a} Konten gescheitert. Rechner und Ursache klären.",
+        "r_fail_warn": "{n} Fehlversuche bei {a} Konten{locked}. Meist Dienste oder Aufgaben mit veraltetem Passwort.",
+        "r_fail_locked": ", {n} davon gesperrt",
+        "r_fail_ok": "Keine fehlgeschlagenen NTLM-Anmeldungen.",
+        "r_vis": "Sichtbarkeit",
+        "r_vis_warn": "Das Bild ist unvollständig: {parts}.",
+        "r_vis_gap": "{n} Maschinen mit abgeschaltetem Auditing",
+        "r_vis_stale": "{n} Agenten melden sich nicht mehr",
+        "r_vis_noagent": "{n} Rechner nutzen NTLM ohne Agent",
+        "r_vis_ok": "Alle Maschinen melden sich und auditieren vollständig.",
+        "r_vis_none": "Noch meldet sich kein Agent – ohne Agenten gibt es keine Daten.",
+        "r_relay": "Relay-Angriffe",
+        "r_relay_warn": "{n} Sitzungen ohne MIC-Schutz oder Channel Binding – über NTLM-Relay angreifbar.",
+        "r_relay_ok": "Keine ungeschützte Sitzung unter den {n} auswertbaren.",
+        "lv_bad": "handeln", "lv_warn": "beobachten", "lv_ok": "in Ordnung",
+        "s5": "Nächste Schritte", "s5_sub": "Aus den Daten abgeleitet, wichtigste zuerst.",
+        "n_v1": "<b>NTLMv1 abstellen</b> bei {top}. Auf den Rechnern dahinter LmCompatibilityLevel 5 setzen und Geräte, die nur NTLMv1 können, ersetzen oder isolieren.",
+        "n_oct": "<b>Vor Oktober 2026</b> die {n} Konten mit NTLMv1-abgeleiteten Anmeldedaten umstellen – sonst fallen sie mit der Umstellung aus.",
+        "n_reason": "<b>Häufigste Ursache angehen:</b> {why} ({n}×). {fix}.",
+        "n_ready": "<b>„Restrict NTLM: Deny“ setzen</b> auf {n} Maschinen, die seit {d} Tagen kein NTLM mehr nutzen: {names}.",
+        "n_top": "<b>Größter offener Posten:</b> {proc} → {tgt} mit {n} Anmeldungen im Zeitraum.",
+        "n_fail": "<b>Fehlversuche klären:</b> {user} von {src} – {why}.",
+        "n_spray": "<b>Password Spraying prüfen:</b> {c} ist mit {a} Konten gescheitert.",
+        "n_vis": "<b>Sichtbarkeit herstellen:</b> Auditing auf {gaps} einschalten{noagent}.",
+        "n_vis_noagent": "; Agent auf {names} installieren",
+        "n_vis_only_noagent": "<b>Sichtbarkeit herstellen:</b> Agent auf {names} installieren.",
+        "n_none": "Nichts Dringendes – den Verlauf weiter beobachten.",
+        "more": "und {n} weitere",
+        "method_h": "So wird gezählt",
+        "method": "Grundlage sind die NTLM- und Anmeldeereignisse der Agenten und Domänencontroller. Dieselbe Anmeldung wird oft mehrfach gesehen – vom Client, vom Server und vom DC; sie zählt einmal. 8001-Einträge ohne Bestätigung durch einen DC zählen nicht. Der NTLM-Anteil ist NTLM geteilt durch NTLM plus Kerberos-Tickets. Fehlgeschlagene Anmeldungen zählen nicht zum Anteil.",
+        "foot": "NTLM-Analyzer · {when}",
+        "tb_back": "← Dashboard", "tb_print": "Drucken / als PDF", "tb_range": "Zeitraum",
+    },
+    "en": {
+        "title": "NTLM status report",
+        "kicker": "Status report",
+        "range": "{d} days",
+        "period": "Period {a} – {b}",
+        "made": "Generated {when}",
+        "basis": "{a} agents · data since {since}",
+        "hero": "<b>{p}</b> of all logons still go through NTLM.",
+        "hero_zero": "<b>No</b> logon went through NTLM in this period.",
+        "hero_none": "There are no logons for this period yet.",
+        "d_down": "{d} percentage points less than in the {n} days before.",
+        "d_up": "{d} percentage points more than in the {n} days before.",
+        "d_flat": "Practically unchanged from the {n} days before.",
+        "d_none": "Not enough data yet to compare with the {n} days before.",
+        "k_share": "NTLM share", "k_share_s": "of all logons",
+        "k_ntlm": "NTLM logons", "k_ntlm_s": "in the period",
+        "k_v1": "of which NTLMv1", "k_v1_s": "insecure, switch off first",
+        "k_acc": "Accounts using NTLM", "k_acc_s": "{n} of them with NTLMv1",
+        "k_acc_s0": "none of them with NTLMv1",
+        "vs": "vs. before", "pp": "pp",
+        "s1": "Trend", "s1_sub": "NTLM share per week - the goal is the zero line.",
+        "goal": "goal 0 %", "wk": "Wk", "last7": "last 7 days", "v1_week": "NTLMv1 logons per week",
+        "few_weeks": "A trend needs at least two weeks of data.",
+        "s2": "Progress", "s2_sub": "The dashboard's work list, and machines that can switch NTLM off.",
+        "st_done": "done", "st_prog": "in progress", "st_open": "open",
+        "done_period": "{n} done in this period",
+        "by_area": "Not done yet, by area",
+        "a_blockers": "Programs (outgoing)", "a_incoming": "Services (incoming)",
+        "a_domain": "Connections (DC view)", "a_v1sso": "NTLMv1 SSO",
+        "work_t": "Each row of the dashboard's work lists is one item; whoever removes it marks it \"done\".",
+        "reopened": "{n} active again - NTLM came back after \"done\"",
+        "no_items": "No entries in the work list yet.",
+        "ready_h": "Ready to switch off",
+        "ready_out": "outgoing", "ready_in": "incoming",
+        "ready_of": "of {m} machines",
+        "ready_t": "Auditing on, watched for {d} days, no NTLM in that time: \"Restrict NTLM: Deny\" can be set here.",
+        "ready_none": "No machine meets the conditions yet.",
+        "s3": "What is left", "s3_sub": "The largest items by number of logons in the period.",
+        "t_prog": "Programs sending NTLM", "t_acc": "Accounts using NTLM",
+        "c_prog": "Program → target", "c_n": "Logons", "c_st": "Status",
+        "c_acc": "Account", "c_mach": "from", "c_tgt": "to",
+        "c_mach_v": "{n} machines", "c_tgt_v": "{n} servers",
+        "none_left": "Nothing left.",
+        "s4": "Risks and visibility", "s4_sub": "What needs attention first - and where the picture is incomplete.",
+        "r_v1": "NTLMv1",
+        "r_v1_bad": "{n} NTLMv1 logons from {a} accounts, mostly {top}. NTLMv1 can be cracked and should be switched off first.",
+        "r_v1_ok": "No NTLMv1 logon in the period.",
+        "r_oct": "October 2026",
+        "r_oct_bad": "{n} logons use NTLMv1-derived credentials. They will break by themselves with the October 2026 change.",
+        "r_oct_warn": "{m} machines are affected by the change; no affected logons have been seen so far.",
+        "r_oct_ok": "No machine recognisably affected.",
+        "r_fail": "Failed logons",
+        "r_fail_spray": "Possible password spraying: {c} failed with {a} accounts. Find the machine and the cause.",
+        "r_fail_warn": "{n} failed attempts for {a} accounts{locked}. Usually services or tasks with an old password.",
+        "r_fail_locked": ", {n} of them locked out",
+        "r_fail_ok": "No failed NTLM logons.",
+        "r_vis": "Visibility",
+        "r_vis_warn": "The picture is incomplete: {parts}.",
+        "r_vis_gap": "{n} machines with auditing off",
+        "r_vis_stale": "{n} agents no longer report",
+        "r_vis_noagent": "{n} machines use NTLM without an agent",
+        "r_vis_ok": "All machines report and audit completely.",
+        "r_vis_none": "No agent reports yet - without agents there is no data.",
+        "r_relay": "Relay attacks",
+        "r_relay_warn": "{n} sessions without MIC protection or channel binding - open to NTLM relay.",
+        "r_relay_ok": "No unprotected session among the {n} that can be judged.",
+        "lv_bad": "act", "lv_warn": "watch", "lv_ok": "fine",
+        "s5": "Next steps", "s5_sub": "Derived from the data, most important first.",
+        "n_v1": "<b>Switch off NTLMv1</b> for {top}. Set LmCompatibilityLevel 5 on the machines behind it and replace or isolate devices that can only do NTLMv1.",
+        "n_oct": "<b>Before October 2026</b> move the {n} accounts with NTLMv1-derived credentials - otherwise they fail with the change.",
+        "n_reason": "<b>Tackle the most common cause:</b> {why} ({n}×). {fix}.",
+        "n_ready": "<b>Set \"Restrict NTLM: Deny\"</b> on {n} machines that have not used NTLM for {d} days: {names}.",
+        "n_top": "<b>Largest open item:</b> {proc} → {tgt} with {n} logons in the period.",
+        "n_fail": "<b>Clear up failed logons:</b> {user} from {src} - {why}.",
+        "n_spray": "<b>Check for password spraying:</b> {c} failed with {a} accounts.",
+        "n_vis": "<b>Restore visibility:</b> switch auditing on for {gaps}{noagent}.",
+        "n_vis_noagent": "; install the agent on {names}",
+        "n_vis_only_noagent": "<b>Restore visibility:</b> install the agent on {names}.",
+        "n_none": "Nothing urgent - keep watching the trend.",
+        "more": "and {n} more",
+        "method_h": "How it is counted",
+        "method": "Based on the NTLM and logon events of the agents and domain controllers. The same logon is often seen several times - by the client, the server and the DC; it counts once. 8001 entries not confirmed by a DC do not count. The NTLM share is NTLM divided by NTLM plus Kerberos tickets. Failed logons do not count towards the share.",
+        "foot": "NTLM-Analyzer · {when}",
+        "tb_back": "← Dashboard", "tb_print": "Print / save as PDF", "tb_range": "Period",
+    },
+}
+
+
+def period_counts(c, start, end):
+    """NTLM (v1, v2, unversioned) and Kerberos between two UTC times, counted
+    like the trend and the key-figure tiles: duplicate and unconfirmed 8001s
+    and 4624 twins left out."""
+    s, e = start.strftime(_TS), end.strftime(_TS)
+    c.execute("CREATE TEMP TABLE IF NOT EXISTS x_rep (id INTEGER PRIMARY KEY)")
+    c.execute("DELETE FROM temp.x_rep")
+    c.execute(f"INSERT INTO x_rep (id) SELECT id FROM events WHERE {_TWIN_IDS} "
+              f"AND event_time >= ? AND event_time < ? AND (NOT ({NOT_SUPERSEDED}) OR {UNCONFIRMED})", [s, e])
+    r = c.execute(
+        "SELECT SUM(CASE WHEN ntlm_version='NTLMv1' THEN 1 ELSE 0 END), "
+        "SUM(CASE WHEN ntlm_version='NTLMv2' THEN 1 ELSE 0 END), "
+        "SUM(CASE WHEN kind!='kerberos' AND ntlm_version IS NULL THEN 1 ELSE 0 END), "
+        "SUM(CASE WHEN kind='kerberos' THEN 1 ELSE 0 END) "
+        "FROM events WHERE event_time >= ? AND event_time < ? "
+        "AND id NOT IN (SELECT id FROM temp.x_rep)", [s, e]).fetchone()
+    v1, v2, oth, krb = (x or 0 for x in r)
+    ntlm = v1 + v2 + oth
+    return {"v1": v1, "v2": v2, "ntlm": ntlm, "krb": krb,
+            "share": (100.0 * ntlm / (ntlm + krb)) if (ntlm + krb) else None}
+
+
+def compute_weekly(c, weeks, tzoff):
+    """NTLM share and NTLMv1 per week for the last `weeks` weeks, oldest
+    first; weeks before the first event are left out."""
+    now = utc_now()
+    start = now - timedelta(days=7 * weeks)
+    s = start.strftime(_TS)
+    c.execute("CREATE TEMP TABLE IF NOT EXISTS x_rep (id INTEGER PRIMARY KEY)")
+    c.execute("DELETE FROM temp.x_rep")
+    c.execute(f"INSERT INTO x_rep (id) SELECT id FROM events WHERE {_TWIN_IDS} "
+              f"AND event_time >= ? AND (NOT ({NOT_SUPERSEDED}) OR {UNCONFIRMED})", [s])
+    rows = c.execute(
+        "SELECT CAST((julianday(substr(event_time,1,19)) - julianday(?)) / 7 AS INTEGER), "
+        "SUM(CASE WHEN ntlm_version='NTLMv1' THEN 1 ELSE 0 END), "
+        "SUM(CASE WHEN kind!='kerberos' THEN 1 ELSE 0 END), "
+        "SUM(CASE WHEN kind='kerberos' THEN 1 ELSE 0 END) "
+        "FROM events WHERE event_time >= ? AND id NOT IN (SELECT id FROM temp.x_rep) "
+        "GROUP BY 1", [s, s]).fetchall()
+    per = {w: (v1 or 0, n or 0, k or 0) for w, v1, n, k in rows if w is not None and 0 <= w < weeks}
+    out = []
+    for w in range(weeks):
+        v1, n, k = per.get(w, (0, 0, 0))
+        begin = start + timedelta(days=7 * w, minutes=tzoff)
+        out.append({"start": begin, "v1": v1, "ntlm": n, "krb": k,
+                    "share": (100.0 * n / (n + k)) if (n + k) else None})
+    # Leading weeks with next to nothing in them (a stray event before
+    # auditing really started) would show as a 100 % spike - left out too.
+    vols = sorted(w["ntlm"] + w["krb"] for w in out if w["share"] is not None)
+    floor = vols[len(vols) // 2] * 0.1 if vols else 0
+    while out and (out[0]["share"] is None or out[0]["ntlm"] + out[0]["krb"] < floor):
+        out.pop(0)
+    return out
+
+
+def _r_num(n, lang, dec=0):
+    s = f"{n:,.{dec}f}"
+    return s.replace(",", " ").replace(".", ",") if lang == "de" else s.replace(",", " ")
+
+
+def _r_date(iso_or_dt, lang, tzoff, time_too=False):
+    if not iso_or_dt:
+        return "–"
+    d = iso_or_dt
+    if isinstance(d, str):
+        try:
+            d = datetime.strptime(d[:19], _TS) + timedelta(minutes=tzoff)
+        except ValueError:
+            return d[:10]
+    if lang == "de":
+        return d.strftime("%d.%m.%Y" + (", %H:%M" if time_too else ""))
+    months = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()
+    return f"{d.day} {months[d.month - 1]} {d.year}" + (d.strftime(", %H:%M") if time_too else "")
+
+
+def _r_list(names, lang, cap=4):
+    names = [n for n in names if n]
+    head = ", ".join(_h(n) for n in names[:cap])
+    if len(names) > cap:
+        head += " " + REPORT_TEXT[lang]["more"].format(n=len(names) - cap)
+    return head
+
+
+def _r_chart(weeks, lang):
+    """Weekly NTLM share as an area line, NTLMv1 per week as bars below."""
+    T = REPORT_TEXT[lang]
+    if len(weeks) < 2:
+        return f'<p class="muted">{_h(T["few_weeks"])}</p>'
+    W, H, L, R, TOP, B = 700, 176, 44, 64, 34, 26
+    n = len(weeks)
+    hi = max(w["share"] or 0 for w in weeks)
+    step = 5 if hi <= 20 else 10 if hi <= 50 else 25
+    ymax = max(step, step * -(-hi // step))
+    x = lambda i: L + (W - L - R) * i / (n - 1)
+    y = lambda v: TOP + (H - TOP - B) * (1 - v / ymax)
+    grid = []
+    v = 0
+    while v <= ymax + 0.01:
+        yy = y(v)
+        grid.append(f'<line x1="{L}" x2="{W - R}" y1="{yy:.1f}" y2="{yy:.1f}" class="{"g0" if v == 0 else "g"}"/>'
+                    f'<text x="{L - 8}" y="{yy + 4:.1f}" class="ax" text-anchor="end">{_r_num(v, lang)} %</text>')
+        v += step
+    pts = [(x(i), y(w["share"])) for i, w in enumerate(weeks) if w["share"] is not None]
+    line = " ".join(f"{a:.1f},{b:.1f}" for a, b in pts)
+    area = f"M{pts[0][0]:.1f},{y(0):.1f} L" + " L".join(f"{a:.1f},{b:.1f}" for a, b in pts) + f" L{pts[-1][0]:.1f},{y(0):.1f} Z"
+    last = weeks[-1]
+    lx, ly = pts[-1]
+    labels = []
+    every = max(1, -(-n // 9))
+    for i, w in enumerate(weeks):
+        if i % every == 0 or i == n - 1:
+            wk = w["start"].isocalendar()[1]
+            labels.append(f'<text x="{x(i):.1f}" y="{H - 8}" class="ax" text-anchor="middle">{T["wk"]} {wk}</text>')
+    dots = "".join(f'<circle cx="{a:.1f}" cy="{b:.1f}" r="2.6" class="dot"/>' for a, b in pts)
+    main = (f'<svg class="chart" viewBox="0 0 {W} {H}" role="img" aria-label="{_h(T["s1"])}">'
+            f'<defs><linearGradient id="ga" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#d9b84a" stop-opacity=".38"/>'
+            f'<stop offset="1" stop-color="#d9b84a" stop-opacity=".02"/></linearGradient></defs>'
+            + "".join(grid) +
+            f'<text x="{W - R + 6}" y="{y(0) + 4:.1f}" class="goal">{_h(T["goal"])}</text>'
+            f'<path d="{area}" fill="url(#ga)"/><polyline points="{line}" class="ln"/>{dots}'
+            f'<circle cx="{lx:.1f}" cy="{ly:.1f}" r="5" class="end"/>'
+            f'<text x="{lx + 8:.1f}" y="{ly - 12:.1f}" class="endv" text-anchor="end">{_r_num(last["share"] or 0, lang, 1)} %'
+            f'<tspan class="ax" dx="6">{_h(T["last7"])}</tspan></text>'
+            + "".join(labels) + '</svg>')
+    vmax = max(w["v1"] for w in weeks)
+    bars = ""
+    if vmax:
+        BH = 46
+        bw = min(26, max(4, (W - L - R) / n * 0.5))
+        for i, w in enumerate(weeks):
+            h = BH * w["v1"] / vmax
+            bars += (f'<rect x="{x(i) - bw / 2:.1f}" y="{BH - h + 16:.1f}" width="{bw:.1f}" height="{max(h, 0.8):.1f}" rx="2" class="{"v1b" if w["v1"] else "v1z"}"/>')
+            if w["v1"] and (n <= 14 or w["v1"] == vmax or i == n - 1):
+                bars += f'<text x="{x(i):.1f}" y="{BH - h + 12:.1f}" class="ax v1t" text-anchor="middle">{_r_num(w["v1"], lang)}</text>'
+        bars = (f'<div class="sublab">{_h(T["v1_week"])}</div>'
+                f'<svg class="chart v1c" viewBox="0 0 {W} {BH + 20}" aria-hidden="true">'
+                f'<line x1="{L}" x2="{W - R}" y1="{BH + 16}" y2="{BH + 16}" class="g0"/>{bars}</svg>')
+    return main + bars
+
+
+REPORT_CSS = r"""
+:root{--ink:#0f172a;--dim:#475569;--faint:#64748b;--line:#e3e8ef;--soft:#f5f7fa;
+  --gold:#a8841e;--gold2:#d9b84a;--v1:#c62828;--amb:#b45309;--ok:#137a50;
+  --text:'Segoe UI Variable Text','Segoe UI',system-ui,-apple-system,'Helvetica Neue',Arial,sans-serif;
+  --disp:'Segoe UI Variable Display','Segoe UI',system-ui,-apple-system,'Helvetica Neue',Arial,sans-serif;
+  --mono:'Cascadia Mono','IBM Plex Mono',ui-monospace,Consolas,'SF Mono',monospace}
+*{box-sizing:border-box}
+html{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+body{margin:0;background:#e7ebf0;color:var(--ink);font-family:var(--text);font-size:13px;line-height:1.5}
+.tb{position:sticky;top:0;z-index:5;display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:center;
+  padding:10px 16px;background:rgba(15,23,42,.92);color:#e2e8f0;font-size:13px}
+.tb a,.tb button{color:#e2e8f0;text-decoration:none;border:1px solid rgba(226,232,240,.25);border-radius:8px;
+  padding:6px 12px;background:transparent;font:inherit;cursor:pointer}
+.tb a.on{background:#d9b84a;color:#0f172a;border-color:#d9b84a;font-weight:600}
+.tb .grp{display:flex;gap:4px;align-items:center}
+.tb .lbl{color:#94a3b8;margin-right:4px}
+.tb .print{background:#d9b84a;color:#0f172a;border-color:#d9b84a;font-weight:600}
+.sheet{width:210mm;max-width:100%;margin:24px auto 48px;background:#fff;padding:15mm 16mm 12mm;
+  box-shadow:0 10px 40px rgba(15,23,42,.18);border-radius:4px}
+.top{display:flex;justify-content:space-between;align-items:center;gap:12px;padding-bottom:12px;border-bottom:2px solid var(--ink)}
+.brand{display:flex;align-items:center;gap:9px;font-family:var(--disp);font-weight:650;font-size:14px;letter-spacing:.01em}
+.brand img{width:24px;height:24px;border-radius:6px}
+.kick{font-family:var(--mono);font-size:10.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--faint);text-align:right}
+h1{font-family:var(--disp);font-size:34px;line-height:1.1;margin:18px 0 6px;font-weight:700;letter-spacing:-.015em}
+.meta{display:flex;flex-wrap:wrap;gap:4px 18px;color:var(--dim);font-size:12px}
+.meta span+span::before{content:"";}
+.hero{margin:18px 0 4px;font-family:var(--disp);font-size:25px;line-height:1.25;font-weight:500;letter-spacing:-.01em}
+.hero b{color:var(--gold);font-weight:700}
+.delta{display:flex;align-items:center;gap:8px;color:var(--dim);font-size:13.5px;margin-bottom:18px}
+.arrow{display:inline-grid;place-items:center;width:22px;height:22px;border-radius:50%;font-size:13px;font-weight:700;color:#fff}
+.arrow.good{background:var(--ok)}.arrow.bad{background:var(--v1)}.arrow.flat{background:#94a3b8}
+.kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:6px 0 8px}
+.kpi{border:1px solid var(--line);border-radius:12px;padding:12px 13px 11px;background:linear-gradient(180deg,#fff,var(--soft))}
+.kpi .l{font-size:11px;color:var(--dim);font-weight:600}
+.kpi .v{font-family:var(--disp);font-size:26px;font-weight:700;letter-spacing:-.02em;line-height:1.15;margin-top:4px}
+.kpi .v.red{color:var(--v1)}
+.kpi .s{font-size:10.5px;color:var(--faint);margin-top:2px}
+.chip{display:inline-block;font-family:var(--mono);font-size:10px;font-weight:600;border-radius:999px;padding:1px 7px;margin-top:6px}
+.chip.good{background:#e3f4ec;color:var(--ok)}.chip.bad{background:#fdeaea;color:var(--v1)}.chip.flat{background:#eef2f6;color:var(--faint)}
+section{margin-top:22px;break-inside:avoid}
+section.flow{break-inside:auto}
+.sh{display:flex;align-items:baseline;gap:12px;border-bottom:1px solid var(--line);padding-bottom:6px;margin-bottom:12px;break-after:avoid}
+.sh .no{font-family:var(--mono);font-size:11px;color:var(--gold);font-weight:700;letter-spacing:.06em}
+.sh h2{margin:0;font-family:var(--disp);font-size:18px;font-weight:650;letter-spacing:-.005em}
+.sh p{margin:0 0 0 auto;color:var(--faint);font-size:11px;text-align:right;max-width:55%}
+.chart{width:100%;height:auto;display:block}
+.chart .g{stroke:#e8ecf2;stroke-width:1}.chart .g0{stroke:#94a3b8;stroke-width:1.2;stroke-dasharray:4 3}
+.chart .ax{font-family:var(--mono);font-size:10px;fill:#7b8798}
+.chart .goal{font-family:var(--mono);font-size:10px;fill:var(--ok);font-weight:700}
+.chart .ln{fill:none;stroke:var(--gold2);stroke-width:2.6;stroke-linejoin:round;stroke-linecap:round}
+.chart .dot{fill:#fff;stroke:var(--gold2);stroke-width:1.6}
+.chart .end{fill:var(--gold2);stroke:#fff;stroke-width:2}
+.chart .endv{font-family:var(--disp);font-size:13px;font-weight:700;fill:var(--ink)}
+.chart .v1b{fill:var(--v1)}.chart .v1z{fill:#e8ecf2}.chart .v1t{fill:var(--v1);font-weight:700}
+.sublab{font-size:10.5px;color:var(--faint);margin:10px 0 2px 44px;font-weight:600}
+.muted{color:var(--faint)}
+.prog{display:grid;grid-template-columns:1.25fr 1fr;gap:18px}
+.bar{display:flex;height:14px;border-radius:999px;overflow:hidden;background:#eef2f6;margin:8px 0 10px}
+.bar i{display:block;height:100%}
+.bar .d{background:var(--ok)}.bar .p{background:var(--gold2)}.bar .o{background:#cbd5e1}
+.legend{display:flex;flex-wrap:wrap;gap:4px 16px;font-size:12px;color:var(--dim)}
+.legend b{font-family:var(--disp);font-size:18px;color:var(--ink);margin-right:5px}
+.legend i{display:inline-block;width:9px;height:9px;border-radius:3px;margin-right:5px;vertical-align:1px}
+.note{font-size:11.5px;color:var(--dim);margin-top:8px}
+.note.warn{color:var(--amb);font-weight:600}
+.areas{margin-top:10px}
+.areas .ah{font-size:10.5px;font-weight:600;color:var(--faint);margin-bottom:2px}
+.ar{display:flex;justify-content:space-between;border-bottom:1px solid #eef1f5;padding:3px 0;font-size:11.5px}
+.ar b{font-variant-numeric:tabular-nums}
+.box{border:1px solid var(--line);border-radius:12px;padding:12px 14px}
+.box h3{margin:0 0 6px;font-size:12.5px;font-family:var(--disp)}
+.rd{display:flex;gap:14px;margin:4px 0 6px}
+.rd div{flex:1}
+.rd b{display:block;font-family:var(--disp);font-size:20px}
+.rd span{font-size:11px;color:var(--faint)}
+.names{font-family:var(--mono);font-size:10.5px;color:var(--dim);margin-top:6px;word-break:break-word}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+table{width:100%;border-collapse:collapse;font-size:11.5px}
+caption{text-align:left;font-family:var(--disp);font-weight:650;font-size:12.5px;padding-bottom:6px}
+th{font-family:var(--mono);font-weight:600;font-size:9.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--faint);
+  text-align:left;border-bottom:1px solid var(--line);padding:4px 6px 5px 0}
+td{border-bottom:1px solid #eef1f5;padding:6px 6px 6px 0;vertical-align:top}
+tr{break-inside:avoid}
+td.n,th.n{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+td .sub{display:block;color:var(--faint);font-size:10.5px;font-weight:400;word-break:break-all}
+td.nm{font-weight:600;word-break:break-word}
+.tag{display:inline-block;font-family:var(--mono);font-size:9.5px;font-weight:700;border-radius:5px;padding:0 5px;margin-left:4px;vertical-align:1px}
+.tag.v1{background:#fdeaea;color:var(--v1)}.tag.st-open{background:#eef2f6;color:var(--faint)}
+.tag.st-in_progress{background:#fbf3dc;color:#8a6a12}.tag.st-done{background:#e3f4ec;color:var(--ok)}
+.risks{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.risk{border:1px solid var(--line);border-left:4px solid #cbd5e1;border-radius:10px;padding:10px 12px;break-inside:avoid}
+.risk.bad{border-left-color:var(--v1)}.risk.warn{border-left-color:#e0a106}.risk.ok{border-left-color:var(--ok)}
+.risk .rh{display:flex;justify-content:space-between;align-items:center;gap:8px;font-weight:650;font-family:var(--disp);font-size:13px}
+.lv{white-space:nowrap;flex:none;font-family:var(--mono);font-size:9.5px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;border-radius:999px;padding:1px 8px}
+.risk.bad .lv{background:#fdeaea;color:var(--v1)}.risk.warn .lv{background:#fdf3d7;color:var(--amb)}.risk.ok .lv{background:#e3f4ec;color:var(--ok)}
+.risk p{margin:5px 0 0;color:var(--dim);font-size:11.5px}
+ol.steps{list-style:none;counter-reset:s;margin:0;padding:0}
+ol.steps li{counter-increment:s;position:relative;padding:8px 0 9px 38px;border-bottom:1px solid #eef1f5;break-inside:avoid;font-size:12.5px}
+ol.steps li::before{content:counter(s);position:absolute;left:0;top:7px;width:25px;height:25px;border-radius:50%;
+  background:var(--ink);color:#fff;font-family:var(--disp);font-weight:700;font-size:12px;display:grid;place-items:center}
+ol.steps li:first-child::before{background:var(--gold2);color:var(--ink)}
+.method{margin-top:24px;padding:10px 12px;background:var(--soft);border-radius:10px;font-size:10.5px;color:var(--dim);break-inside:avoid}
+.method b{color:var(--ink)}
+.foot{margin-top:14px;display:flex;justify-content:space-between;font-family:var(--mono);font-size:9.5px;color:var(--faint);
+  border-top:1px solid var(--line);padding-top:8px}
+@page{size:A4;margin:13mm 13mm 14mm}
+@media print{
+  body{background:#fff;font-size:12.5px}
+  .tb{display:none}
+  .sheet{width:auto;margin:0;padding:0;box-shadow:none;border-radius:0}
+  .pb{break-before:page}
+}
+@media (max-width:760px){
+  .sheet{padding:18px 16px;margin:0;border-radius:0}
+  .kpis{grid-template-columns:1fr 1fr}
+  .prog,.two,.risks{grid-template-columns:1fr}
+  h1{font-size:27px}.hero{font-size:20px}
+  .sh{flex-wrap:wrap}.sh p{margin:0;text-align:left;max-width:none}
+}
+"""
+
+
+def render_report(ctx):
+    lang, rng, tz = ctx["lang"], ctx["range"], ctx["tzoff"]
+    T = REPORT_TEXT[lang]
+    days = REPORT_RANGES[rng]
+    data, cur, prev = ctx["data"], ctx["cur"], ctx["prev"]
+    num = lambda v, d=0: _r_num(v, lang, d)
+    now_local = utc_now() + timedelta(minutes=tz)
+    start_local = now_local - timedelta(days=days)
+
+    # Toolbar (screen only). The static demo has no server behind the links,
+    # so there they point to the pre-rendered files.
+    def link(lg, rg):
+        return (f"report-{lg}-{rg}.html" if ctx["static"]
+                else f"/report?range={rg}&lang={lg}&tzoff={tz}")
+    back = "index.html" if ctx["static"] else "/"
+    tb = (f'<nav class="tb"><a href="{back}">{_h(T["tb_back"])}</a>'
+          f'<span class="grp"><span class="lbl">{_h(T["tb_range"])}</span>'
+          + "".join(f'<a href="{link(lang, r)}" class="{"on" if r == rng else ""}">{_h(T["range"].format(d=d))}</a>'
+                    for r, d in REPORT_RANGES.items()) +
+          '</span><span class="grp">'
+          + "".join(f'<a href="{link(lg, rng)}" class="{"on" if lg == lang else ""}">{lg.upper()}</a>' for lg in ("de", "en")) +
+          f'</span><button type="button" class="print" onclick="window.print()">{_h(T["tb_print"])}</button></nav>')
+
+    # Head and the one sentence that matters
+    agents = data.get("agents") or []
+    first = ctx["first_event"]
+    meta = [T["period"].format(a=_r_date(start_local, lang, 0), b=_r_date(now_local, lang, 0)),
+            T["basis"].format(a=num(len(agents)), since=_r_date(first, lang, tz)),
+            T["made"].format(when=_r_date(now_local, lang, 0, True))]
+    if cur["share"] is None:
+        hero = T["hero_none"]
+    elif cur["ntlm"] == 0:
+        hero = T["hero_zero"]
+    else:
+        hero = T["hero"].format(p=num(cur["share"], 1) + " %")
+    if cur["share"] is None or prev["share"] is None:
+        delta, arrow = T["d_none"].format(n=days), ""
+    else:
+        dp = cur["share"] - prev["share"]
+        if abs(dp) < 0.5:
+            delta, arrow = T["d_flat"].format(n=days), '<span class="arrow flat">→</span>'
+        elif dp < 0:
+            delta, arrow = T["d_down"].format(d=num(-dp, 1), n=days), '<span class="arrow good">↓</span>'
+        else:
+            delta, arrow = T["d_up"].format(d=num(dp, 1), n=days), '<span class="arrow bad">↑</span>'
+
+    def chip(c_, p_, pct=True, pp=False):
+        if p_ is None or c_ is None:
+            return ""
+        if pp:
+            d = c_ - p_
+            if abs(d) < 0.05:
+                return f'<span class="chip flat">±0 {T["pp"]} {T["vs"]}</span>'
+            return (f'<span class="chip {"good" if d < 0 else "bad"}">{"−" if d < 0 else "+"}{num(abs(d), 1)} '
+                    f'{T["pp"]} {T["vs"]}</span>')
+        if not p_:
+            return "" if not c_ else f'<span class="chip bad">+{num(c_)} {T["vs"]}</span>'
+        d = 100.0 * (c_ - p_) / p_
+        if abs(d) < 0.5:
+            return f'<span class="chip flat">±0 % {T["vs"]}</span>'
+        return f'<span class="chip {"good" if d < 0 else "bad"}">{"−" if d < 0 else "+"}{num(abs(d))} % {T["vs"]}</span>'
+
+    acc_rows = [r for r in (data.get("accounts") or {}).get("rows") or [] if r.get("n")]
+    acc_v1 = sum(1 for r in acc_rows if r.get("v1"))
+    has_prev = prev["share"] is not None
+    share_txt = num(cur["share"], 1) + "\u202f%" if cur["share"] is not None else "–"
+    kpis = (
+        f'<div class="kpi"><div class="l">{_h(T["k_share"])}</div><div class="v">{share_txt}</div>'
+        f'<div class="s">{_h(T["k_share_s"])}</div>{chip(cur["share"], prev["share"], pp=True) if has_prev else ""}</div>'
+        f'<div class="kpi"><div class="l">{_h(T["k_ntlm"])}</div><div class="v">{num(cur["ntlm"])}</div>'
+        f'<div class="s">{_h(T["k_ntlm_s"])}</div>{chip(cur["ntlm"], prev["ntlm"]) if has_prev else ""}</div>'
+        f'<div class="kpi"><div class="l">{_h(T["k_v1"])}</div><div class="v{" red" if cur["v1"] else ""}">{num(cur["v1"])}</div>'
+        f'<div class="s">{_h(T["k_v1_s"])}</div>{chip(cur["v1"], prev["v1"]) if has_prev else ""}</div>'
+        f'<div class="kpi"><div class="l">{_h(T["k_acc"])}</div><div class="v">{num(len(acc_rows))}</div>'
+        f'<div class="s">{_h(T["k_acc_s"].format(n=num(acc_v1)) if acc_v1 else T["k_acc_s0"])}</div></div>')
+
+    # 01 Trend
+    s1 = _r_chart(ctx["weekly"], lang)
+
+    # 02 Progress: work list and readiness
+    items = [r for k in ("blockers", "incoming", "domain", "v1sso") for r in (data.get(k) or [])]
+    n_open = sum(1 for r in items if r.get("st") == "open")
+    n_prog = sum(1 for r in items if r.get("st") == "in_progress")
+    n_done = ctx["done_total"]
+    reopened = sum(1 for r in items if r.get("st") == "done" and r.get("st_at") and (r.get("last_seen") or "") > r["st_at"])
+    tot = n_open + n_prog + n_done
+    if tot:
+        pc = lambda v: f"{100.0 * v / tot:.2f}%"
+        work = (f'<div class="bar"><i class="d" style="width:{pc(n_done)}"></i><i class="p" style="width:{pc(n_prog)}"></i>'
+                f'<i class="o" style="width:{pc(n_open)}"></i></div>'
+                f'<div class="legend"><span><i style="background:var(--ok)"></i><b>{num(n_done)}</b>{_h(T["st_done"])}</span>'
+                f'<span><i style="background:var(--gold2)"></i><b>{num(n_prog)}</b>{_h(T["st_prog"])}</span>'
+                f'<span><i style="background:#cbd5e1"></i><b>{num(n_open)}</b>{_h(T["st_open"])}</span></div>'
+                + (f'<div class="note">{_h(T["done_period"].format(n=num(ctx["done_period"])))}</div>' if ctx["done_period"] else "")
+                + (f'<div class="note warn">{_h(T["reopened"].format(n=num(reopened)))}</div>' if reopened else ""))
+        areas = [(T["a_" + k], sum(1 for r in data.get(k) or [] if r.get("st") != "done"))
+                 for k in ("blockers", "incoming", "domain", "v1sso")]
+        work += (f'<div class="areas"><div class="ah">{_h(T["by_area"])}</div>'
+                 + "".join(f'<div class="ar"><span>{_h(a)}</span><b>{num(v)}</b></div>' for a, v in areas if v)
+                 + f'</div><div class="note">{_h(T["work_t"])}</div>')
+    else:
+        work = f'<p class="muted">{_h(T["no_items"])}</p>'
+    rd = data.get("readiness") or {}
+    rrows = rd.get("rows") or []
+    judged_out = sum(1 for r in rrows if r["out"]["st"] != "dc")
+    judged_in = sum(1 for r in rrows if r["in"]["st"] != "dc")
+    ready_names = [r["machine"] for r in rrows if r["out"]["st"] == "ready" or r["in"]["st"] == "ready"]
+    ready = (f'<div class="box"><h3>{_h(T["ready_h"])}</h3><div class="rd">'
+             f'<div><b>{num(rd.get("out_ready", 0))}</b><span>{_h(T["ready_out"])} · {_h(T["ready_of"].format(n=num(rd.get("out_ready", 0)), m=num(judged_out)))}</span></div>'
+             f'<div><b>{num(rd.get("in_ready", 0))}</b><span>{_h(T["ready_in"])} · {_h(T["ready_of"].format(n=num(rd.get("in_ready", 0)), m=num(judged_in)))}</span></div></div>'
+             + (f'<div class="names">{_r_list(ready_names, lang, 8)}</div>'
+                f'<div class="note">{_h(T["ready_t"].format(d=rd.get("quiet_days", 30)))}</div>'
+                if ready_names else f'<div class="note">{_h(T["ready_none"])}</div>') + '</div>')
+    s2 = f'<div class="prog"><div>{work}</div>{ready}</div>'
+
+    # 03 What is left
+    st_txt = {"open": T["st_open"], "in_progress": T["st_prog"], "done": T["st_done"]}
+    progs = [r for r in data.get("blockers") or [] if not (r.get("st") == "done" and (r.get("last_seen") or "") <= (r.get("st_at") or ""))][:15]
+    t_prog = (f'<table><caption>{_h(T["t_prog"])}</caption><thead><tr><th>{_h(T["c_prog"])}</th>'
+              f'<th class="n">{_h(T["c_n"])}</th></tr></thead><tbody>'
+              + "".join(f'<tr><td class="nm">{_h(r["process"])}<span class="tag st-{_h(r["st"])}">{_h(st_txt.get(r["st"], r["st"]))}</span>'
+                        f'<span class="sub">→ {_h(r["target"])}</span></td><td class="n">{num(r["n"])}</td></tr>' for r in progs)
+              + (f'<tr><td colspan="2" class="muted">{_h(T["none_left"])}</td></tr>' if not progs else "")
+              + '</tbody></table>')
+    accs = acc_rows[:15]
+    t_acc = (f'<table><caption>{_h(T["t_acc"])}</caption><thead><tr><th>{_h(T["c_acc"])}</th>'
+             f'<th class="n">{_h(T["c_n"])}</th></tr></thead><tbody>'
+             + "".join(f'<tr><td class="nm">{_h(r["name"])}' + (f'<span class="tag v1">NTLMv1</span>' if r.get("v1") else "")
+                       + f'<span class="sub">{_h(T["c_mach"])} {_h(T["c_mach_v"].format(n=num(r["machines"])))} '
+                         f'{_h(T["c_tgt"])} {_h(T["c_tgt_v"].format(n=num(r["targets"])))}</span></td>'
+                         f'<td class="n">{num(r["n"])}</td></tr>' for r in accs)
+             + (f'<tr><td colspan="2" class="muted">{_h(T["none_left"])}</td></tr>' if not accs else "")
+             + '</tbody></table>')
+    s3 = f'<div class="two"><div>{t_prog}</div><div>{t_acc}</div></div>'
+
+    # 04 Risks and visibility
+    risks = []
+    v1u = [u for u in data.get("v1_users") or [] if u.get("name")]
+    v1n = cur["v1"]
+    if v1n:
+        risks.append(("bad", T["r_v1"], T["r_v1_bad"].format(n=num(v1n), a=num(len(v1u)), top=_r_list([u["name"] for u in v1u], lang, 3))))
+    else:
+        risks.append(("ok", T["r_v1"], _h(T["r_v1_ok"])))
+    v1sso = data.get("v1sso") or []
+    v1sso_n = sum(r.get("n", 0) for r in v1sso)
+    oct_aff = [a["source"] for a in agents if a.get("cred_guard") != "on" and a.get("block_v1sso") != "deny"
+               and a.get("lm_level") and str(a["lm_level"]).isdigit() and int(a["lm_level"]) >= 4]
+    if v1sso_n:
+        risks.append(("bad", T["r_oct"], _h(T["r_oct_bad"].format(n=num(v1sso_n)))))
+    elif oct_aff:
+        risks.append(("warn", T["r_oct"], _h(T["r_oct_warn"].format(m=num(len(oct_aff))))))
+    else:
+        risks.append(("ok", T["r_oct"], _h(T["r_oct_ok"])))
+    fl = data.get("failures") or {}
+    if fl.get("spray"):
+        c0 = fl["spray"][0]
+        risks.append(("bad", T["r_fail"], _h(T["r_fail_spray"].format(c=c0[0], a=num(c0[1])))))
+    elif fl.get("n"):
+        locked = sum(1 for r in fl.get("rows") or [] if r.get("locked"))
+        risks.append(("warn", T["r_fail"], _h(T["r_fail_warn"].format(
+            n=num(fl["n"]), a=num(fl.get("accounts", 0)),
+            locked=T["r_fail_locked"].format(n=num(locked)) if locked else ""))))
+    else:
+        risks.append(("ok", T["r_fail"], _h(T["r_fail_ok"])))
+    now = utc_now()
+    gaps = [a["source"] for a in agents if a.get("outgoing_audit") == "off" or a.get("incoming_audit") == "off"
+            or (a.get("is_dc") and a.get("domain_audit") == "off") or a.get("logon_audit") == "none"]
+    stale = []
+    for a in agents:
+        try:
+            seen = datetime.strptime((a.get("last_seen") or "")[:19], _TS)
+        except ValueError:
+            seen = None
+        if not seen or (now - seen).days >= AGENT_STALE_DAYS:
+            stale.append(a["source"])
+    noag = data.get("agentless") or {}
+    noag_rows = noag.get("rows") or []
+    parts = []
+    if gaps:
+        parts.append(T["r_vis_gap"].format(n=num(len(gaps))))
+    if stale:
+        parts.append(T["r_vis_stale"].format(n=num(len(stale))))
+    if noag_rows:
+        parts.append(T["r_vis_noagent"].format(n=num(noag.get("total", len(noag_rows)))))
+    if not agents:
+        risks.append(("warn", T["r_vis"], _h(T["r_vis_none"])))
+    elif parts:
+        risks.append(("warn", T["r_vis"], _h(T["r_vis_warn"].format(parts=", ".join(parts)))))
+    else:
+        risks.append(("ok", T["r_vis"], _h(T["r_vis_ok"])))
+    st = data.get("stats") or {}
+    if st.get("relay_scope"):
+        risks.append(("warn" if st.get("relay") else "ok", T["r_relay"],
+                      _h(T["r_relay_warn"].format(n=num(st["relay"])) if st.get("relay")
+                         else T["r_relay_ok"].format(n=num(st["relay_scope"])))))
+    lv = {"bad": T["lv_bad"], "warn": T["lv_warn"], "ok": T["lv_ok"]}
+    order = {"bad": 0, "warn": 1, "ok": 2}
+    risks.sort(key=lambda r: order[r[0]])
+    s4 = '<div class="risks">' + "".join(
+        f'<div class="risk {k}"><div class="rh">{_h(title)}<span class="lv">{_h(lv[k])}</span></div><p>{body}</p></div>'
+        for k, title, body in risks) + '</div>'
+
+    # 05 Next steps - from the data, most important first, at most six
+    steps = []
+    if v1n and v1u:
+        steps.append(T["n_v1"].format(top=_r_list([u["name"] for u in v1u], lang, 3)))
+    if v1sso_n:
+        steps.append(T["n_oct"].format(n=num(len({r.get("user") for r in v1sso}))))
+    if fl.get("spray"):
+        c0 = fl["spray"][0]
+        steps.append(T["n_spray"].format(c=_h(c0[0]), a=num(c0[1])))
+    reasons = [r for r in data.get("reasons") or [] if r.get("cat") not in ("unclear", "cloud", "acct")]
+    if reasons:
+        r0 = reasons[0]
+        why = ui_text(lang, "rid_" + str(r0["rid"]), r0.get("text") or "")
+        fix = ui_text(lang, "fix_" + str(r0.get("cat")), "")
+        if why and fix:
+            steps.append(T["n_reason"].format(why=_h(why), n=num(r0["n"]), fix=_h(fix.rstrip("."))))
+    if ready_names:
+        steps.append(T["n_ready"].format(n=num(len(ready_names)), d=rd.get("quiet_days", 30),
+                                         names=_r_list(ready_names, lang, 4)))
+    open_progs = [r for r in data.get("blockers") or [] if r.get("st") == "open"]
+    if open_progs:
+        r0 = open_progs[0]
+        steps.append(T["n_top"].format(proc=_h(r0["process"]), tgt=_h(r0["target"]), n=num(r0["n"])))
+    # Repeated failures of one account point at a stored old password.
+    frows = [r for r in fl.get("rows") or [] if r.get("n", 0) >= 3]
+    if frows:
+        r0 = frows[0]
+        why = ui_text(lang, "nt_" + str(r0.get("code") or "").lower(), str(r0.get("code") or ""))
+        steps.append(T["n_fail"].format(user=_h(r0["user"]), src=_h(r0.get("from") or "–"), why=_h(why)))
+    noag_names = [r.get("machine") or r.get("workstation") or r.get("name") for r in noag_rows]
+    if gaps:
+        steps.append(T["n_vis"].format(gaps=_r_list(gaps, lang, 4),
+                                       noagent=T["n_vis_noagent"].format(names=_r_list(noag_names, lang, 3)) if noag_names else ""))
+    elif noag_names:
+        steps.append(T["n_vis_only_noagent"].format(names=_r_list(noag_names, lang, 3)))
+    steps = steps[:6] or [_h(T["n_none"])]
+    s5 = '<ol class="steps">' + "".join(f"<li>{s}</li>" for s in steps) + '</ol>'
+
+    def sec(no, key, body, cls=""):
+        return (f'<section class="{cls}"><div class="sh"><span class="no">{no}</span><h2>{_h(T[key])}</h2>'
+                f'<p>{_h(T[key + "_sub"])}</p></div>{body}</section>')
+
+    logo = ctx.get("logo") or ""
+    title = f'{T["title"]} · {T["range"].format(d=days)}'
+    return (f'<!doctype html><html lang="{lang}"><head><meta charset="utf-8">'
+            f'<meta name="viewport" content="width=device-width,initial-scale=1">'
+            f'<title>{_h(title)}</title><style>{REPORT_CSS}</style></head><body>{tb}'
+            f'<main class="sheet"><div class="top"><div class="brand">'
+            + (f'<img src="{logo}" alt="">' if logo else "") +
+            f'NTLM-Analyzer</div><div class="kick">{_h(T["kicker"])} · {_h(T["range"].format(d=days))}</div></div>'
+            f'<h1>{_h(T["title"])}</h1><div class="meta">' + "".join(f"<span>{_h(m)}</span>" for m in meta) + '</div>'
+            f'<p class="hero">{hero}</p><div class="delta">{arrow}<span>{_h(delta)}</span></div>'
+            f'<div class="kpis">{kpis}</div>'
+            # Printed: page one is the overview, page two what to do about
+            # it, page three the detail lists for whoever does the work.
+            + sec("01", "s1", s1) + sec("02", "s2", s2) + sec("03", "s4", s4, "pb")
+            + sec("04", "s5", s5) + sec("05", "s3", s3, "flow pb") +
+            f'<div class="method"><b>{_h(T["method_h"])}.</b> {_h(T["method"])}</div>'
+            f'<div class="foot"><span>{_h(T["foot"].format(when=_r_date(now_local, lang, 0, True)))}</span>'
+            f'<span>{_h(T["range"].format(d=days))}</span></div></main></body></html>')
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -440,7 +1674,7 @@ class Handler(BaseHTTPRequestHandler):
             "frame-ancestors 'none'")
 
     def log_message(self, fmt, *args):
-        pass  # ruhig halten; bei Bedarf entkommentieren
+        pass  # stay quiet; uncomment when needed
 
     # ---- Auth / Sessions --------------------------------------------------
     def _cookie_token(self):
@@ -504,7 +1738,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _handle_login(self):
-        if not self.server.pw_hash:        # Login deaktiviert -> einfach durchwinken
+        if not self.server.pw_hash:        # login disabled -> let everything through
             self._redirect("/")
             return
         # Brute-force throttle per source IP: after LOGIN_MAX_FAILS failed
@@ -537,13 +1771,13 @@ class Handler(BaseHTTPRequestHandler):
         else:
             with LOGIN_FAILS_LOCK:
                 fails, locked_until = LOGIN_FAILS.get(ip, [0, 0.0])
-                if locked_until <= now:            # bestehende Sperre nie ueberschreiben
+                if locked_until <= now:            # never overwrite an existing lock
                     fails += 1
                     if fails >= LOGIN_MAX_FAILS:
                         LOGIN_FAILS[ip] = [0, now + LOGIN_LOCK_SECS]
                     else:
                         LOGIN_FAILS[ip] = [fails, 0.0]
-            time.sleep(1.0)                # leichte Bremse gegen Erraten
+            time.sleep(1.0)                # slight brake against guessing
             self._redirect("/login?err=1")
 
     # ---- Routing ----------------------------------------------------------
@@ -567,6 +1801,11 @@ class Handler(BaseHTTPRequestHandler):
                 if self.server.pw_hash:   # only show logout when there is a login
                     page = page.replace('id="logout" hidden', 'id="logout"', 1)
                 self._send(200, page, "text/html; charset=utf-8")
+        elif u.path == "/report":
+            if self._login_required():
+                self._redirect("/login")
+            else:
+                self._send(200, self._report(parse_qs(u.query)), "text/html; charset=utf-8")
         elif u.path == "/api/export.csv":
             if self._login_required():
                 self._send(401, {"error": "login required"})
@@ -577,12 +1816,22 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(401, {"error": "login required"})
             else:
                 self._send(200, self._query_data(parse_qs(u.query)))
+        elif u.path == "/api/machine":
+            if self._login_required():
+                self._send(401, {"error": "login required"})
+            else:
+                self._send(200, self._query_machine(parse_qs(u.query)))
+        elif u.path == "/api/account":
+            if self._login_required():
+                self._send(401, {"error": "login required"})
+            else:
+                self._send(200, self._query_account(parse_qs(u.query)))
         else:
             self._send(404, {"error": "not found"})
 
     def do_POST(self):
         u = urlparse(self.path)
-        if u.path == "/login":          # Browser-Login, nutzt KEINEN API-Key
+        if u.path == "/login":          # browser login, uses NO API key
             self._handle_login()
             return
         if u.path == "/item-status":    # browser action -> session, not API key
@@ -599,14 +1848,18 @@ class Handler(BaseHTTPRequestHandler):
                 return
             key = str(p.get("key") or "")[:400]
             status = str(p.get("status") or "")
-            if not key or "|" not in key or status not in ("offen", "arbeit", "erledigt"):
+            # Status values are English identifiers now. The German ones earlier
+            # versions used are still accepted, so a dashboard tab left open
+            # across the upgrade keeps working.
+            status = LEGACY_STATUS.get(status, status)
+            if not key or "|" not in key or status not in ("open", "in_progress", "done"):
                 self._send(400, {"error": "bad key/status"})
                 return
             # UTC, so the comparison against the agents' event timestamps (also
             # UTC) for "active again" has no timezone offset.
             now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
             with DB_LOCK:
-                if status == "offen":     # open = default -> remove the row
+                if status == "open":      # open = default -> remove the row
                     self.server.conn.execute("DELETE FROM item_status WHERE key=?", (key,))
                 else:
                     self.server.conn.execute(
@@ -656,7 +1909,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"ok": ok})
             return
         events = payload.get("events") or []
-        if isinstance(events, dict):      # Single-Event-Push -> in Liste wandeln
+        if isinstance(events, dict):      # single-event push -> wrap in a list
             events = [events]
         if not isinstance(events, list):
             self._send(400, {"error": "events must be a list"})
@@ -670,6 +1923,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def _upsert_agent(self, source, p):
         now = datetime.now(timezone.utc).isoformat()
+        # 4624s that arrived before this machine's first status report (role
+        # unknown then) are filed once it says it is not a DC.
+        if not p.get("is_dc"):
+            with DB_LOCK:
+                self.server.conn.execute("UPDATE events SET kind = 'incoming' WHERE source = ? "
+                                         "AND event_id = 4624 AND kind = 'auth'", (source,))
+                self.server.conn.commit()
 
         def g(key):
             """Status fields are display strings; a nested value from a broken
@@ -681,13 +1941,14 @@ class Handler(BaseHTTPRequestHandler):
                 return int(v)
             return str(v)[:200]
 
+        aud = lambda v: LEGACY_AUDIT.get(v, v)   # older agents send "aus"/"an"
         with DB_LOCK:
             self.server.conn.execute(
                 "INSERT INTO agents (source,is_dc,agent_version,outgoing_audit,"
                 "incoming_audit,domain_audit,lm_level,block_v1sso,cred_guard,ntlm_log_kb,"
                 "os_version,restrict_out,restrict_in,restrict_dom,exc_client,exc_dc,"
-                "domain_level,forest_level,last_seen) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "domain_level,forest_level,last_seen,first_seen,logon_audit) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(source) DO UPDATE SET is_dc=excluded.is_dc, "
                 "agent_version=excluded.agent_version, outgoing_audit=excluded.outgoing_audit, "
                 "incoming_audit=excluded.incoming_audit, domain_audit=excluded.domain_audit, "
@@ -697,14 +1958,16 @@ class Handler(BaseHTTPRequestHandler):
                 "restrict_in=excluded.restrict_in, restrict_dom=excluded.restrict_dom, "
                 "exc_client=excluded.exc_client, exc_dc=excluded.exc_dc, "
                 "domain_level=excluded.domain_level, forest_level=excluded.forest_level, "
-                "last_seen=excluded.last_seen",
+                "last_seen=excluded.last_seen, logon_audit=excluded.logon_audit, "
+                "first_seen=COALESCE(agents.first_seen, excluded.first_seen)",
                 (source, 1 if p.get("is_dc") else 0, g("agent_version"),
-                 g("outgoing_audit"), g("incoming_audit"),
-                 g("domain_audit"), g("lm_level"), g("block_v1sso"),
+                 aud(g("outgoing_audit")), aud(g("incoming_audit")),
+                 aud(g("domain_audit")), g("lm_level"), g("block_v1sso"),
                  g("cred_guard"), g("ntlm_log_kb"),
                  g("os_version"), g("restrict_out"), g("restrict_in"),
                  g("restrict_dom"), g("exc_client"), g("exc_dc"),
-                 g("domain_level"), g("forest_level"), now))
+                 g("domain_level"), g("forest_level"), now,
+                 utc_now().strftime("%Y-%m-%dT%H:%M:%S"), g("logon_audit")))
             self.server.conn.commit()
         return True
 
@@ -724,6 +1987,7 @@ class Handler(BaseHTTPRequestHandler):
 
         rows = []
         dcv = []
+        fails = []
         for e in events:
             if not isinstance(e, dict):
                 continue                     # skip garbage entries, keep the rest
@@ -734,8 +1998,21 @@ class Handler(BaseHTTPRequestHandler):
                 if e.get("event_time") and e.get("user"):
                     ws = (e.get("workstation") or "").strip().lstrip("\\").upper() or None
                     dcv.append((source, e.get("record_id"), e.get("event_time"),
-                                user_key(e.get("user")), ws, e.get("failure_code"), now))
+                                user_key(e.get("user")), ws, norm_status(e.get("failure_code")), now))
                 continue
+            # A failed NTLM logon: its own table, never counted as NTLM in use.
+            if e.get("event_id") in (4625, "4625"):
+                if e.get("event_time") and e.get("user"):
+                    ws = (e.get("workstation") or "").strip().lstrip("\\").upper() or None
+                    fails.append((source, e.get("record_id"), e.get("event_time"), e.get("user"),
+                                  user_key(e.get("user")), e.get("domain"), ws, e.get("ip"),
+                                  e.get("logon_type"), normalize_process(e.get("process")),
+                                  norm_status(e.get("failure_code")), e.get("ntlm_version"), now))
+                continue
+            # Anonymous logons (null sessions) carry no credential; Windows still
+            # labels them "NTLM V1". Kept, but without that version.
+            if str(e.get("user") or "").strip().upper() == "ANONYMOUS LOGON":
+                e["ntlm_version"] = None
             # 4022/4023 are written on the server being accessed, not on the DC:
             # they belong with 8002/8003 as incoming NTLM. Agents up to 2.1.1
             # sent them as "domain", which put member-server logons into the
@@ -772,7 +2049,7 @@ class Handler(BaseHTTPRequestHandler):
                 e.get("process_path"),
                 now,
             ))
-        if not rows and not dcv:
+        if not rows and not dcv and not fails:
             return 0
         cols = "source," + ",".join(FIELDS) + ",received_at"
         placeholders = ",".join(["?"] * (len(FIELDS) + 2))
@@ -780,12 +2057,24 @@ class Handler(BaseHTTPRequestHandler):
         with DB_LOCK:
             n = 0
             if rows:
+                # A member server's 4624 is an incoming NTLM logon on that
+                # server; on a DC it keeps its old meaning. Agents report their
+                # status before their events, so the role is known here.
+                dc = self.server.conn.execute("SELECT is_dc FROM agents WHERE source = ?", (source,)).fetchone()
+                if dc is not None and not dc[0]:
+                    rows = [r[:4] + ("incoming",) + r[5:] if str(r[3]) == "4624" else r for r in rows]
                 n += self.server.conn.executemany(sql, rows).rowcount
+                enrich_versions(self.server.conn, source, now)
             if dcv:
                 n += self.server.conn.executemany(
                     "INSERT OR IGNORE INTO dc_validations (dc, record_id, event_time, "
                     "user_key, workstation, status, received_at) VALUES (?,?,?,?,?,?,?)",
                     dcv).rowcount
+            if fails:
+                n += self.server.conn.executemany(
+                    "INSERT OR IGNORE INTO ntlm_failures (source, record_id, event_time, user, user_key, "
+                    "domain, workstation, ip, logon_type, process, status, ntlm_version, received_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", fails).rowcount
             self.server.conn.commit()
             return n
 
@@ -800,7 +2089,7 @@ class Handler(BaseHTTPRequestHandler):
         # event_time is stored as ISO (so string comparison is correct).
         rng = one("range", "all")
         deltas = {"24h": timedelta(hours=24), "7d": timedelta(days=7),
-                  "30d": timedelta(days=30)}
+                  "30d": timedelta(days=30), "90d": timedelta(days=90)}
         cutoff = None
         if rng in deltas:
             cutoff = (utc_now() - deltas[rng]).strftime("%Y-%m-%dT%H:%M:%S")
@@ -874,7 +2163,7 @@ class Handler(BaseHTTPRequestHandler):
         return one, rng, cutoff, where, params
 
     def _send_csv(self, qs):
-        """Gefilterte Ereignisliste als CSV (Excel-tauglich: BOM + Semikolon)."""
+        """Filtered event list as CSV (Excel-friendly: BOM + semicolon)."""
         one, _rng, _cutoff, where, params = self._event_filters(qs)
         limit = min(int(one("limit", "50000") or 50000), 200000)
         clause = (" WHERE " + " AND ".join(where)) if where else ""
@@ -890,7 +2179,7 @@ class Handler(BaseHTTPRequestHandler):
 
         def cell(v):
             s = "" if v is None else str(v)
-            # Schutz vor Formel-Injektion in Tabellenkalkulationen
+            # guard against formula injection in spreadsheets
             return "'" + s if s[:1] in ("=", "+", "-", "@", "\t", "\r") else s
 
         buf = io.StringIO()
@@ -902,7 +2191,7 @@ class Handler(BaseHTTPRequestHandler):
                     "Kerberos failure", "Process path"])
         for r in rows:
             w.writerow([cell(v) for v in r])
-        body = "\ufeff" + buf.getvalue()   # BOM -> Excel erkennt UTF-8
+        body = "\ufeff" + buf.getvalue()   # BOM -> Excel recognises UTF-8
         data = body.encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/csv; charset=utf-8")
@@ -913,13 +2202,238 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _report(self, qs):
+        """The printable status report (see render_report)."""
+        def one(name, default=None):
+            v = qs.get(name, [default])
+            return v[0] if v else default
+        rng = one("range", "30d")
+        rng = rng if rng in REPORT_RANGES else "30d"
+        lang = "en" if one("lang") == "en" else "de"
+        try:
+            tzoff = max(-840, min(840, int(one("tzoff") or 0)))
+        except (TypeError, ValueError):
+            tzoff = 0
+        data = self._query_data({"range": [rng], "tzoff": [str(tzoff)], "limit": ["1"]})
+        days = REPORT_RANGES[rng]
+        now = utc_now()
+        cur_start = now - timedelta(days=days)
+        with DB_LOCK:
+            c = self.server.conn
+            cur = period_counts(c, cur_start, now)
+            prev = period_counts(c, cur_start - timedelta(days=days), cur_start)
+            first = c.execute("SELECT MIN(event_time) FROM events").fetchone()[0]
+            # The previous period only compares if the data reaches back that far.
+            if not first or first[:19] > (cur_start - timedelta(days=days)).strftime(_TS):
+                prev = {"v1": None, "v2": None, "ntlm": None, "krb": None, "share": None}
+            weekly = compute_weekly(c, 26 if days > 30 else 12, tzoff)
+            done_total = c.execute("SELECT COUNT(*) FROM item_status WHERE status = 'done'").fetchone()[0]
+            done_period = c.execute("SELECT COUNT(*) FROM item_status WHERE status = 'done' AND updated_at >= ?",
+                                    (cur_start.strftime(_TS),)).fetchone()[0]
+        m = re.search(r'class="mark" alt="" width="28" height="28" src="(data:image/png;base64,[A-Za-z0-9+/=]+)"', DASHBOARD_HTML)
+        return render_report({"lang": lang, "range": rng, "tzoff": tzoff, "static": one("static") == "1",
+                              "data": data, "cur": cur, "prev": prev, "weekly": weekly,
+                              "first_event": first, "done_total": done_total, "done_period": done_period,
+                              "logo": m.group(1) if m else ""})
+
+    def _query_account(self, qs):
+        """Everything about one account for the detail drawer: where it uses
+        NTLM from, with which programs, to which servers, in which version, how
+        often it failed, and whether it already gets Kerberos tickets."""
+        one = lambda k, d="": (qs.get(k) or [d])[0]
+        key = user_key(str(one("name"))[:256]) or ""
+        rng = one("range", "30d")
+        try:
+            tzoff = max(-840, min(840, int(one("tzoff") or 0)))
+        except (TypeError, ValueError):
+            tzoff = 0
+        tzmod = f"{tzoff:+d} minutes"
+        deltas = {"24h": timedelta(hours=24), "7d": timedelta(days=7), "30d": timedelta(days=30)}
+        now = utc_now()
+        cutoff = (now - deltas[rng]).strftime(_TS) if rng in deltas else None
+        cut, cp = ("event_time >= ?", [cutoff]) if cutoff else ("1=1", [])
+        hourly = rng == "24h"
+        blen = 13 if hourly else 10
+        mine = f"{_UKEY} = ?"
+        with DB_LOCK:
+            c = self.server.conn
+            c.execute("CREATE TEMP TABLE IF NOT EXISTS x_acct (id INTEGER PRIMARY KEY)")
+            c.execute("DELETE FROM temp.x_acct")
+            c.execute(f"INSERT INTO x_acct (id) SELECT id FROM events WHERE {_TWIN_IDS} AND {mine} "
+                      f"AND {cut} AND (NOT ({NOT_SUPERSEDED}) OR {UNCONFIRMED})", [key] + cp)
+            use = f"kind IN {NTLM_USE_KINDS} AND {mine} AND {cut} AND id NOT IN (SELECT id FROM temp.x_acct)"
+            first, last = c.execute(f"SELECT MIN(event_time), MAX(event_time) FROM events WHERE {use}",
+                                    [key] + cp).fetchone()
+            ru = acct_rollup(c.execute(_ACCT_COLS.format(k=_UKEY) + f"WHERE {use} GROUP BY 1, 2, 3, 4, 5",
+                                       [key] + cp)).get(key, {})
+            n, v1, v2 = ru.get("n", 0), ru.get("v1", 0), ru.get("v2", 0)
+            krb = c.execute(f"SELECT COUNT(*) FROM events WHERE kind = 'kerberos' AND {mine} AND {cut}",
+                            [key] + cp).fetchone()[0]
+            fails_local = c.execute("SELECT COUNT(*) FROM ntlm_failures WHERE user_key = ? "
+                                    + ("AND event_time >= ?" if cutoff else ""), [key] + cp).fetchone()[0]
+            known = n or krb or fails_local or c.execute(
+                "SELECT 1 FROM dc_validations WHERE user_key = ? LIMIT 1", (key,)).fetchone()
+            if not key or not known:
+                return {"name": account_label(key), "key": key, "unknown": True}
+            # Where it comes from: the sending machine for outgoing, the client
+            # for incoming and the DC view. Each counts with its best side.
+            frm = {}
+            for m, kind, cnt in c.execute(
+                    "SELECT UPPER(CASE WHEN kind = 'outgoing' THEN source ELSE workstation END), kind, COUNT(*) "
+                    f"FROM events WHERE {use} GROUP BY 1, 2", [key] + cp):
+                if not m:
+                    continue
+                side = {"outgoing": "agent", "domain": "dc"}.get(kind, "server")
+                e = frm.setdefault(m, {"agent": 0, "server": 0, "dc": 0})
+                e[side] += cnt
+            from_rows = sorted(([m, max(v.values()), max(v, key=v.get)] for m, v in frm.items()),
+                               key=lambda x: -x[1])
+            # One logon to a server can be seen three times - the client's 8001,
+            # the server's 8003, the DC's 8004 - so per server the side that saw
+            # most counts, not the sum of all three.
+            to = {}
+            for kind, src_, tgt, cnt in c.execute(
+                    f"SELECT kind, source, target_server, COUNT(*) FROM events WHERE {use} "
+                    "GROUP BY kind, source, target_server", [key] + cp):
+                h = (src_ or "").upper()[:15] if kind in ("incoming", "auth") else host_key(tgt)
+                if h:
+                    side = {"outgoing": "agent", "domain": "dc"}.get(kind, "server")
+                    e = to.setdefault(h, {"agent": 0, "server": 0, "dc": 0})
+                    e[side] += cnt
+            to_rows = sorted(([h, max(v.values())] for h, v in to.items()), key=lambda x: -x[1])
+            progs = [[p or "", t or "", (m or "").upper(), k, a or 0] for p, t, m, k, a in c.execute(
+                "SELECT process, target_server, source, COUNT(*), "
+                "SUM(CASE WHEN ntlm_version = 'NTLMv1' THEN 1 ELSE 0 END) FROM events "
+                f"WHERE kind = 'outgoing' AND {use} GROUP BY process, target_server, source "
+                "ORDER BY COUNT(*) DESC LIMIT 8", [key] + cp)]
+            series = dict(c.execute(
+                f"SELECT substr(datetime(event_time, ?), 1, {blen}), COUNT(*) FROM events WHERE {use} GROUP BY 1",
+                [tzmod, key] + cp).fetchall())
+            fl = compute_failures(c, cutoff, None)["rows_all"]
+        fl = [f for f in fl if f["key"] == key]
+        local_now = now + timedelta(minutes=tzoff)
+        if hourly:
+            buckets = [(local_now - timedelta(hours=23 - i)).strftime("%Y-%m-%d %H") for i in range(24)]
+        else:
+            start = _ts(cutoff) if cutoff else (_ts(first) or now)
+            days = max(1, min(400, (now - start).days + 1))
+            buckets = [(local_now - timedelta(days=days - 1 - i)).strftime("%Y-%m-%d") for i in range(days)]
+        return {"name": account_label(key), "key": key, "range": rng, "first": first, "last": last,
+                "n": n or 0, "v1": v1 or 0, "v2": v2 or 0, "krb": krb,
+                "machine_account": key.endswith("$"), "anonymous": key == "ANONYMOUS LOGON",
+                "from": from_rows[:8], "from_total": len(from_rows), "to": to_rows[:8], "to_total": len(to_rows),
+                "programs": progs, "failed": {"n": sum(f["n"] for f in fl), "rows": fl[:10]},
+                "series": {"b": buckets, "n": [series.get(b, 0) for b in buckets]}}
+
+    def _query_machine(self, qs):
+        """Everything about one machine for the detail drawer.
+
+        Outgoing is what the machine itself sent (duplicates and unconfirmed
+        8001s left out, as everywhere). Incoming is gathered from three sides -
+        the machine's own incoming events, the DCs' domain view, and other
+        machines' outgoing events naming it - and one logon can show up in all
+        three. So each (account, source machine) pair counts with the highest
+        of its three numbers, never their sum, and says which side saw it.
+        """
+        one = lambda k, d="": (qs.get(k) or [d])[0]
+        name = str(one("name"))[:64]
+        rng = one("range", "30d")
+        try:
+            tzoff = int(one("tzoff") or 0)
+        except (TypeError, ValueError):
+            tzoff = 0
+        tzoff = max(-840, min(840, tzoff))
+        tzmod = f"{tzoff:+d} minutes"
+        deltas = {"24h": timedelta(hours=24), "7d": timedelta(days=7), "30d": timedelta(days=30)}
+        now = utc_now()
+        cutoff = (now - deltas[rng]).strftime(_TS) if rng in deltas else None
+        cut, cp = ("event_time >= ?", [cutoff]) if cutoff else ("1=1", [])
+        key = name.upper()[:15]
+        hourly = rng == "24h"
+        blen = 13 if hourly else 10
+        with DB_LOCK:
+            c = self.server.conn
+            known = c.execute("SELECT 1 FROM agents WHERE source = ? UNION SELECT 1 FROM events "
+                              "WHERE source = ? LIMIT 1", (name, name)).fetchone()
+            if not name or not known:
+                return {"name": name, "unknown": True}
+            c.execute("CREATE TEMP TABLE IF NOT EXISTS x_mach (id INTEGER PRIMARY KEY)")
+            c.execute("DELETE FROM temp.x_mach")
+            c.execute(f"INSERT INTO x_mach (id) SELECT id FROM events WHERE source = ? AND {_TWIN_IDS} "
+                      f"AND {cut} AND (NOT ({NOT_SUPERSEDED}) OR {UNCONFIRMED})", [name] + cp)
+            counted = "id NOT IN (SELECT id FROM temp.x_mach)"
+            o = c.execute(
+                "SELECT COUNT(*), SUM(CASE WHEN ntlm_version='NTLMv1' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN ntlm_version='NTLMv2' THEN 1 ELSE 0 END) FROM events "
+                f"WHERE source = ? AND kind = 'outgoing' AND {cut} AND {counted}", [name] + cp).fetchone()
+            top = [[p or "", t or "", n, v1 or 0] for p, t, n, v1 in c.execute(
+                "SELECT process, target_server, COUNT(*), SUM(CASE WHEN ntlm_version='NTLMv1' THEN 1 ELSE 0 END) "
+                f"FROM events WHERE source = ? AND kind = 'outgoing' AND {cut} AND {counted} "
+                "GROUP BY process, target_server ORDER BY COUNT(*) DESC LIMIT 8", [name] + cp)]
+            users = [[u or "", n] for u, n in c.execute(
+                f"SELECT user, COUNT(*) FROM events WHERE source = ? AND kind = 'outgoing' AND {cut} AND {counted} "
+                "GROUP BY user ORDER BY COUNT(*) DESC LIMIT 6", [name] + cp)]
+            pairs = {}
+            def add(user, frm, n, via):
+                k = ((user or "").lower(), (frm or "").upper())
+                e = pairs.setdefault(k, {"user": user or "", "from": (frm or "").upper(), "local": 0, "dc": 0, "cli": 0})
+                e[via] += n
+            n_local = 0
+            for user, ws, n in c.execute(
+                    f"SELECT user, workstation, COUNT(*) FROM events WHERE source = ? AND kind = 'incoming' AND {cut} "
+                    f"AND {counted} GROUP BY user, workstation", [name] + cp):
+                add(user, ws, n, "local"); n_local += n
+            like = [f"%{name}%"]
+            for tgt, user, ws, n in c.execute(
+                    "SELECT target_server, user, workstation, COUNT(*) FROM events WHERE kind = 'domain' "
+                    f"AND target_server LIKE ? AND {cut} GROUP BY target_server, user, workstation", like + cp):
+                if host_key(tgt) == key:
+                    add(user, ws, n, "dc")
+            # The machine's own outgoing NTLM to itself counts too: denying
+            # incoming NTLM there would break that as well (the readiness
+            # verdict counts it the same way, so both numbers agree).
+            for src, tgt, user, n in c.execute(
+                    "SELECT source, target_server, user, COUNT(*) FROM events WHERE kind = 'outgoing' "
+                    f"AND target_server LIKE ? AND {cut} GROUP BY source, target_server, user",
+                    like + cp):
+                if host_key(tgt) == key:
+                    add(user, src, n, "cli")
+            inc = []
+            for e in pairs.values():
+                via = max(("local", "dc", "cli"), key=lambda v: e[v])
+                inc.append([e["user"], e["from"], e[via], via])
+            inc.sort(key=lambda x: -x[2])
+            series_out = dict(c.execute(
+                f"SELECT substr(datetime(event_time, ?), 1, {blen}), COUNT(*) FROM events "
+                f"WHERE source = ? AND kind = 'outgoing' AND {cut} AND {counted} GROUP BY 1",
+                [tzmod, name] + cp).fetchall())
+            series_in = dict(c.execute(
+                f"SELECT substr(datetime(event_time, ?), 1, {blen}), COUNT(*) FROM events "
+                f"WHERE source = ? AND kind = 'incoming' AND {cut} AND {counted} GROUP BY 1",
+                [tzmod, name] + cp).fetchall())
+            first, last = c.execute("SELECT MIN(event_time), MAX(event_time) FROM events WHERE source = ?",
+                                    (name,)).fetchone()
+        # A continuous axis, empty buckets included, so a quiet week looks quiet.
+        local_now = now + timedelta(minutes=tzoff)
+        if hourly:
+            buckets = [(local_now - timedelta(hours=23 - i)).strftime("%Y-%m-%d %H") for i in range(24)]
+        else:
+            start = _ts(cutoff) if cutoff else (_ts(first) or now)
+            days = max(1, min(400, (now - start).days + 1))
+            buckets = [(local_now - timedelta(days=days - 1 - i)).strftime("%Y-%m-%d") for i in range(days)]
+        return {"name": name, "range": rng, "first": first, "last": last,
+                "out": {"n": o[0] or 0, "v1": o[1] or 0, "v2": o[2] or 0, "top": top, "users": users},
+                "inc": {"local": n_local, "who": len(inc), "pairs": inc[:8]},
+                "series": {"b": buckets, "out": [series_out.get(b, 0) for b in buckets],
+                           "inc": [series_in.get(b, 0) for b in buckets]}}
+
     def _query_data(self, qs):
         one, rng, cutoff, where, params = self._event_filters(qs)
         limit = min(int(one("limit", "300") or 300), 2000)
-        # tf/tp sind der gemeinsame Filter ALLER Aggregate. Neben dem Zeitraum
-        # wirkt hier auch die Maschinenauswahl - dadurch filtert sie global und
-        # nicht nur die Ereignisliste. Die Klausel bleibt ein fester String,
-        # Benutzereingaben gehen ausschliesslich als Parameter hinein.
+        # tf/tp are the shared filter of ALL aggregates. Besides the time range
+        # the machine selection applies here too - so it filters globally, not
+        # only the event list. The clause stays a fixed string; user input only
+        # ever goes in as parameters.
         # Browser UTC offset in minutes (east positive). Everything is stored in
         # UTC; the day/hour buckets below have to be shifted into the viewer's
         # local time, otherwise "peak on Sunday at 03:00" names the wrong hour.
@@ -948,7 +2462,7 @@ class Handler(BaseHTTPRequestHandler):
             f"WHEN NOT ({NOT_SUPERSEDED}) THEN 1 "
             f"WHEN {JUDGEABLE} AND {DC_COVERED} AND NOT {DCV_USER} THEN 3 "
             "ELSE 2 END FROM events "
-            f"WHERE event_id = 8001 AND {base_where} "
+            f"WHERE {_TWIN_IDS} AND {base_where} "
             f"AND (NOT ({NOT_SUPERSEDED}) OR {UNCONFIRMED})")
         # Every aggregate leaves out both duplicate and unconfirmed 8001s.
         tf = " AND ".join(["id NOT IN (SELECT id FROM temp.x_cls)"] + base_parts)
@@ -974,7 +2488,7 @@ class Handler(BaseHTTPRequestHandler):
                       c.execute("SELECT key, status, updated_at FROM item_status").fetchall()}
             def with_status(prefix, a, b, row):
                 key = f"{prefix}|{a}|{b}"
-                st, st_at = st_map.get(key, ("offen", None))
+                st, st_at = st_map.get(key, ("open", None))
                 row.update(key=key, st=st, st_at=st_at)
                 return row
             stats = {
@@ -1051,7 +2565,7 @@ class Handler(BaseHTTPRequestHandler):
                 f"GROUP BY process ORDER BY COUNT(*) DESC LIMIT 15", tp).fetchall()]
             v1_users = [dict(name=r[0], n=r[1]) for r in c.execute(
                 f"SELECT user, COUNT(*) FROM events WHERE ntlm_version='NTLMv1' AND {tf} "
-                f"GROUP BY user ORDER BY COUNT(*) DESC LIMIT 15", tp).fetchall()]
+                f"GROUP BY user ORDER BY COUNT(*) DESC LIMIT {PANEL_LIMIT}", tp).fetchall()]
             # Shutdown blockers: outgoing NTLM (8001) - breaks once the outgoing policy denies
             blockers = [with_status("proc", r[0], r[1],
                              dict(process=r[0], target=r[1], n=r[2], blocked=r[3],
@@ -1060,13 +2574,13 @@ class Handler(BaseHTTPRequestHandler):
                 f"COUNT(*), SUM(CASE WHEN event_id IN (4001,4002,4003,4004,4005,4006,4013) THEN 1 ELSE 0 END), COUNT(DISTINCT user), COUNT(DISTINCT source), MAX(event_time), "
                 f"GROUP_CONCAT(DISTINCT user) "
                 f"FROM events WHERE event_id IN (8001,4001,4020,4021,4013) AND {tf} "
-                f"GROUP BY process, target_server ORDER BY COUNT(*) DESC LIMIT 50", tp).fetchall()]
+                f"GROUP BY process, target_server ORDER BY COUNT(*) DESC LIMIT {PANEL_LIMIT}", tp).fetchall()]
             # "Why NTLM?" - grouped by the Usage ID of the enhanced 40xx events.
             # This is the actual worklist: each cause has its own remediation,
             # so the same program can appear under two different reasons.
             reasons = [dict(rid=r[0],
-                            text=REASON_IDS.get(r[0], ("Unknown reason", "unklar"))[0],
-                            cat=REASON_IDS.get(r[0], ("", "unklar"))[1],
+                            text=REASON_IDS.get(r[0], ("Unknown reason", "unclear"))[0],
+                            cat=REASON_IDS.get(r[0], ("", "unclear"))[1],
                             n=r[1], procs=r[2], machines=r[3], last_seen=r[4],
                             sample=r[5]) for r in c.execute(
                 f"SELECT reason_id, COUNT(*), COUNT(DISTINCT process), "
@@ -1074,14 +2588,14 @@ class Handler(BaseHTTPRequestHandler):
                 f"MAX(COALESCE(target_server,'')) "
                 f"FROM events WHERE reason_id IS NOT NULL AND reason_id != '' AND {tf} "
                 f"GROUP BY reason_id ORDER BY COUNT(*) DESC", tp).fetchall()]
-            # Zweite Quelle: fehlgeschlagene Kerberos-Anfragen (4769). Auf
-            # Systemen ohne die 40xx-Ereignisse die einzige Fruehwarnung -
-            # 0x7 (SPN fehlt) ist der klassische Fallback-Vorbote. Gleiche
-            # Tabelle, gleiche Abhilfe-Spalte; rid bekommt ein "k"-Praefix,
-            # damit die i18n-Schluessel nicht mit den Usage-IDs kollidieren.
+            # Second source: failed Kerberos requests (4769). On systems
+            # without the 40xx events the only early warning - 0x7 (SPN
+            # missing) is the classic harbinger of a fallback. Same table,
+            # same remedy column; rid gets a "k" prefix so the i18n keys do
+            # not collide with the usage IDs.
             reasons += [dict(rid="k" + r[0],
-                             text=KRB_FAIL.get(r[0], ("Kerberos failure " + r[0], "unklar"))[0],
-                             cat=KRB_FAIL.get(r[0], ("", "unklar"))[1],
+                             text=KRB_FAIL.get(r[0], ("Kerberos failure " + r[0], "unclear"))[0],
+                             cat=KRB_FAIL.get(r[0], ("", "unclear"))[1],
                              n=r[1], procs=0, machines=r[2], last_seen=r[3],
                              sample=r[4]) for r in c.execute(
                 f"SELECT failure_code, COUNT(*), COUNT(DISTINCT source), "
@@ -1125,7 +2639,7 @@ class Handler(BaseHTTPRequestHandler):
                 f"SUM(CASE WHEN event_id IN (4002,4003) THEN 1 ELSE 0 END), "
                 f"COUNT(DISTINCT user), COUNT(DISTINCT workstation), MAX(event_time) "
                 f"FROM events WHERE kind='incoming' AND {tf} "
-                f"GROUP BY source, process ORDER BY COUNT(*) DESC LIMIT 50", tp).fetchall()]
+                f"GROUP BY source, process ORDER BY COUNT(*) DESC LIMIT {PANEL_LIMIT}", tp).fetchall()]
             # NTLMv1 SSO (4024/4025): its own blocker with a hard October 2026 deadline
             v1sso = [with_status("v1sso", r[0], r[1],
                           dict(user=r[0], target=r[1], n=r[2], sources=r[3],
@@ -1134,7 +2648,7 @@ class Handler(BaseHTTPRequestHandler):
                 f"COUNT(*), COUNT(DISTINCT source), MAX(event_time), "
                 f"MAX(CASE WHEN event_id=4025 THEN 1 ELSE 0 END) "
                 f"FROM events WHERE kind='ntlmv1sso' AND {tf} "
-                f"GROUP BY user, target_server ORDER BY COUNT(*) DESC LIMIT 50", tp).fetchall()]
+                f"GROUP BY user, target_server ORDER BY COUNT(*) DESC LIMIT {PANEL_LIMIT}", tp).fetchall()]
             # NTLM inside the domain (8004 and 4030-4033, from the DC only): most reliable
             # source->target view. 4022/4023 are deliberately not here - see ingest.
             domain = [with_status("dom", r[0], r[1],
@@ -1145,14 +2659,14 @@ class Handler(BaseHTTPRequestHandler):
                 f"SUM(CASE WHEN event_id IN (4004,4005,4006) THEN 1 ELSE 0 END), "
                 f"MAX(event_time), GROUP_CONCAT(DISTINCT user) "
                 f"FROM events WHERE event_id IN (8004,8005,8006,4004,4005,4006,4030,4031,4032,4033) AND {tf} "
-                f"GROUP BY workstation, target_server ORDER BY COUNT(*) DESC LIMIT 50", tp).fetchall()]
+                f"GROUP BY workstation, target_server ORDER BY COUNT(*) DESC LIMIT {PANEL_LIMIT}", tp).fetchall()]
             # Kerberos (informational): which services/SPNs already use Kerberos
             kerberos = [dict(service=r[0], accounts=r[1], n=r[2],
                              enc=r[3], last_seen=r[4]) for r in c.execute(
                 f"SELECT COALESCE(target_server,'(unknown)'), COUNT(DISTINCT user), COUNT(*), "
                 f"       GROUP_CONCAT(DISTINCT enc_type), MAX(event_time) "
                 f"FROM events WHERE kind='kerberos' AND {tf} "
-                f"GROUP BY target_server ORDER BY COUNT(*) DESC LIMIT 50", tp).fetchall()]
+                f"GROUP BY target_server ORDER BY COUNT(*) DESC LIMIT {PANEL_LIMIT}", tp).fetchall()]
             # Kerberos by account: the "safe side" - which accounts already use Kerberos
             kerberos_accounts = [dict(account=r[0], services=r[1], svc_count=r[2], n=r[3],
                                       enc=r[4], last_seen=r[5]) for r in c.execute(
@@ -1160,10 +2674,10 @@ class Handler(BaseHTTPRequestHandler):
                 f"       COUNT(DISTINCT target_server), COUNT(*), "
                 f"       GROUP_CONCAT(DISTINCT enc_type), MAX(event_time) "
                 f"FROM events WHERE kind='kerberos' AND user IS NOT NULL AND user<>'' AND {tf} "
-                f"GROUP BY user ORDER BY COUNT(*) DESC LIMIT 50", tp).fetchall()]
+                f"GROUP BY user ORDER BY COUNT(*) DESC LIMIT {PANEL_LIMIT}", tp).fetchall()]
             srcs = [r[0] for r in c.execute(
                 "SELECT DISTINCT source FROM events ORDER BY source").fetchall()]
-            # Maschinen: Heartbeat (last_seen) + Audit-Status + Eventzahl je Quelle
+            # Machines: heartbeat (last_seen) + audit status + event count per source
             # (deliberately WITHOUT the time filter: shows the agents' current state)
             agents = [dict(source=r[0], is_dc=bool(r[1]), agent_version=r[2],
                            outgoing_audit=r[3], incoming_audit=r[4], domain_audit=r[5],
@@ -1174,7 +2688,7 @@ class Handler(BaseHTTPRequestHandler):
                            restrict_out=r[15], restrict_in=r[16],
                            restrict_dom=r[17], exc_client=r[18],
                            exc_dc=r[19], domain_level=r[20], forest_level=r[21],
-                           dcval=r[22] or 0, dcval_last=r[23],
+                           dcval=r[22] or 0, dcval_last=r[23], logon_audit=r[24],
                            cg=cg_by_src.get(r[0], 0)) for r in c.execute(
                 "SELECT a.source, a.is_dc, a.agent_version, a.outgoing_audit, a.incoming_audit, "
                 "a.domain_audit, a.last_seen, "
@@ -1188,12 +2702,13 @@ class Handler(BaseHTTPRequestHandler):
                 # Per DC: does it deliver 4776? One DC without them blocks every
                 # phantom verdict, so the machines panel has to say which one.
                 "(SELECT COUNT(*) FROM dc_validations v WHERE v.dc = a.source), "
-                "(SELECT MAX(event_time) FROM dc_validations v WHERE v.dc = a.source) "
+                "(SELECT MAX(event_time) FROM dc_validations v WHERE v.dc = a.source), "
+                "a.logon_audit "
                 "FROM agents a ORDER BY a.last_seen DESC").fetchall()]
 
-            # Datenbasis: seit wann liegen ueberhaupt Events vor? Zwei Wochen im
-            # Normalbetrieb gelten als Minimum, damit auch woechentliche
-            # Aufgaben und Batch-Jobs einmal gelaufen sind.
+            # Data basis: since when are there any events at all? Two weeks of
+            # normal operation count as the minimum, so that weekly tasks and
+            # batch jobs have run at least once.
             first_all = c.execute("SELECT MIN(event_time) FROM events").fetchone()[0]
             coverage_days = None
             if first_all:
@@ -1221,7 +2736,19 @@ class Handler(BaseHTTPRequestHandler):
             events_total = c.execute(
                 f"SELECT COUNT(*) FROM events{clause}", params).fetchone()[0]
 
-        return {"stats": stats, "v1sso": v1sso, "incoming": incoming, "reasons": reasons, "trend": trend, "trend_bucket": ("hour" if rng == "24h" else "day"), "heat": heat, "spark": spark,
+            failures = compute_failures(c, cutoff, src)
+            accounts = compute_accounts(c, tf, tp, failures)
+            failures.pop("rows_all", None)
+            # Which machines would log a failed logon at all ("Audit Logon: Failure").
+            failures["blind"] = c.execute(
+                "SELECT COUNT(*) FROM agents WHERE logon_audit IN ('success', 'none')").fetchone()[0]
+            readiness = cached("ready", lambda: compute_readiness(c))
+            kpi = cached(("kpi", tzoff, src or ""), lambda: compute_kpi(c, tzoff, src))
+            agentless = cached(("noagent", rng), lambda: compute_agentless(c, cutoff))
+
+        return {"readiness": readiness, "agentless": agentless, "kpi": kpi,
+                "failures": failures, "accounts": accounts,
+                "stats": stats, "v1sso": v1sso, "incoming": incoming, "reasons": reasons, "trend": trend, "trend_bucket": ("hour" if rng == "24h" else "day"), "heat": heat, "spark": spark,
                 "top_proc": top_proc, "v1_users": v1_users,
                 "blockers": blockers, "domain": domain, "kerberos": kerberos,
                 "kerberos_accounts": kerberos_accounts,
@@ -1236,6 +2763,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>NTLM-Analyzer</title>
+<script>
+// Before first paint: a remembered theme choice, so the page never flashes in
+// the other one. Without a choice the stylesheet follows the system setting.
+try { var th = localStorage.getItem('ntlm.theme');
+      if(th === 'light' || th === 'dark') document.documentElement.setAttribute('data-theme', th); } catch(e){}
+</script>
 <!-- Embedded rather than a separate file: the dashboard is one
      self-contained page with no external requests, and the CSP allows
      data: for images. A browser tab with the generic globe next to a
@@ -1246,23 +2779,147 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <style>
 :root{
   /* Tells the browser to draw native controls - select popups, scrollbars,
-     focus rings - in their dark variant. Without it the dropdown list is
-     rendered by the OS with light defaults and unreadable grey text. */
+     focus rings - in the matching variant. */
   color-scheme:dark;
-  --void:#0e131f; --card:#18202f; --card2:#1d2637;
-  --edge:rgba(158,180,225,.13); --edge2:rgba(158,180,225,.24);
-  --ink:#eef2fa; --dim:#a3b1c9; --faint:#7c8aa4;
-  --v1:#ff6b6b; --v2:#f5b841; --krb:#3ddc97; --pol:#a78bfa; --grey:#4a5872;
+  --void:#0a0f1c;
+  --card:#121a2b;
+  --card2:#18233a;
+  --ink:#eef2f8;
+  --dim:#a3b0c6;
+  --faint:#7c8aa5;
+  --v1:#ff6b6b;
+  --v2:#f5b841;
+  --krb:#3ddc97;
+  --pol:#a78bfa;
+  --grey:#4a5872;
+  --gold:#d9b84a;
+  --gold-ink:#1b1704;
+  --hi-rgb:255,255,255;
+  --gold-rgb:217,184,74;
+  --v1-rgb:255,107,107;
+  --v2-rgb:245,184,65;
+  --krb-rgb:61,220,151;
+  --line-rgb:158,180,225;
+  --hdr-rgb:10,15,28;
+  --shade-rgb:0,0,0;
+  --pol-rgb:167,139,250;
+  --scrim-rgb:6,9,16;
+  --tip:#1d2637;
+  --tip-sel:#26314a;
+  --tip-sel-ink:#ffffff;
+  --v1-hi:#ffb3b3;
+  --v2-hi:#ffd894;
+  --krb-hi:#9ff0cb;
+  --gold-hi:#ffe9a8;
+  --v1-deep:#c94a4a;
+  --v2-deep:#c08b2c;
+  --drawer:#141c2d;
+  --code:#0b1019;
+  --bar-v1:#ff5a5a;
+  --bar-v2:#f5b841;
+  --bar-krb:#2fc98a;
+  --shadow:0 1px 0 rgba(255,255,255,.035) inset, 0 16px 36px rgba(0,0,0,.32);
+  --edge:rgba(var(--line-rgb),.12); --edge2:rgba(var(--line-rgb),.22);
   /* Brand accent (same muted gold as the logo and the project page), used only
      for interactive chrome - focus rings, active pills, toggle states. Never
      for data: v1/v2/krb keep meaning "insecure / outdated / safe" everywhere,
      and this must not blur into that. */
-  --gold:#d9b84a; --gold-ink:#1b1704;
   --disp:'Segoe UI Variable Display','Segoe UI',system-ui,-apple-system,sans-serif;
   --text:'Segoe UI Variable Text','Segoe UI',system-ui,-apple-system,sans-serif;
   --mono:'Cascadia Mono','IBM Plex Mono',ui-monospace,Consolas,'SF Mono',monospace;
-  --r:6px; --pad:clamp(20px,2.8vw,52px);   /* crisper panel corners, closer to the reference's hairline-bordered look */
+  /* Soft surfaces with depth instead of hairline boxes: rounder corners and a
+     shadow carry the separation the borders used to. */
+  --r:16px; --pad:clamp(20px,2.8vw,52px);
 }
+/* Light theme: follows the system unless the viewer picked one (data-theme on
+   <html>, remembered per browser). Every colour above that differs is set
+   again here - including the channel values, so each rgba(var(--x-rgb),a)
+   in the rules below turns into the light equivalent without a second rule. */
+:root[data-theme="light"]{
+  color-scheme:light;
+  --void:#f3f5f9;
+  --card:#ffffff;
+  --card2:#f6f8fb;
+  --ink:#0f172a;
+  --dim:#475569;
+  --faint:#5b6b82;
+  --v1:#c62828;
+  --v2:#a15c07;
+  --krb:#137a50;
+  --pol:#6d28d9;
+  --grey:#94a3b8;
+  --gold:#8a6a12;
+  --gold-ink:#fffdf5;
+  --hi-rgb:15,23,42;
+  --gold-rgb:168,132,30;
+  --v1-rgb:220,38,38;
+  --v2-rgb:217,119,6;
+  --krb-rgb:5,150,105;
+  --line-rgb:15,23,42;
+  --hdr-rgb:255,255,255;
+  --shade-rgb:15,23,42;
+  --pol-rgb:124,58,237;
+  --scrim-rgb:15,23,42;
+  --tip:#ffffff;
+  --tip-sel:#e8edf5;
+  --tip-sel-ink:#0f172a;
+  --v1-hi:#b91c1c;
+  --v2-hi:#92400e;
+  --krb-hi:#065f46;
+  --gold-hi:#6b5310;
+  --v1-deep:#ef4444;
+  --v2-deep:#f59e0b;
+  --drawer:#ffffff;
+  --code:#f1f4f9;
+  --bar-v1:#e04545;
+  --bar-v2:#e3a21a;
+  --bar-krb:#23a874;
+  --shadow:0 1px 2px rgba(15,23,42,.05), 0 12px 28px rgba(15,23,42,.07);
+}
+@media (prefers-color-scheme: light){
+  :root:not([data-theme="dark"]){
+    color-scheme:light;
+    --void:#f3f5f9;
+    --card:#ffffff;
+    --card2:#f6f8fb;
+    --ink:#0f172a;
+    --dim:#475569;
+    --faint:#5b6b82;
+    --v1:#c62828;
+    --v2:#a15c07;
+    --krb:#137a50;
+    --pol:#6d28d9;
+    --grey:#94a3b8;
+    --gold:#8a6a12;
+    --gold-ink:#fffdf5;
+    --hi-rgb:15,23,42;
+    --gold-rgb:168,132,30;
+    --v1-rgb:220,38,38;
+    --v2-rgb:217,119,6;
+    --krb-rgb:5,150,105;
+    --line-rgb:15,23,42;
+    --hdr-rgb:255,255,255;
+    --shade-rgb:15,23,42;
+    --pol-rgb:124,58,237;
+    --scrim-rgb:15,23,42;
+    --tip:#ffffff;
+    --tip-sel:#e8edf5;
+    --tip-sel-ink:#0f172a;
+    --v1-hi:#b91c1c;
+    --v2-hi:#92400e;
+    --krb-hi:#065f46;
+    --gold-hi:#6b5310;
+    --v1-deep:#ef4444;
+    --v2-deep:#f59e0b;
+    --drawer:#ffffff;
+    --code:#f1f4f9;
+    --bar-v1:#e04545;
+    --bar-v2:#e3a21a;
+    --bar-krb:#23a874;
+    --shadow:0 1px 2px rgba(15,23,42,.05), 0 12px 28px rgba(15,23,42,.07);
+  }
+}
+
 *{box-sizing:border-box}
 html{scroll-behavior:smooth}
 /* No overflow-x:hidden here. It was added against 4 px of sideways scroll on
@@ -1273,21 +2930,20 @@ html{scroll-behavior:smooth}
 body{margin:0;background:var(--void);color:var(--ink);font-family:var(--text);font-size:18px;
   line-height:1.5;-webkit-font-smoothing:antialiased}
 body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:0;
-  background:radial-gradient(1200px 600px at 10% -8%,rgba(255,107,107,.05),transparent 62%),
-             radial-gradient(1200px 700px at 90% 108%,rgba(217,184,74,.042),transparent 62%)}
+  background:radial-gradient(1200px 600px at 10% -8%,rgba(var(--v1-rgb),.05),transparent 62%),
+             radial-gradient(1200px 700px at 90% 108%,rgba(var(--gold-rgb),.042),transparent 62%)}
 .stage{position:relative;z-index:1}
-::selection{background:rgba(217,184,74,.30)}
+::selection{background:rgba(var(--gold-rgb),.30)}
 :focus-visible{outline:2px solid var(--gold);outline-offset:2px;border-radius:6px}
 button{font:inherit}
 a{color:inherit}
 
 header{position:sticky;top:0;z-index:60;backdrop-filter:blur(18px) saturate(1.4);
-  background:rgba(14,19,31,.80);border-bottom:1px solid var(--edge)}
+  background:rgba(var(--hdr-rgb),.80);border-bottom:1px solid var(--edge)}
 .hin{padding:0 var(--pad);height:66px;display:flex;align-items:center;gap:16px}
 /* The controls scrolled sideways out of view on a phone: the language toggle
    and the CSV button were simply unreachable. Wrapping costs a second row and
    keeps everything within reach. */
-}
 .logo{display:flex;align-items:center;gap:11px;font-family:var(--disp);font-size:17px;font-weight:600;
   letter-spacing:-.02em;white-space:nowrap}
 .orb{width:9px;height:9px;border-radius:50%;background:var(--krb);position:relative;flex:none}
@@ -1295,25 +2951,47 @@ header{position:sticky;top:0;z-index:60;backdrop-filter:blur(18px) saturate(1.4)
   opacity:.35;animation:ping 3.2s cubic-bezier(.2,.7,.3,1) infinite}
 .orb.stale{background:var(--v2)} .orb.stale::after{border-color:var(--v2)}
 @keyframes ping{0%{transform:scale(.6);opacity:.5}70%,100%{transform:scale(1.5);opacity:0}}
-.tools{display:flex;align-items:center;gap:8px;margin-left:auto;flex-wrap:wrap;justify-content:flex-end}
-.pill{display:flex;background:rgba(255,255,255,.035);border:1px solid var(--edge);border-radius:9px;
+.tools{display:flex;align-items:center;gap:8px;margin-left:12px;flex-wrap:wrap;justify-content:flex-end}
+/* Quick search: the button in the header, and the dialog it opens (Ctrl+K) */
+.searchbtn{display:inline-flex;align-items:center;gap:8px;margin-left:auto;height:36px;padding:0 8px 0 12px;border-radius:10px;
+  border:1px solid var(--edge);background:var(--card);color:var(--dim);font-family:var(--mono);font-size:13px;cursor:pointer;flex:none}
+.searchbtn kbd,.palin kbd{font-family:var(--mono);font-size:11px;padding:2px 6px;border-radius:5px;border:1px solid var(--edge2);color:var(--faint)}
+.searchbtn:hover{border-color:var(--gold);color:var(--ink)}
+.pal{position:fixed;inset:0;z-index:300;background:rgba(var(--scrim-rgb),.55);backdrop-filter:blur(4px);
+  display:flex;justify-content:center;align-items:flex-start;padding:12vh 16px 16px}
+.pal[hidden]{display:none}
+.palbox{width:min(660px,100%);background:var(--card);border:1px solid var(--edge2);border-radius:16px;
+  box-shadow:0 30px 80px rgba(var(--shade-rgb),.45);overflow:hidden;display:flex;flex-direction:column;max-height:72vh}
+.palin{display:flex;align-items:center;gap:10px;padding:14px 16px;border-bottom:1px solid var(--edge);color:var(--dim)}
+.palin input{flex:1;min-width:0;background:none;border:0;outline:none;color:var(--ink);font:inherit;font-size:17px}
+.palin input::-webkit-search-cancel-button{display:none}
+#palres{list-style:none;margin:0;padding:6px;overflow-y:auto}
+#palres li{display:flex;align-items:center;gap:12px;padding:9px 10px;border-radius:9px;cursor:pointer;min-height:40px}
+#palres li[aria-selected="true"]{background:rgba(var(--gold-rgb),.14)}
+.pty{font-family:var(--mono);font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--faint);min-width:92px;flex:none}
+.plb{color:var(--ink);font-size:15px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.psb{margin-left:auto;color:var(--faint);font-family:var(--mono);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:45%;flex:none}
+#palres mark{background:none;color:var(--gold);font-weight:650}
+.palfoot{border-top:1px solid var(--edge);padding:8px 16px;font-family:var(--mono);font-size:11.5px;color:var(--faint)}
+.palnone{padding:18px 16px;color:var(--dim);list-style:none}
+.pill{display:flex;background:rgba(var(--hi-rgb),.035);border:1px solid var(--edge);border-radius:9px;
   padding:2px;gap:2px}
 .pill button{background:none;border:0;color:var(--dim);font-family:var(--mono);font-size:12.5px;
   padding:5px 11px;border-radius:7px;cursor:pointer;transition:.18s;white-space:nowrap}
 .pill button:hover{color:var(--ink)}
-.pill button[aria-pressed=true]{background:rgba(217,184,74,.16);color:var(--gold);
-  box-shadow:inset 0 0 0 1px rgba(217,184,74,.4)}
-select,.ghost{background:rgba(255,255,255,.035);border:1px solid var(--edge);color:var(--ink);
+.pill button[aria-pressed=true]{background:rgba(var(--gold-rgb),.16);color:var(--gold);
+  box-shadow:inset 0 0 0 1px rgba(var(--gold-rgb),.4)}
+select,.ghost{background:rgba(var(--hi-rgb),.035);border:1px solid var(--edge);color:var(--ink);
   border-radius:9px;padding:6px 10px;font-family:var(--mono);font-size:12.5px;cursor:pointer;transition:.18s}
-select:hover,.ghost:hover{border-color:var(--edge2);background:rgba(255,255,255,.06)}
-select option,.sel-st option{background:#1d2637;color:var(--ink)}
-select option:checked,.sel-st option:checked{background:#26314a;color:#fff}
-.ghost[aria-pressed=true]{background:rgba(217,184,74,.14);border-color:rgba(217,184,74,.4);color:var(--gold)}
+select:hover,.ghost:hover{border-color:var(--edge2);background:rgba(var(--hi-rgb),.06)}
+select option,.sel-st option{background:var(--tip);color:var(--ink)}
+select option:checked,.sel-st option:checked{background:var(--tip-sel);color:var(--tip-sel-ink)}
+.ghost[aria-pressed=true]{background:rgba(var(--gold-rgb),.14);border-color:rgba(var(--gold-rgb),.4);color:var(--gold)}
 
 .herotop{display:flex;gap:clamp(24px,4vw,70px);align-items:flex-start}
 .herotext{flex:1 1 auto;min-width:0}
 .osdon{flex:0 0 auto;width:330px;border:1px solid var(--edge);border-radius:var(--r);
-  background:rgba(255,255,255,.02);padding:16px 18px}
+  background:rgba(var(--hi-rgb),.02);padding:16px 18px}
 .osdon .oh{font-family:var(--mono);font-size:12px;letter-spacing:.09em;text-transform:uppercase;
   color:var(--faint);margin-bottom:12px}
 .osdon .ow{display:flex;align-items:center;gap:16px}
@@ -1336,7 +3014,7 @@ select option:checked,.sel-st option:checked{background:#26314a;color:#fff}
 .osdon .flr b{font-family:var(--mono);font-size:13px;color:var(--ink);font-weight:600}
 .osdon .flr em{font-style:normal;color:var(--v2);font-weight:700;cursor:help}
 @media(max-width:1250px){.osdon{display:none}}
-.jump{position:sticky;top:66px;z-index:55;backdrop-filter:blur(14px);background:rgba(14,19,31,.76);
+.jump{position:sticky;top:66px;z-index:55;backdrop-filter:blur(14px);background:rgba(var(--hdr-rgb),.76);
   border-bottom:1px solid var(--edge);padding:9px var(--pad);display:flex;gap:5px;flex-wrap:wrap}
 .jl{background:none;border:1px solid transparent;color:var(--faint);font-family:var(--mono);
   font-size:14px;padding:4px 9px;border-radius:7px;cursor:pointer;transition:.16s;display:flex;
@@ -1346,7 +3024,6 @@ select option:checked,.sel-st option:checked{background:#26314a;color:#fff}
 .jl.nil{opacity:.4}
 
 .hero{padding:58px var(--pad) 44px}
-}
 .eyebrow{font-family:var(--mono);font-size:15.5px;letter-spacing:.16em;text-transform:uppercase;
   color:var(--faint);margin-bottom:16px}
 .thesis{font-family:var(--disp);font-size:clamp(40px,4.2vw,66px);font-weight:380;line-height:1.09;
@@ -1376,12 +3053,12 @@ select option:checked,.sel-st option:checked{background:#26314a;color:#fff}
 .seg.on{filter:brightness(1.45)}
 .handbar:hover .seg:not(:hover){filter:brightness(.72)}
 .segtip{position:absolute;bottom:calc(100% + 14px);left:0;transform:translateX(-50%) translateY(4px);
-  background:#1d2637;border:1px solid var(--edge2);border-radius:12px;padding:13px 16px;
-  box-shadow:0 18px 40px rgba(0,0,0,.45);pointer-events:none;opacity:0;visibility:hidden;
+  background:var(--tip);border:1px solid var(--edge2);border-radius:12px;padding:13px 16px;
+  box-shadow:0 18px 40px rgba(var(--shade-rgb),.45);pointer-events:none;opacity:0;visibility:hidden;
   transition:opacity .16s,transform .16s;z-index:30;white-space:nowrap}
 .segtip.on{opacity:1;visibility:visible;transform:translateX(-50%) translateY(0)}
 .segtip::after{content:"";position:absolute;top:100%;left:50%;margin-left:-6px;
-  border:6px solid transparent;border-top-color:#1d2637}
+  border:6px solid transparent;border-top-color:var(--tip)}
 .segtip .th{font-family:var(--disp);font-size:15px;font-weight:600;color:var(--ink);
   margin-bottom:9px;display:flex;align-items:center;gap:8px}
 .segtip .th i{width:10px;height:10px;border-radius:3px;flex:none}
@@ -1391,18 +3068,18 @@ select option:checked,.sel-st option:checked{background:#26314a;color:#fff}
   font-variant-numeric:tabular-nums}
 .segtip .tf{margin-top:9px;padding-top:8px;border-top:1px solid var(--edge);
   font-family:var(--mono);font-size:11.5px;color:var(--faint)}
-.seg.s1{background:linear-gradient(180deg,rgba(255,107,107,.30),rgba(255,107,107,.16))}
-.seg.s2{background:linear-gradient(180deg,rgba(245,184,65,.28),rgba(245,184,65,.14))}
-.seg.s3{background:linear-gradient(180deg,rgba(61,220,151,.26),rgba(61,220,151,.13))}
+.seg.s1{background:linear-gradient(180deg,rgba(var(--v1-rgb),.30),rgba(var(--v1-rgb),.16))}
+.seg.s2{background:linear-gradient(180deg,rgba(var(--v2-rgb),.28),rgba(var(--v2-rgb),.14))}
+.seg.s3{background:linear-gradient(180deg,rgba(var(--krb-rgb),.26),rgba(var(--krb-rgb),.13))}
 .seg::after{content:"";position:absolute;left:0;top:0;bottom:0;width:2px}
 .seg.s1::after{background:var(--v1)}.seg.s2::after{background:var(--v2)}.seg.s3::after{background:var(--krb)}
 .seg b{font-family:var(--mono);font-size:15px;font-weight:500;white-space:nowrap;opacity:0;
   transition:opacity .5s .8s}
-.seg.s1 b{color:#ffb3b3}.seg.s2 b{color:#ffd894}.seg.s3 b{color:#9ff0cb}
+.seg.s1 b{color:var(--v1-hi)}.seg.s2 b{color:var(--v2-hi)}.seg.s3 b{color:var(--krb-hi)}
 .seg:hover{filter:brightness(1.3)}
 .handkey{display:flex;gap:12px;flex-wrap:wrap;margin-top:14px}
 .kk{display:flex;align-items:baseline;gap:9px;padding:9px 14px;border:1px solid var(--edge);
-  border-radius:10px;background:rgba(255,255,255,.02);font-size:14px;color:var(--dim)}
+  border-radius:10px;background:rgba(var(--hi-rgb),.02);font-size:14px;color:var(--dim)}
 .kk i{width:9px;height:9px;border-radius:3px;flex:none;align-self:center}
 .kk b{font-family:var(--mono);font-size:17px;font-weight:600;color:var(--ink);
   font-variant-numeric:tabular-nums}
@@ -1411,7 +3088,7 @@ select option:checked,.sel-st option:checked{background:#26314a;color:#fff}
 .kk.nil{opacity:.55}
 .kk.nil b{color:var(--dim)}
 .deadline{display:flex;align-items:center;gap:16px;margin-top:26px;padding:15px 19px;
-  border:1px solid var(--edge);border-radius:var(--r);background:rgba(255,107,107,.045);max-width:700px}
+  border:1px solid var(--edge);border-radius:var(--r);background:rgba(var(--v1-rgb),.045);max-width:700px}
 .dnum{font-family:var(--disp);font-size:38px;font-weight:620;letter-spacing:-.03em;color:var(--v1);
   font-variant-numeric:tabular-nums;line-height:1}
 .dtxt{font-size:15px;color:var(--dim)}
@@ -1440,20 +3117,117 @@ select option:checked,.sel-st option:checked{background:#26314a;color:#fff}
 .c2{grid-column:span 2}.call{grid-column:1/-1}
 @media(max-width:1399px){.c2{grid-column:span 1}}
 @media(max-width:1399px){.c2,.call{grid-column:span 1}}
-.card{border:1px solid var(--edge);border-radius:var(--r);scroll-margin-top:118px;
-  background:linear-gradient(180deg,rgba(255,255,255,.022),transparent 40%),var(--card);
+.card{border:1px solid var(--edge);border-radius:var(--r);scroll-margin-top:calc(var(--stick, 118px) + 12px);
+  background:linear-gradient(180deg,rgba(var(--hi-rgb),.022),transparent 40%),var(--card);
   overflow:hidden;opacity:0;transform:translateY(16px);
   transition:opacity .6s cubic-bezier(.16,1,.3,1),transform .6s cubic-bezier(.16,1,.3,1),border-color .25s}
 .card.in{opacity:1;transform:none}
 .card:hover{border-color:var(--edge2)}
 .ch{display:flex;align-items:center;gap:12px;padding:20px 22px 16px;flex-wrap:wrap}
+/* Short explanation under a panel title - what the panel's verdict rests on. */
+/* Header: brand mark, live dot after the name */
+.mark{width:28px;height:28px;border-radius:7px;flex:none;display:block;box-shadow:0 0 0 1px var(--edge)}
+/* Theme button: shows where it leads - the sun in dark, the moon in light */
+.themebtn{display:inline-grid;place-items:center;min-width:36px;padding-left:8px;padding-right:8px}
+.themebtn .i-moon{display:none}
+:root[data-theme="light"] .themebtn .i-sun{display:none}
+:root[data-theme="light"] .themebtn .i-moon{display:block}
+@media (prefers-color-scheme: light){
+  :root:not([data-theme="dark"]) .themebtn .i-sun{display:none}
+  :root:not([data-theme="dark"]) .themebtn .i-moon{display:block}
+}
+.logo .orb{margin-left:2px}
+.menu{display:none}
+/* "?" in a panel header, and the answer it opens */
+.hlp{margin-left:10px;flex:none;width:30px;height:30px;border-radius:50%;border:1px solid var(--edge);
+  background:none;color:var(--dim);cursor:pointer;font-family:var(--mono);font-size:13px;font-weight:600}
+.hlp:hover,.hlp[aria-expanded=true]{color:var(--gold);border-color:var(--gold)}
+.hlp + .fold{margin-left:6px}
+/* The two header buttons always sit at the right edge, whether or not the
+   panel has a meta line (which carries the auto margin when it is there). */
+.ch .hlp, .ch .fold{margin-left:auto}
+.ch .meta + .hlp, .ch .meta + .fold{margin-left:10px}
+.ch .hlp + .fold{margin-left:6px}
+.cnote.help{border-left:2px solid var(--gold);margin:0 22px 14px;padding:8px 12px;background:rgba(var(--gold-rgb),.05)}
+/* Machine detail in the side drawer */
+.md{padding:6px 24px 30px}
+.md-load,.md-none{color:var(--dim);font-size:14px;padding:6px 0}
+.md-live{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:13.5px;color:var(--dim)}
+.md-dot{width:8px;height:8px;border-radius:50%;background:var(--krb);box-shadow:0 0 0 4px rgba(var(--krb-rgb),.15);flex:none}
+.md-dot.off{background:var(--v1);box-shadow:0 0 0 4px rgba(var(--v1-rgb),.15)}
+.md-sep{color:var(--faint)}
+.md-sec{margin-top:22px}
+.md-h{font-family:var(--mono);font-size:11.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--faint);margin:0 0 10px}
+.md-kpis{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.md-k{background:var(--card2);border:1px solid var(--edge);border-radius:12px;padding:12px 14px;display:flex;flex-direction:column;gap:6px;align-items:flex-start}
+.md-k span{font-size:12.5px;color:var(--dim)}
+.md-k b{font-family:var(--disp);font-size:30px;font-weight:650;line-height:1;color:var(--ink);font-variant-numeric:tabular-nums}
+.md-k em{font-style:normal;font-family:var(--mono);font-size:11.5px;color:var(--faint)}
+.md-chart{margin-top:14px}
+.md-chart svg{display:block;width:100%;height:80px}
+.md-legend{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--dim);margin-top:6px}
+.md-legend i{display:inline-block;width:12px;height:3px;border-radius:2px;margin-right:6px;vertical-align:middle}
+.md-axis{margin-left:auto;font-family:var(--mono);font-size:11px;color:var(--faint)}
+.md-rdy{display:grid;grid-template-columns:auto 1fr;gap:10px 14px;align-items:start;font-size:13.5px}
+.md-list{display:flex;flex-direction:column}
+.md-row{display:flex;justify-content:space-between;align-items:baseline;gap:12px;padding:9px 0;border-top:1px solid var(--edge);
+  font-size:14px;text-align:left;background:none;border-left:0;border-right:0;border-bottom:0;color:var(--ink);font-family:inherit;width:100%}
+.md-list > .md-row:first-child{border-top:0}
+button.md-row{cursor:pointer}
+button.md-row:hover{color:var(--gold)}
+.md-row .n{font-family:var(--mono);color:var(--dim);white-space:nowrap}
+.md-via{font-family:var(--mono);font-size:11px;color:var(--faint);white-space:nowrap}
+.md-more{font-size:12.5px;color:var(--faint);padding-top:8px}
+.md-chips{display:flex;gap:8px;flex-wrap:wrap}
+.md-chip{background:rgba(var(--hi-rgb),.05);border:1px solid var(--edge);border-radius:999px;padding:5px 11px;color:var(--ink);
+  font-family:var(--mono);font-size:12.5px;cursor:pointer}
+.md-chip b{color:var(--dim);font-weight:400;margin-left:4px}
+.md-chip:hover{border-color:var(--gold)}
+.md-tags{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.md-acts{display:flex;gap:8px;flex-wrap:wrap;margin-top:26px}
+.v1blind{display:block;width:calc(100% - 44px);margin:0 22px 12px;padding:9px 12px;text-align:left;cursor:pointer;
+  font:inherit;font-size:13.5px;line-height:1.45;color:var(--v2-hi);background:rgba(var(--v2-rgb),.10);
+  border:1px solid rgba(var(--v2-rgb),.35);border-radius:10px}
+.v1blind:hover{border-color:var(--v2)}
+.v1blind.bad{color:var(--v1-hi);background:rgba(var(--v1-rgb),.10);border-color:rgba(var(--v1-rgb),.40);cursor:default}
+.md-k3{grid-template-columns:repeat(3,minmax(0,1fr))}
+.md-link{background:none;border:0;padding:0;font:inherit;color:inherit;cursor:pointer;text-decoration:underline;
+  text-decoration-color:var(--edge2);text-underline-offset:3px}
+.md-link:hover{color:var(--gold)}
+@media(max-width:420px){.md-k3{grid-template-columns:1fr 1fr}}
+/* Block headings between the panel groups */
+.blk{grid-column:1/-1;padding:26px 2px 2px;scroll-margin-top:calc(var(--stick, 118px) + 4px)}
+.blk h2{margin:0;font-family:var(--mono);font-size:13px;font-weight:600;letter-spacing:.16em;
+  text-transform:uppercase;color:var(--gold)}
+.blk p{margin:6px 0 0;color:var(--faint);font-size:14.5px}
+/* Fold button: a chevron at the end of every panel header */
+.fold{margin-left:10px;flex:none;width:30px;height:30px;border-radius:7px;border:1px solid var(--edge);
+  background:none;color:var(--dim);cursor:pointer;display:grid;place-items:center}
+.fold::before{content:"";width:7px;height:7px;border-right:2px solid currentColor;border-bottom:2px solid currentColor;
+  transform:translateY(-2px) rotate(45deg);transition:transform .18s}
+.fold:hover{color:var(--ink);border-color:var(--gold)}
+.card.folded .fold::before{transform:translateY(1px) rotate(-135deg)}
+.card.folded > :not(.ch){display:none!important}
+.card.folded .ch{padding-bottom:20px}
+tr.clip,.brow.clip{display:none!important}
+.showall{display:block;margin:12px 22px 18px;background:none;border:1px dashed var(--edge2);color:var(--dim);
+  font-family:var(--mono);font-size:12.5px;border-radius:7px;padding:8px 14px;cursor:pointer;min-height:36px}
+.showall:hover{color:var(--ink);border-color:var(--gold)}
+/* Jump bar: group labels, and the section being read */
+.jg{font-family:var(--mono);font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--gold);
+  opacity:.75;align-self:center;margin:0 2px 0 12px;white-space:nowrap}
+.jg:first-child{margin-left:0}
+.jl.on{color:var(--ink);border-color:var(--edge2);background:rgba(var(--hi-rgb),.04)}
+@media(max-width:760px){.fold{width:40px;height:40px}}
+.cnote{padding:0 22px 14px;color:var(--dim);font-size:13.5px;line-height:1.55;max-width:90ch}
+.rdd{font-size:12.5px;color:var(--dim);margin-top:5px;line-height:1.5}
 .ch h2{margin:0;font-family:var(--disp);font-size:18.5px;font-weight:580;letter-spacing:-.012em}
 .ch .meta{margin-left:auto;font-family:var(--mono);font-size:14px;color:var(--faint)}
 .flag{font-family:var(--mono);font-size:12.5px;letter-spacing:.09em;text-transform:uppercase;
   padding:2px 7px;border-radius:5px;border:1px solid var(--edge2);color:var(--dim)}
-.flag.due{color:var(--v1);border-color:rgba(255,107,107,.35);background:rgba(255,107,107,.07)}
-.flag.ok{color:var(--krb);border-color:rgba(61,220,151,.3);background:rgba(61,220,151,.06)}
-.mini{background:rgba(255,255,255,.04);border:1px solid var(--edge);color:var(--dim);border-radius:7px;
+.flag.due{color:var(--v1);border-color:rgba(var(--v1-rgb),.35);background:rgba(var(--v1-rgb),.07)}
+.flag.ok{color:var(--krb);border-color:rgba(var(--krb-rgb),.3);background:rgba(var(--krb-rgb),.06)}
+.mini{background:rgba(var(--hi-rgb),.04);border:1px solid var(--edge);color:var(--dim);border-radius:7px;
   padding:3px 9px;font-family:var(--mono);font-size:12px;cursor:pointer;transition:.16s}
 .mini:hover{color:var(--ink);border-color:var(--gold)}
 
@@ -1465,7 +3239,7 @@ table{width:100%;border-collapse:collapse}
    data, so a table read as one undifferentiated block. It is now a band: its
    own slightly lighter surface, a firm bottom edge, brighter and heavier type.
    Contrast against that band goes from 4.69:1 to 6.98:1. */
-thead th{background:rgba(158,180,225,.055);border-bottom:1px solid var(--edge2);
+thead th{background:rgba(var(--line-rgb),.055);border-bottom:1px solid var(--edge2);
   position:relative;cursor:pointer;user-select:none}
 thead th:hover{color:var(--ink)}
 thead th[aria-sort=ascending]::after{content:" \2191";color:var(--gold)}
@@ -1474,12 +3248,12 @@ th{font-family:var(--mono);font-size:12.5px;letter-spacing:.1em;text-transform:u
   color:var(--dim);font-weight:600;text-align:left;padding:12px 22px 12px;white-space:nowrap}
 /* First data row needs no line of its own - the band already draws it. */
 thead + tbody tr:first-child td{border-top:0}
-td{padding:14px 22px;border-top:1px solid rgba(158,180,225,.11);font-size:16.5px;line-height:1.45}
+td{padding:14px 22px;border-top:1px solid rgba(var(--line-rgb),.11);font-size:16.5px;line-height:1.45}
 tbody tr{transition:background .16s}
-tbody tr:nth-child(even){background:rgba(158,180,225,.028)}
+tbody tr:nth-child(even){background:rgba(var(--line-rgb),.028)}
 tbody tr.click{cursor:pointer}
-tbody tr.click:hover{background:rgba(148,170,220,.06)}
-tbody tr.on{background:rgba(217,184,74,.10);box-shadow:inset 3px 0 0 var(--gold)}
+tbody tr.click:hover{background:rgba(var(--line-rgb),.06)}
+tbody tr.on{background:rgba(var(--gold-rgb),.10);box-shadow:inset 3px 0 0 var(--gold)}
 .r{text-align:right;font-family:var(--mono);font-variant-numeric:tabular-nums}
 .mn{font-family:var(--mono);font-size:15px}
 /* Table cells marked .dm carry real content - target servers, accounts,
@@ -1492,38 +3266,38 @@ tbody tr.on{background:rgba(217,184,74,.10);box-shadow:inset 3px 0 0 var(--gold)
   vertical-align:bottom}
 .tag{display:inline-block;font-family:var(--mono);font-size:12.5px;padding:2px 7px;border-radius:5px;
   border:1px solid;line-height:15px;white-space:nowrap}
-.tag.v1{color:var(--v1);border-color:rgba(255,107,107,.32);background:rgba(255,107,107,.07)}
-.tag.v2{color:var(--v2);border-color:rgba(245,184,65,.32);background:rgba(245,184,65,.07)}
-.tag.krb{color:var(--krb);border-color:rgba(61,220,151,.3);background:rgba(61,220,151,.06)}
-.tag.pol{color:var(--pol);border-color:rgba(167,139,250,.32);background:rgba(167,139,250,.07)}
+.tag.v1{color:var(--v1);border-color:rgba(var(--v1-rgb),.32);background:rgba(var(--v1-rgb),.07)}
+.tag.v2{color:var(--v2);border-color:rgba(var(--v2-rgb),.32);background:rgba(var(--v2-rgb),.07)}
+.tag.krb{color:var(--krb);border-color:rgba(var(--krb-rgb),.3);background:rgba(var(--krb-rgb),.06)}
+.tag.pol{color:var(--pol);border-color:rgba(var(--pol-rgb),.32);background:rgba(var(--pol-rgb),.07)}
 .tag.n{color:var(--faint);border-color:var(--edge2)}
 .restn{color:var(--faint);font-family:var(--mono);font-size:12px;margin-left:6px}
-.sel-st{background:rgba(255,255,255,.04);border:1px solid var(--edge);color:var(--dim);border-radius:7px;
+.sel-st{background:rgba(var(--hi-rgb),.04);border:1px solid var(--edge);color:var(--dim);border-radius:7px;
   padding:3px 8px;font-family:var(--mono);font-size:13px}
 .done td{opacity:.42}
 .empty{padding:34px 20px;text-align:center;color:var(--faint);font-size:15.5px}
 .empty b{display:block;color:var(--dim);font-size:15.5px;margin-bottom:5px;font-weight:500}
 
 .bar{display:flex;align-items:center;gap:9px;flex-wrap:wrap;padding:2px 22px 14px}
-.search{flex:1 1 240px;min-width:160px;background:rgba(255,255,255,.035);border:1px solid var(--edge);
+.search{flex:1 1 240px;min-width:160px;background:rgba(var(--hi-rgb),.035);border:1px solid var(--edge);
   color:var(--ink);border-radius:9px;padding:7px 11px;font-family:var(--mono);font-size:13px}
 .search::placeholder{color:var(--faint)}
-.search:focus{outline:none;border-color:var(--edge2);background:rgba(255,255,255,.06)}
+.search:focus{outline:none;border-color:var(--edge2);background:rgba(var(--hi-rgb),.06)}
 .chipset{display:flex;gap:5px;flex-wrap:wrap}
-.chip{background:rgba(255,255,255,.035);border:1px solid var(--edge);color:var(--dim);border-radius:8px;
+.chip{background:rgba(var(--hi-rgb),.035);border:1px solid var(--edge);color:var(--dim);border-radius:8px;
   padding:5px 11px;font-family:var(--mono);font-size:13px;cursor:pointer;transition:.16s;white-space:nowrap}
 .chip:hover{color:var(--ink);border-color:var(--edge2)}
-.chip[aria-pressed=true]{background:rgba(255,255,255,.09);color:var(--ink);border-color:var(--edge2)}
+.chip[aria-pressed=true]{background:rgba(var(--hi-rgb),.09);color:var(--ink);border-color:var(--edge2)}
 .active{display:flex;gap:6px;flex-wrap:wrap;padding:0 17px 11px}
-.afl{display:inline-flex;align-items:center;gap:7px;background:rgba(217,184,74,.12);
-  border:1px solid rgba(217,184,74,.32);color:#ffe9a8;border-radius:8px;padding:4px 8px;
+.afl{display:inline-flex;align-items:center;gap:7px;background:rgba(var(--gold-rgb),.12);
+  border:1px solid rgba(var(--gold-rgb),.32);color:var(--gold-hi);border-radius:8px;padding:4px 8px;
   font-family:var(--mono);font-size:12px}
 .afl button{background:none;border:0;color:inherit;cursor:pointer;opacity:.7;padding:0 0 0 2px;font-size:15px}
 .afl button:hover{opacity:1}
 /* Unconfirmed 8001s: dashed and muted on purpose - they are shown, not
    asserted, and must not read like the solid NTLM tags next to them. */
 .tag.unc{border-style:dashed;color:var(--dim);background:transparent}
-.tag.unc.ph{color:var(--krb);border-color:rgba(61,220,151,.35)}
+.tag.unc.ph{color:var(--krb);border-color:rgba(var(--krb-rgb),.35)}
 .expl.unc{border-style:dashed}
 .unchint{background:none;border:1px dashed var(--edge2);color:var(--dim);font-family:var(--mono);
   font-size:12px;border-radius:7px;padding:5px 10px;cursor:pointer;margin-left:6px}
@@ -1531,9 +3305,9 @@ tbody tr.on{background:rgba(217,184,74,.10);box-shadow:inset 3px 0 0 var(--gold)
 .clearall{background:none;border:0;color:var(--faint);font-family:var(--mono);font-size:12px;
   cursor:pointer;text-decoration:underline;text-underline-offset:3px}
 .clearall:hover{color:var(--ink)}
-.more{display:block;width:100%;background:rgba(255,255,255,.03);border:0;border-top:1px solid var(--edge);
+.more{display:block;width:100%;background:rgba(var(--hi-rgb),.03);border:0;border-top:1px solid var(--edge);
   color:var(--dim);font-family:var(--mono);font-size:12.5px;padding:11px;cursor:pointer;transition:.16s}
-.more:hover{background:rgba(255,255,255,.06);color:var(--ink)}
+.more:hover{background:rgba(var(--hi-rgb),.06);color:var(--ink)}
 
 .bars{padding:14px 22px 20px}
 .brow{margin-bottom:10px;cursor:pointer}
@@ -1543,10 +3317,10 @@ tbody tr.on{background:rgba(217,184,74,.10);box-shadow:inset 3px 0 0 var(--gold)
   color:var(--dim);transition:color .16s}
 .blab .bn{font-family:var(--mono);font-size:12.5px;color:var(--faint);flex:none}
 .blab .btx{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.btr{height:4px;background:rgba(148,170,220,.09);border-radius:3px;overflow:hidden}
+.btr{height:4px;background:rgba(var(--line-rgb),.09);border-radius:3px;overflow:hidden}
 .bfl{height:100%;width:0;border-radius:3px;transition:width 1s cubic-bezier(.16,1,.3,1)}
-.bfl.red{background:linear-gradient(90deg,#c94a4a,var(--v1))}
-.bfl.amb{background:linear-gradient(90deg,#c08b2c,var(--v2))}
+.bfl.red{background:linear-gradient(90deg,var(--v1-deep),var(--v1))}
+.bfl.amb{background:linear-gradient(90deg,var(--v2-deep),var(--v2))}
 
 /* align-items must stretch: the columns need a definite height, otherwise the
    percentage heights of the bars inside resolve against nothing and collapse
@@ -1568,7 +3342,7 @@ tbody tr.on{background:rgba(217,184,74,.10);box-shadow:inset 3px 0 0 var(--gold)
   .hr{min-width:560px}
 }
 .hr .lb{font-family:var(--mono);font-size:12px;color:var(--faint)}
-.hc{aspect-ratio:1;border-radius:2px;background:rgba(148,170,220,.05);transform:scale(.4);opacity:0;
+.hc{aspect-ratio:1;border-radius:2px;background:rgba(var(--line-rgb),.05);transform:scale(.4);opacity:0;
   transition:transform .5s cubic-bezier(.16,1,.3,1),opacity .5s}
 .hc.in{transform:scale(1);opacity:1}
 .hc{cursor:pointer}
@@ -1582,38 +3356,38 @@ tbody tr.on{background:rgba(217,184,74,.10);box-shadow:inset 3px 0 0 var(--gold)
   border-top:1px solid var(--edge)}
 .hnote b{color:var(--v2);font-weight:500}
 
-.scrim{position:fixed;inset:0;background:rgba(6,9,16,.60);backdrop-filter:blur(3px);opacity:0;
+.scrim{position:fixed;inset:0;background:rgba(var(--scrim-rgb),.60);backdrop-filter:blur(3px);opacity:0;
   pointer-events:none;transition:opacity .3s;z-index:70}
 .scrim.on{opacity:1;pointer-events:auto}
-.drawer{position:fixed;top:0;right:0;bottom:0;width:min(540px,100%);background:#151d2b;
+.drawer{position:fixed;top:0;right:0;bottom:0;width:min(540px,100%);background:var(--drawer);
   border-left:1px solid var(--edge2);z-index:80;transform:translateX(100%);
   transition:transform .42s cubic-bezier(.16,1,.3,1);display:flex;flex-direction:column;
-  box-shadow:-30px 0 70px rgba(0,0,0,.45)}
+  box-shadow:-30px 0 70px rgba(var(--shade-rgb),.45)}
 .drawer.on{transform:none}
 .dh{padding:20px 22px 15px;border-bottom:1px solid var(--edge);display:flex;align-items:flex-start;gap:12px}
 .dh h3{margin:0 0 6px;font-family:var(--disp);font-size:22px;font-weight:580;letter-spacing:-.02em}
 .dh .when{font-family:var(--mono);font-size:14.5px;color:var(--faint)}
-.x{background:rgba(255,255,255,.05);border:1px solid var(--edge);color:var(--dim);border-radius:8px;
+.x{background:rgba(var(--hi-rgb),.05);border:1px solid var(--edge);color:var(--dim);border-radius:8px;
   width:34px;height:34px;cursor:pointer;margin-left:auto;flex:none;transition:.16s;font-size:17px}
 .x:hover{color:var(--ink);border-color:var(--edge2)}
 .dbody{overflow-y:auto;padding:4px 0 26px;flex:1}
 .expl{margin:15px 22px;padding:13px 15px;border:1px solid var(--edge);border-radius:11px;
-  background:rgba(148,170,220,.04);font-size:16px;color:var(--dim);line-height:1.6}
+  background:rgba(var(--line-rgb),.04);font-size:16px;color:var(--dim);line-height:1.6}
 .expl b{display:block;color:var(--ink);font-weight:600;margin-bottom:4px}
 .grp{margin:17px 22px 0}
 .grp .gk{font-family:var(--mono);font-size:12.5px;letter-spacing:.11em;text-transform:uppercase;
   color:var(--faint);padding-bottom:8px;border-bottom:1px solid var(--edge);margin-bottom:4px}
 .fr{display:grid;grid-template-columns:150px 1fr;gap:14px;padding:9px 0;font-size:16px;
-  border-bottom:1px solid rgba(148,170,220,.05)}
+  border-bottom:1px solid rgba(var(--line-rgb),.05)}
 .fr:last-child{border-bottom:0}
 .fr .fk{color:var(--faint);font-family:var(--mono);font-size:14px;padding-top:2px}
 .fr .fv{font-family:var(--mono);font-size:15.5px;word-break:break-word}
 .fr .fv.none{color:var(--faint)}
 .dact{display:flex;gap:8px;flex-wrap:wrap;margin:19px 22px 0}
-.dact button{flex:1 1 auto;background:rgba(255,255,255,.04);border:1px solid var(--edge);color:var(--dim);
+.dact button{flex:1 1 auto;background:rgba(var(--hi-rgb),.04);border:1px solid var(--edge);color:var(--dim);
   border-radius:9px;padding:10px 14px;font-family:var(--mono);font-size:14px;cursor:pointer;transition:.18s}
-.dact button:hover{color:var(--ink);border-color:var(--gold);background:rgba(217,184,74,.09)}
-.code{margin:15px 22px;background:#0c1119;border:1px solid var(--edge);border-radius:10px;padding:13px 15px;
+.dact button:hover{color:var(--ink);border-color:var(--gold);background:rgba(var(--gold-rgb),.09)}
+.code{margin:15px 22px;background:var(--code);border:1px solid var(--edge);border-radius:10px;padding:13px 15px;
   font-family:var(--mono);font-size:15px;color:var(--dim);white-space:pre-wrap;word-break:break-all;
   max-height:360px;overflow-y:auto}
 
@@ -1628,7 +3402,7 @@ tbody tr.on{background:rgba(217,184,74,.10);box-shadow:inset 3px 0 0 var(--gold)
    header, so every table on the page gets this without being told about it. */
 @media(max-width:760px){
   table.srt thead{position:absolute;left:-9999px}      /* kept for screen readers */
-  table.srt tr{display:block;padding:12px 4px;border-top:1px solid rgba(158,180,225,.11)}
+  table.srt tr{display:block;padding:12px 4px;border-top:1px solid rgba(var(--line-rgb),.11)}
   table.srt tbody tr:first-child{border-top:0}
   /* wrap: cells holding several tags side by side (the machine panel) would
      otherwise keep them on one line and push past the card edge. */
@@ -1656,6 +3430,7 @@ tbody tr.on{background:rgba(217,184,74,.10);box-shadow:inset 3px 0 0 var(--gold)
      which is below every platform's guidance. */
   .hin button, .hin select, .hin a{min-height:40px}
   #range button{padding-top:9px;padding-bottom:9px}
+}
 
 @media(max-width:720px){
   .hin{gap:10px;overflow-x:auto}.hero{padding:30px var(--pad) 20px}
@@ -1673,6 +3448,7 @@ tbody tr.on{background:rgba(217,184,74,.10);box-shadow:inset 3px 0 0 var(--gold)
   .dnum{font-size:30px}
   .focus{padding-bottom:20px;gap:10px}
   .fc{padding:14px 16px}
+}
 
 /* Long unbroken values - SPNs, UNC paths - still pushed a stacked cell past
    the card edge, which is what clipped them in the first place. */
@@ -1680,19 +3456,131 @@ tbody tr.on{background:rgba(217,184,74,.10);box-shadow:inset 3px 0 0 var(--gold)
   table.srt td{overflow-wrap:anywhere;word-break:break-word}
   table.srt td .cut{max-width:none;white-space:normal;overflow:visible}
 }
+/* ===== The modern look: soft surfaces, key-figure tiles, slim bar ===== */
+.card,.fc,.osdon,.kpi{background:var(--card);border:1px solid var(--edge);border-radius:var(--r);box-shadow:var(--shadow)}
+.drawer{box-shadow:none}
+.drawer.on{box-shadow:-30px 0 70px rgba(var(--shade-rgb),.35)}
+.herotop{display:flex;gap:clamp(24px,4vw,56px);align-items:flex-start}
+.heroside{flex:0 0 380px;display:flex;flex-direction:column;gap:16px}
+.deadline .dtxt{font-size:13.5px;line-height:1.45}
+.deadline .dtxt b{font-size:15px}
+.heroside .osdon{width:auto}
+.deadline{margin:0;max-width:none;padding:20px 22px;border-radius:var(--r);
+  background:rgba(var(--v1-rgb),.10);border:1px solid rgba(var(--v1-rgb),.28)}
+.dnum{font-size:52px;font-weight:700;line-height:1}
+@media(max-width:1250px){
+  .herotop{flex-direction:column;align-items:stretch}
+  .heroside{flex:none;max-width:700px}
+}
+.handcap{display:flex;justify-content:space-between;gap:12px;margin-top:6px;font-family:var(--mono);font-size:12px;
+  letter-spacing:.1em;text-transform:uppercase;color:var(--faint)}
+.handbar{height:16px;border-radius:999px;gap:3px;background:transparent;margin-top:10px}
+.seg{border-radius:0}
+.seg.s1{background:var(--bar-v1)}.seg.s2{background:var(--bar-v2)}.seg.s3{background:var(--bar-krb)}
+.seg.on{filter:none;box-shadow:inset 0 0 0 2px var(--ink)}
+.kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px;margin-top:22px}
+@media(max-width:1100px){.kpis{grid-template-columns:repeat(2,minmax(0,1fr))}}
+.kpi{display:flex;flex-direction:column;gap:12px;padding:18px 20px;text-align:left;font:inherit;color:inherit;min-width:0}
+button.kpi{cursor:pointer;transition:border-color .15s,transform .15s}
+button.kpi:hover{border-color:var(--edge2);transform:translateY(-1px)}
+.kpi.on{box-shadow:0 0 0 2px var(--gold),var(--shadow)}
+.kh{display:flex;align-items:center;gap:8px;font-size:13.5px;color:var(--dim)}
+.kh i{width:8px;height:8px;border-radius:50%;flex:none}
+.kb{display:flex;align-items:flex-end;justify-content:space-between;gap:10px;min-width:0}
+.kb b{font-family:var(--disp);font-size:clamp(30px,2.6vw,40px);font-weight:650;line-height:1;letter-spacing:-.03em;
+  color:var(--ink);font-variant-numeric:tabular-nums;white-space:nowrap}
+.ksp{flex:0 1 110px;min-width:28px;width:auto}
+.kd{display:flex;align-items:center;gap:8px 10px;flex-wrap:wrap}
+.dlt{font-style:normal;font-family:var(--mono);font-size:12px;padding:3px 9px;border-radius:999px;white-space:nowrap}
+.dlt.good{color:var(--krb);background:rgba(var(--krb-rgb),.14)}
+.dlt.bad{color:var(--v1);background:rgba(var(--v1-rgb),.14)}
+.dlt.flat{color:var(--dim);background:rgba(var(--hi-rgb),.06)}
+.kd small{font-family:var(--mono);font-size:11.5px;color:var(--faint)}
+.focus{gap:16px}
+.fc{display:flex;gap:16px;align-items:flex-start;padding:20px 22px;text-align:left}
+.fc:hover{border-color:var(--edge2)}
+.fi{width:38px;height:38px;border-radius:11px;background:rgba(var(--hi-rgb),.05);display:grid;place-items:center;flex:none}
+.ft{min-width:0}
+.tchart{position:relative;padding:14px 22px 2px}
+.tchart svg{display:block;width:100%;height:190px;overflow:visible}
+.tgrid{stroke:rgba(var(--line-rgb),.12);stroke-width:1}
+.tgoal{stroke:var(--krb);stroke-width:1.5;stroke-dasharray:6 5}
+.tgoaltxt{position:absolute;left:30px;bottom:10px;font-family:var(--mono);font-size:11.5px;color:var(--krb);
+  background:var(--card);padding:1px 7px;border-radius:6px;border:1px solid rgba(var(--krb-rgb),.35)}
+.thit{fill:transparent;cursor:pointer}
+.thit:hover{fill:rgba(var(--hi-rgb),.05)}
+.thit.on{fill:rgba(var(--gold-rgb),.16)}
+td{padding:12px 22px;font-size:15.5px}
+.sel-st{-webkit-appearance:none;appearance:none;border-radius:999px;padding:6px 30px 6px 13px;font-family:var(--mono);
+  font-size:12.5px;cursor:pointer;min-height:32px;
+  background-image:linear-gradient(45deg,transparent 50%,currentColor 50%),linear-gradient(135deg,currentColor 50%,transparent 50%);
+  background-position:calc(100% - 15px) 55%,calc(100% - 10px) 55%;background-size:5px 5px,5px 5px;background-repeat:no-repeat}
+.sel-st.st-open{background-color:rgba(var(--hi-rgb),.05);color:var(--dim);border:1px solid var(--edge2)}
+.sel-st.st-in_progress{background-color:rgba(var(--v2-rgb),.14);color:var(--v2-hi);border:1px solid rgba(var(--v2-rgb),.40)}
+.sel-st.st-done{background-color:rgba(var(--krb-rgb),.14);color:var(--krb-hi);border:1px solid rgba(var(--krb-rgb),.40)}
+/* Very narrow phones: the mark alone says whose dashboard this is. */
+@media(max-width:379px){#brand{display:none}}
+/* Below 380 px two tiles side by side leave no room for the line next to a
+   five-digit number; the change and the comparison line carry the point. */
+@media(max-width:380px){.ksp{display:none}}
+td .blkd{margin-top:5px}
+td.nw{white-space:nowrap}
+@media(max-width:760px){
+  .kpis{gap:12px}
+  .kpi .kq{display:none}
+  .kd small{font-size:11px}
+  .kpi{padding:14px 16px}
+  .dnum{font-size:42px}
+  .deadline{padding:16px 18px}
+}
+
+/* Phone header: one row - brand plus a button that says what is set. The
+   controls took three rows (about 200 px) before any content; now they open
+   below on demand. Last in the file so these rules win over the ones above. */
+@media(max-width:760px){
+  .hin{flex-wrap:wrap;row-gap:10px}
+  .menu{display:inline-flex;align-items:center;gap:8px;margin-left:auto;min-height:40px;padding:6px 12px;
+    background:rgba(var(--hi-rgb),.04);border:1px solid var(--edge);border-radius:9px;color:var(--ink);
+    font-family:var(--mono);font-size:13px;cursor:pointer;max-width:60vw}
+  .menu span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .menu i{width:7px;height:7px;border-right:2px solid currentColor;border-bottom:2px solid currentColor;
+    transform:translateY(-2px) rotate(45deg);transition:transform .18s;flex:none}
+  header.open .menu i{transform:translateY(1px) rotate(-135deg)}
+  header.open .menu{border-color:var(--gold)}
+  .tools{display:none}
+  header.open .tools{display:flex;flex-wrap:wrap;gap:8px}
+  .searchbtn{margin-left:auto;width:44px;height:44px;padding:0;justify-content:center}
+  /* brand, search and the selection button have to share one row */
+  .logo{gap:8px}
+  #brand{font-size:15px}
+  .menu{padding:6px 10px}
+  .searchbtn span,.searchbtn kbd{display:none}
+  .menu{margin-left:8px}
+  .pal{padding:8px}
+  .palbox{max-height:86vh}
+  .psb{display:none}
+  .pty{min-width:74px}
+  .hlp{width:40px;height:40px}
+  .mark{width:26px;height:26px}
+  .eyebrow{font-size:12.5px;letter-spacing:.1em;margin-bottom:10px}
+}
 </style>
 </head>
 <body>
 <a class="skip" href="#sec-events">Skip to the event list</a>
 <div class="stage">
 <header><div class="hin">
-  <div class="logo"><span class="orb" id="orb"></span><span id="brand">NTLM-Analyzer</span></div>
-  <div class="tools">
+  <div class="logo"><img class="mark" alt="" width="28" height="28" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAMAAACdt4HsAAAA/1BMVEX+/v4dKDohLD0PGy4uOEn5yQtUXWv99M774Xn72U/855L70y+UmaL///773mj766n///yPlJoAAACDiZOkqK7n6OpcY3H//v44Q1hja3d0e4extbokLkBETVz///++wcb4zSL+87gBDiJpcHx6gIucoam3u8HKzNDR09fe4OP/0grm3Kf////EvJjAvary34r/4DL/4EsAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB9fbMYAAAAQHRSTlP+//////7/////////1///DP8A/////4f///////8o//7//////////////33//////wAAAAAAAAAAAAAAAAAAJ9C2nAAAAihJREFUeNrtl2lzozAMhn1gHNuAQ4DcPdLu1XbP///n1gcQTJNmLH/b2XcmQBz0IMtCsdBytdyUCKRyY4zR6h5o7hD3K7RMsDeEJfqOkrRBZRog0fy//lkVdWFVP8zGD268Lm7Zd5h6kS78IX9yw7i7RcgwscroLhxf46MZxhm6DfAi9EvoASV2OAIwuzcaYFxo0gBG39IAhOaJHhD6OXEKOOugAJJ7F3ZAAKHt3SwZYgGH1hoQvIUCiuGiAQIaVHiLIRliAfvxKgcDXBRsPEEAu353mJyTIRawNpcPvQvPEICb+a4n2PK2hgA64ivDdoRFAvqltFmBnkGASRz3MMDXsTh9ggEGuyOqgQBb5l1paaGAgzfcFlDAkAB5X6PiAS9kWiXJRSOpjPgVwPhem2DQ7f4KQAhxFTAkA6FZ++sPY0roqCmckyF/+82YEMocZkZcaq0lR/ZzAeCy0LwR+pVJd3vFVAhYMCtxsuhLAPefj3+qRz7Mee4Dt7IndBlwoEeaLxifPJJ/uME44vV8e4FrNX0qq4JVYIME8lucp9AD9ILpj9dp8EUQBS0qLyFR3dRGTTvfYzVvgdcVi96+8RAQeMAXVhqZg6yk/ybfEdh0KAhIv4wVdyel/ekdYDptzjQCzOHsglKQTawcCeJ6GtwgCM1N4jMlhQQRuHDxWZiI2gOMwZ33p5EA7du4J5TwxpM/WsImofU1hFOZ1Hxz6Zpv0/6DG2dj/BcWBhsxYHO2PQAAAABJRU5ErkJggg=="><span id="brand">NTLM-Analyzer</span><span class="orb" id="orb"></span></div>
+  <button type="button" class="searchbtn" id="searchbtn" aria-haspopup="dialog"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg><span id="searchlbl"></span><kbd id="searchkbd"></kbd></button>
+  <button type="button" class="menu" id="menu" aria-expanded="false" aria-controls="tools"></button>
+  <div class="tools" id="tools">
     <div class="pill" id="range"></div>
     <select id="mach"></select>
     <button class="ghost" id="hide"></button>
+    <button class="ghost" id="report"></button>
     <button class="ghost" id="csv">CSV</button>
     <button class="ghost" id="logout" hidden>Logout</button>
+    <button type="button" class="ghost themebtn" id="theme"><svg class="i-sun" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4.2"/><path d="M12 2.5v2M12 19.5v2M4.2 4.2l1.4 1.4M18.4 18.4l1.4 1.4M2.5 12h2M19.5 12h2M4.2 19.8l1.4-1.4M18.4 5.6l1.4-1.4"/></svg><svg class="i-moon" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z"/></svg></button>
     <div class="pill" id="lang"><button data-l="de">DE</button><button data-l="en">EN</button></div>
   </div>
 </div></header>
@@ -1706,20 +3594,31 @@ tbody tr.on{background:rgba(217,184,74,.10);box-shadow:inset 3px 0 0 var(--gold)
       <h1 class="thesis" id="thesis"></h1>
       <p class="sub" id="subline"></p>
     </div>
-    <aside class="osdon" id="osdon"></aside>
+    <aside class="heroside">
+      <div class="deadline">
+        <div class="dnum" id="days">0</div>
+        <div class="dtxt"><b id="ddl_t"></b><span id="ddl_b"></span></div>
+      </div>
+      <div class="osdon" id="osdon"></div>
+    </aside>
   </div>
+  <div class="handcap"><span id="hc_l"></span><span id="hc_r"></span></div>
   <div class="handbar" id="handbar"></div>
-  <div class="handkey" id="handkey"></div>
-  <div class="deadline">
-    <div class="dnum" id="days">0</div>
-    <div class="dtxt"><b id="ddl_t"></b><span id="ddl_b"></span></div>
-  </div>
+  <div class="kpis" id="handkey"></div>
 </section>
 
 <div class="focus" id="focus"></div>
 <div class="grid" id="grid"></div>
 </div>
 
+<div class="pal" id="pal" hidden role="dialog" aria-modal="true" aria-label="Search">
+  <div class="palbox">
+    <div class="palin"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+      <input id="palq" type="search" autocomplete="off" spellcheck="false" role="combobox" aria-expanded="true" aria-controls="palres" aria-autocomplete="list"><kbd>Esc</kbd></div>
+    <ul id="palres" role="listbox"></ul>
+    <div class="palfoot" id="palfoot"></div>
+  </div>
+</div>
 <div class="scrim" id="scrim"></div>
 <aside class="drawer" id="drawer" role="dialog" aria-modal="true">
   <div class="dh"><div><h3 id="dtitle"></h3><div class="when" id="dwhen"></div></div>
@@ -1752,7 +3651,7 @@ de: {
   fl_split_t:'Die Agenten melden unterschiedliche Werte',
   osdon_mid:'Agenten', osdon_old:'{n} vor Server 2019 – dort fehlen die 40xx-Ereignisse', osbar_tip:'Gezählt werden nur Maschinen mit Agent, nicht die gesamte Domäne',
   leg_goal:'Farbbedeutung', leg_bad:'NTLMv1 · unsicher', leg_old:'NTLMv2 · veraltet', leg_good:'Kerberos · sicher',
-  range:'Zeitraum', r7d:'7 Tage', r30d:'30 Tage', rall:'Alles',
+  range:'Zeitraum', r24h:'24 Std.', trend_hourly:'pro Stunde', r7d:'7 Tage', r30d:'30 Tage', rall:'Alles',
   lab_total:'NTLM gesamt', sub_total:'erfasste Vorgänge', tt_total:'Zählt jedes erfasste Ereignis im gewählten Zeitraum – NTLM, Kerberos und Domänenmeldungen zusammen. Klick zeigt die Liste.',
   lab_v1:'Unsicher', sub_v1:'NTLMv1 – zuerst ablösen', tt_v1:'Zählt Anmeldungen mit NTLMv1: Ereignis 4624 mit Version NTLMv1 sowie 4024/4025 (NTLMv1-SSO). Klick filtert die Liste.',
   lab_v2:'Veraltet', sub_v2:'NTLMv2 – besser, aber alt', tt_v2:'Zählt Anmeldungen mit NTLMv2 (4624 und 40xx mit Version NTLMv2). Besser als v1, aber weiterhin Relay-anfällig. Klick filtert die Liste.',
@@ -1885,7 +3784,7 @@ de: {
   fix_dc:'Netzweg zum DC prüfen (Firewall, Segmentierung); IAKerb kommt 2026',
   fix_loop:'Meist RPC-Endpoint-Mapper; die beiden RPC-Richtlinien prüfen',
   fix_null:'Anonyme Verbindung – Aufrufer identifizieren und abstellen',
-  fix_unklar:'Ursache prüfen – Windows meldet hier keine bekannte ID',
+  fix_unclear:'Ursache prüfen – Windows meldet hier keine bekannte ID',
   k_relay:'Relay-gefährdet', k_relay_s:'ohne MIC oder EPA',
   nav_label:'Abschnitte', nav_prog:'Programme', nav_inc:'Dienste', nav_v1sso:'NTLMv1-SSO',
   nav_v1:'NTLMv1', nav_dom:'Domäne', nav_krb:'Kerberos', nav_mach:'Maschinen', nav_ev:'Ereignisse',
@@ -1913,11 +3812,111 @@ de: {
   f_all:'Alle', f_v1:'Nur unsicher', f_v2:'Nur veraltet', f_out:'Programme', f_dom:'Domäne',
   csv:'CSV-Export', csv_t:'Aktuelle Auswahl als CSV herunterladen',
   g_logout:'Abmelden', g_logout_t:'Sitzung auf dem Server beenden',
+  g_report:'Bericht', g_report_t:'Statusbericht zum Drucken oder als PDF – für alle, die das Dashboard nicht öffnen',
   more:'weitere', b_v1:'NTLMv1 · unsicher', b_v2:'NTLMv2 · veraltet', b_krb:'Kerberos · sicher',
   b_dom:'NTLM (Domäne)', b_out:'NTLM ausgehend', b_fb:'Kerberos-Fallback',
   hb_on:'aktiv', hb_off:'still',
   au_out_on:'Ausgehend', au_out_off:'Ausgehend aus', au_dom_on:'Domäne', au_dom_off:'Domäne aus',
-  st_offen:'offen', st_arbeit:'in Arbeit', st_erledigt:'erledigt', again:'wieder aktiv', what:'Was tun?',
+  st_open:'offen', st_in_progress:'in Arbeit', st_done:'erledigt', again:'wieder aktiv', what:'Was tun?',
+  search_btn:'Suchen', search_kbd:'Strg K', pal_ph:'Maschine, Programm, Konto, Ziel oder Panel …',
+  pal_foot:'↑ ↓ wählen · Enter öffnen · Esc schließen · Maschinen öffnen die Detailansicht, alles andere filtert die Ereignisse',
+  pal_none:'Nichts gefunden für „{q}".', pal_machine:'Maschine', pal_noagent:'Rechner', pal_prog:'Programm',
+  pal_acct:'Konto', pal_target:'Ziel', pal_panel:'Panel', pal_panel_sub:'springen',
+  pal_noagent_sub:'ohne Agent · {n}× NTLM', pal_dom_sub:'Domänensicht · {n}×', pal_target_sub:'{n}× NTLM',
+  nav_fail:'Fehlversuche', nav_acc:'Konten', pal_failed:'{n}× fehlgeschlagen',
+  fail_h:'Fehlgeschlagene NTLM-Versuche', fail_badge_spray:'Spraying?',
+  fail_meta:'{n} Versuche · {a} Konten',
+  fail_from:'Von', fail_to:'Auf', fail_why:'Grund', fail_locked:'gesperrt',
+  fail_to_dc:'über DC', fail_to_dc_t:'Nur vom Domänencontroller gesehen (4776) – der Zielserver hat keinen Agent oder kein Fehler-Audit.',
+  fail_spray:'Viele Konten von einem Rechner: {l}. So sieht Password Spraying aus – oder ein Skript mit veralteten Zugangsdaten. Prüfen.',
+  fail_spray_n:'{n} Konten',
+  fail_blind:'Auf {n} Maschinen ist „Anmelden überwachen: Fehler" nicht aktiv – Fehlanmeldungen dort erscheinen nur, wenn ein DC sie prüft.',
+  fail_empty:'Keine fehlgeschlagenen NTLM-Anmeldungen im gewählten Zeitraum.',
+  fv_local:'auf dem Server gesehen', fv_dc:'vom DC gesehen', fv_both:'Server und DC',
+  nt_0xc000006a:'falsches Passwort', nth_0xc000006a:'Meist ein Dienst, eine geplante Aufgabe oder ein Laufwerk mit altem Passwort auf dem Quellrechner.',
+  nt_0xc0000064:'Konto existiert nicht', nth_0xc0000064:'Vertippter oder gelöschter Kontoname – oder jemand probiert Namen durch.',
+  nt_0xc0000234:'Konto gesperrt', nth_0xc0000234:'Das Konto ist gesperrt. Die Quelle finden, die es mit falschem Passwort immer wieder versucht.',
+  nt_0xc0000072:'Konto deaktiviert', nth_0xc0000072:'Ein deaktiviertes Konto wird noch benutzt – Dienst, Aufgabe oder Skript suchen.',
+  nt_0xc0000193:'Konto abgelaufen', nth_0xc0000193:'Das Konto ist abgelaufen, wird aber noch verwendet.',
+  nt_0xc0000071:'Passwort abgelaufen', nth_0xc0000071:'Passwort abgelaufen – bei Dienstkonten: Kennwort erneuern oder auf gMSA umstellen.',
+  nt_0xc0000224:'Passwort muss geändert werden', nth_0xc0000224:'Das Konto muss bei der nächsten Anmeldung sein Passwort ändern.',
+  nt_0xc000006f:'außerhalb der Anmeldezeiten', nth_0xc000006f:'Anmeldung zu einer gesperrten Uhrzeit.',
+  nt_0xc0000070:'Arbeitsstation nicht erlaubt', nth_0xc0000070:'Das Konto darf sich an diesem Rechner nicht anmelden (userWorkstations).',
+  nt_0xc000015b:'Anmeldetyp nicht erlaubt', nth_0xc000015b:'Das Benutzerrecht für diesen Anmeldetyp fehlt (z. B. „Zugriff vom Netzwerk").',
+  nt_0xc000006d:'Anmeldung fehlgeschlagen', nth_0xc000006d:'Allgemeiner Fehlschlag ohne genaueren Grund.',
+  nt_0xc0000133:'Uhrzeit weicht ab', nth_0xc0000133:'Die Uhr des Rechners weicht zu stark vom DC ab.',
+  nt_0xc0000413:'Authentifizierungs-Firewall', nth_0xc0000413:'Selektive Authentifizierung einer Vertrauensstellung hat die Anmeldung abgelehnt.',
+  acc_h:'Konten, die NTLM nutzen', acc_meta:'{n} Konten · {v} mit NTLMv1',
+  acc_logons:'NTLM-Anmeldungen', acc_ver:'Version', acc_mach:'Rechner', acc_tgt:'Ziele', acc_failed:'Fehlgeschlagen', acc_krb:'Kerberos',
+  acc_krb_t:'Dieses Konto bekommt bereits Kerberos-Tickets – nur ein Teil läuft noch über NTLM.',
+  acc_nover:'unbekannt', acc_nover_t:'Die Ereignisse nennen keine Version (8001/8003/8004 ohne passendes 4624 oder 40xx).',
+  acc_anon:'anonym', acc_anon_t:'Anonyme NTLM-Verbindung (Null-Session): keine Anmeldedaten, oft alte Drucker, Samba/Linux-Abfragen oder Aufzählungen. Windows kennzeichnet sie als „NTLM V1" – das ist hier kein echtes NTLMv1. Aufrufer über die Quellrechner finden und anonymen Zugriff einschränken.',
+  acc_machine:'Computerkonto', acc_machine_t:'Ein Computerkonto meldet sich per NTLM an – meist Dienste, die als SYSTEM laufen und Kerberos nicht nutzen können (z. B. Ziel per IP-Adresse oder fehlender SPN).',
+  acd_user:'Benutzer- oder Dienstkonto', acd_last:'zuletzt {when}', acd_none:'Für dieses Konto liegen im Zeitraum keine NTLM-Daten vor.',
+  acd_failed_sub:'Server und DCs', acd_mixed:'teils schon Kerberos', acd_krb_only:'nur Kerberos', acd_no_krb:'kein Kerberos gesehen',
+  acd_via_agent:'Agent', acd_via_server:'vom Server gesehen', acd_via_dc:'vom DC gesehen',
+  acd_from:'Von welchen Rechnern', acd_to:'Auf welche Server', acd_fails:'Fehlgeschlagene Versuche', acd_more:'… und {n} weitere',
+  acd_events:'Ereignisse dieses Kontos',
+  help_failed:'Fehlgeschlagene NTLM-Anmeldungen: auf den Servern mit Agent (4625) und an den Domänencontrollern (4776). Dieselbe Fehlanmeldung wird dabei einmal gezählt. Häufigste Ursachen: veraltete Passwörter in Diensten oder Aufgaben – und Password Spraying, wenn ein Rechner viele Konten durchprobiert. Fehlschläge zählen nicht zum NTLM-Anteil.',
+  help_accounts:'Jedes Konto, das NTLM nutzt, aus allen Richtungen: was die Rechner senden (8001/4020), was die Server annehmen (8003/4022/4624) und was die DCs sehen (8004/4030). Dieselbe Anmeldung wird einmal gezählt. Ein Klick öffnet das Konto mit Rechnern, Servern, Programmen und Fehlschlägen.',
+  b_out_off:'ausgehend aus', b_out_off_t:'„Ausgehender NTLM-Datenverkehr zu Remoteservern" steht nicht auf „Alle überwachen" – diese Maschine schreibt kein 8001. Welches Programm und Konto von hier NTLM nutzt, bleibt unsichtbar.',
+  b_in_off:'eingehend aus', b_in_off_t:'„Eingehenden NTLM-Datenverkehr überwachen" ist aus – kein 8002/8003. Welcher Dienst hier NTLM annimmt, bleibt offen; die Anmeldungen selbst sieht man weiter über 4624 und den DC.',
+  b_dom_off:'Domäne aus', b_dom_off_t:'„NTLM-Authentifizierung in dieser Domäne überwachen" ist auf diesem DC aus – kein 8004. Die Domänensicht fehlt für alles, was dieser DC prüft.',
+  ag_gaps:'Auf {n} Maschinen fehlt NTLM-Auditing in mindestens einer Richtung – dort bleibt NTLM ganz oder teilweise unsichtbar. Die roten und gelben Abzeichen nennen die Richtlinie.',
+  r_logon:'Anmeldungen', r_logon_t:'„Anmelden überwachen: Erfolg" ist aktiv – diese Maschine schreibt 4624, NTLMv1 wird hier erkannt.',
+  b_logon_off:'4624 fehlt', b_logon_off_t:'„Anmelden überwachen" steht auf „Keine Überwachung" oder nur „Fehler". Ohne erfolgreiche 4624 bleibt NTLMv1 auf dieser Maschine unsichtbar. GPO: Erweiterte Überwachungsrichtlinienkonfiguration → An-/Abmelden → Anmelden überwachen: Erfolg.',
+  b_agent_old:'Agent vor 2.3', b_agent_old_t:'Dieser Agent sammelt 4624 nur auf DCs – NTLMv1 bleibt auf dieser Maschine unsichtbar, bis der Agent auf 2.3.0 oder neuer aktualisiert ist.',
+  b_logon_unk:'Anmelde-Audit unbekannt', b_logon_unk_t:'Der Agent konnte die Auditrichtlinie nicht lesen (auditpol). Ob NTLMv1 hier erkannt wird, ist offen.',
+  v1_blind:'Auf {n} Maschinen ist NTLMv1 unsichtbar – {a} ohne Anmelde-Audit, {b} mit Agent vor 2.3. Zum Maschinen-Panel →',
+  md_loading:'Lädt …', md_err:'Konnte nicht geladen werden.', md_out:'Ausgehend', md_in:'Eingehend',
+  md_in_local:'Eingehend (auf der Maschine)', md_srcs_lbl:'Quellen', md_local:'{n} selbst protokolliert',
+  md_v1:'{n} davon NTLMv1', md_v1none:'kein NTLMv1', md_ready:'Abschalten · letzte 30 Tage', md_progs:'Programme → Ziele',
+  md_from:'Wer per NTLM zugreift', md_users:'Konten', md_audit:'Auditing',
+  md_none_out:'Kein ausgehendes NTLM im gewählten Zeitraum.', md_none_in:'Kein eingehendes NTLM im gewählten Zeitraum gesehen.',
+  md_via_local:'selbst protokolliert', md_via_dc:'vom DC gesehen', md_via_cli:'vom Client gemeldet',
+  md_more:'… und {n} weitere Quellen', md_seen:'zuletzt gemeldet {when}', md_since:'Daten seit {when}',
+  md_stale:'meldet sich nicht', md_agent:'Agent {v}', md_type_srv:'Server', md_type_cli:'Client',
+  md_filter:'Dashboard auf diese Maschine filtern', md_events:'Ereignisse dieser Maschine',
+  svc_logon:'Anmeldung ohne Dienstangabe (4624)', blk_short:'blockiert', kpi_share:'NTLM-Anteil', kpi_vs:'zur Vorwoche', kpi_sub:'7 Tage: {a} · Vorwoche: {b}', kpi_new:'neu', kpi_pts:'Pkt.',
+  hc_l:'Ablöse · {r}', hc_r:'Ziel: 100 % Kerberos', goal0:'Ziel: 0',
+  theme_light:'Helles Design', theme_dark:'Dunkles Design',
+  help_lbl:'Was zeigt das?', menu_lbl:'Auswahl', orb_t:'Live – aktualisiert sich jede Minute',
+  help_trend:'NTLM-Vorgänge im gewählten Zeitraum – diese Balken sollen über die Wochen gegen null gehen. Rot = NTLMv1, Gelb = NTLMv2, Grau = NTLM ohne Versionsangabe. Kerberos steht zur Einordnung im Tooltip. Ein Klick auf einen Balken zeigt die Ereignisse dahinter.',
+  help_programs:'Die Arbeitsliste: jedes Programm, das per NTLM auf ein Ziel zugreift, aus den Client-Ereignissen 8001 und 4020. Status setzen, sobald ein Eintrag behoben oder bewusst akzeptiert ist. Die Linie zeigt den Verlauf der letzten Tage, die rote Zahl bereits blockierte Versuche.',
+  help_why:'Warum Windows NTLM statt Kerberos gewählt hat – aus dem Grund, den die erweiterten Ereignisse 4020 bis 4023 mitliefern, und aus Kerberos-Fehlern (4769). Zu jedem Grund steht die übliche Behebung; ein Klick zeigt die betroffenen Ereignisse.',
+  help_heat:'Wann NTLM passiert, nach Wochentag und Stunde. Helle Zellen außerhalb der Arbeitszeit sind meist geplante Aufgaben, Dienste oder Skripte – oft die am leichtesten übersehenen Posten. Ein Klick auf eine Zelle zeigt genau diese Stunde.',
+  help_v1:'Konten, die sich noch mit NTLMv1 anmelden – erkannt an den Anmeldungen auf Servern und DCs (4624) und an den erweiterten Ereignissen von Windows 11 24H2 / Server 2025. NTLMv1 lässt sich mit wenig Aufwand knacken und sollte als Erstes verschwinden – meist hilft ein LmCompatibilityLevel von 5 auf dem Client oder ein Update des Geräts.',
+  help_v1sso:'Anmeldungen mit aus NTLMv1 abgeleiteten Anmeldedaten (Ereignis 4024), häufig WLAN oder VPN mit MS-CHAPv2. Ab Oktober 2026 blockiert Windows das standardmäßig – was hier steht, bricht dann.',
+  help_noagent:'Rechner, an denen sich Domänenkonten per NTLM angemeldet haben, die aber keinen Agent haben – aus den NTLM-Prüfungen der Domänencontroller (4776). Oft Drucker, Geräte oder vergessene Server.',
+  help_incoming:'Welche Dienste auf welchen Servern NTLM annehmen – aus den eingehenden Ereignissen 8002, 8003 und 4022 auf den Servern selbst. Das Gegenstück zu den Programmen: hier setzt man an, um NTLM serverseitig abzuschalten.',
+  help_domain:'NTLM-Anmeldungen von Domänenkonten, wie die Domänencontroller sie sehen (8004, 4030–4033): von welchem Rechner zu welchem Server. Erfasst auch Rechner ohne Agent.',
+  help_top:'Die Server, die am häufigsten per NTLM angesprochen werden. Ein Ziel weit oben lohnt oft einen Blick auf SPN und DNS – ein einziger Fix kann viele Einträge auf einmal erledigen.',
+  help_kerberos:'Dienste, die bereits Kerberos-Tickets bekommen (4769 auf den Domänencontrollern), mit der ausgehandelten Verschlüsselung. Zeigt, was schon funktioniert – und wo noch RC4 statt AES läuft.',
+  help_kacc:'Konten, die bereits Kerberos nutzen. Hilfreich als Gegenprobe: Taucht ein Konto hier und zugleich bei NTLM auf, läuft meist nur ein Teil seiner Zugriffe noch über NTLM.',
+  help_agents:'Jeder Rechner mit Agent: Betriebssystem, welches Auditing dort aktiv ist, und ob er sich meldet. Wo Auditing fehlt, sieht das Dashboard NTLM auf diesem Rechner nicht.',
+  help_events:'Die einzelnen Ereignisse hinter allen Zahlen. Filter aus den anderen Panels landen hier; ein Klick auf eine Zeile zeigt alle Felder mit Erklärung.',
+  blk_lage:'Lage', blk_lage_p:'Wo NTLM noch läuft und warum.',
+  blk_act:'Handeln', blk_act_p:'Was sich jetzt abschalten oder beheben lässt.',
+  blk_det:'Details', blk_det_p:'Wer, wohin, wann – zum Nachschlagen.',
+  nav_top:'Ziele', nav_kacc:'Kerberos-Konten',
+  fold_open:'Aufklappen', fold_close:'Zuklappen',
+  show_all:'Alle {n} anzeigen', show_less:'Weniger anzeigen',
+  rdy_h:'Abschaltbereit', rdy_badge:'nächster Schritt', nav_rdy:'Abschaltbereit',
+  rdy_meta:'{o} ausgehend · {i} eingehend bereit',
+  rdy_intro:'Bereit heißt: Auditing an, {d} Tage beobachtet und in diesen {d} Tagen kein NTLM – dann lässt sich dort „Restrict NTLM" auf „Deny" stellen. Eingehend zählt auch, was andere Rechner und die Domänencontroller an NTLM zu dieser Maschine gesehen haben; Doppelungen und Phantome zählen nicht.',
+  rdy_th_out:'Ausgehend', rdy_th_in:'Eingehend', rdy_th_obs:'Beobachtet', rdy_days:'{d} Tage',
+  rdy_ready:'bereit', rdy_since:'letztes NTLM {when}', rdy_quiet:'seit {d} Tagen kein NTLM',
+  rdy_busy_out:'{n}× NTLM', rdy_busy_in:'NTLM aus {w} Quellen', rdy_from:'von', rdy_last:'zuletzt {when}',
+  rdy_active:'bereits gesperrt', rdy_young:'noch {r} Tage beobachten', rdy_young1:'noch 1 Tag beobachten',
+  rdy_days1:'1 Tag', na_more:'… und {n} weitere, nach Anzahl sortiert – die häufigsten stehen oben.', rdy_noaudit:'Auditing aus',
+  rdy_noaudit_t_out:'Ohne „Outgoing NTLM traffic: Audit all" (oder Windows 11 24H2 / Server 2025) lässt sich nicht sagen, ob ausgehend NTLM läuft.',
+  rdy_noaudit_t_in:'Ohne „Audit Incoming NTLM Traffic" (oder Server 2025) lässt sich nicht sagen, ob eingehend NTLM läuft. NTLM, das andere Rechner oder die DCs zu dieser Maschine sehen, wird trotzdem erkannt.',
+  rdy_stale:'Agent meldet sich nicht', rdy_stale_t:'Seit mehr als zwei Tagen keine Meldung – ohne aktuelle Daten keine Bewertung.',
+  rdy_dc:'domänenweit entscheiden',
+  na_h:'Rechner ohne Agent', na_badge:'aus 4776', nav_na:'Ohne Agent',
+  na_intro:'Aus den NTLM-Prüfungen der Domänencontroller (4776): Rechner, an denen sich Domänenkonten per NTLM angemeldet haben, die aber keinen Agent haben. Oft genau die vergessenen Server und Geräte.',
+  na_empty:'Kein NTLM von Rechnern ohne Agent im gewählten Zeitraum.',
+  na_nodc:'Noch keine NTLM-Prüfungen (4776) von den Domänencontrollern – dafür braucht der Agent auf den DCs Version 2.2.0.',
   type_dc:'Domänencontroller', type_member:'Server/Client',
   b_dcval_ok:'4776 kommt an', b_dcval_ok_t:'Liefert NTLM-Prüfungen (4776) für den Phantom-Abgleich, zuletzt {when}.',
   b_dcval_none:'keine 4776', b_dcval_none_t:'Dieser DC liefert keine NTLM-Prüfungen (4776). Solange auch nur ein DC fehlt, wird kein 8001 als Phantom belegt – den Agent auf Version 2.2.0 oder neuer aktualisieren; „Anmeldeinformationen überprüfen" muss im Audit aktiv sein.',
@@ -1984,7 +3983,7 @@ en: {
   fl_split_t:'Agents report different values',
   osdon_mid:'agents', osdon_old:'{n} predate Server 2019 – no 40xx events there', osbar_tip:'Counts reporting machines only, not the whole domain',
   leg_goal:'Color legend', leg_bad:'NTLMv1 · insecure', leg_old:'NTLMv2 · outdated', leg_good:'Kerberos · secure',
-  range:'Time range', r7d:'7 days', r30d:'30 days', rall:'All',
+  range:'Time range', r24h:'24 hours', trend_hourly:'per hour', r7d:'7 days', r30d:'30 days', rall:'All',
   lab_total:'NTLM total', sub_total:'recorded events', tt_total:'Counts every recorded event in the selected range - NTLM, Kerberos and domain reports combined. Click shows the list.',
   lab_v1:'Insecure', sub_v1:'NTLMv1 – replace first', tt_v1:'Counts NTLMv1 logons: event 4624 with version NTLMv1 plus 4024/4025 (NTLMv1 SSO). Click filters the list.',
   lab_v2:'Outdated', sub_v2:'NTLMv2 – better, but old', tt_v2:'Counts NTLMv2 logons (4624 and 40xx with version NTLMv2). Better than v1, but still relay-prone. Click filters the list.',
@@ -2117,7 +4116,7 @@ en: {
   fix_dc:'Check the network path to a DC (firewall, segmentation); IAKerb arrives 2026',
   fix_loop:'Usually the RPC endpoint mapper; review the two RPC policies',
   fix_null:'Anonymous connection - identify the caller and stop it',
-  fix_unklar:'Investigate - Windows reported no known ID here',
+  fix_unclear:'Investigate - Windows reported no known ID here',
   k_relay:'Relay-exposed', k_relay_s:'no MIC or EPA',
   nav_label:'Sections', nav_prog:'Programs', nav_inc:'Services', nav_v1sso:'NTLMv1 SSO',
   nav_v1:'NTLMv1', nav_dom:'Domain', nav_krb:'Kerberos', nav_mach:'Machines', nav_ev:'Events',
@@ -2145,11 +4144,111 @@ en: {
   f_all:'All', f_v1:'Insecure only', f_v2:'Outdated only', f_out:'Programs', f_dom:'Domain',
   csv:'CSV export', csv_t:'Download the current selection as CSV',
   g_logout:'Log out', g_logout_t:'End the session on the server',
+  g_report:'Report', g_report_t:'Status report to print or save as PDF - for everyone who does not open the dashboard',
   more:'more', b_v1:'NTLMv1 · insecure', b_v2:'NTLMv2 · outdated', b_krb:'Kerberos · secure',
   b_dom:'NTLM (domain)', b_out:'NTLM outgoing', b_fb:'Kerberos fallback',
   hb_on:'active', hb_off:'quiet',
   au_out_on:'Outgoing', au_out_off:'Outgoing off', au_dom_on:'Domain', au_dom_off:'Domain off',
-  st_offen:'open', st_arbeit:'in progress', st_erledigt:'done', again:'active again', what:'What to do?',
+  st_open:'open', st_in_progress:'in progress', st_done:'done', again:'active again', what:'What to do?',
+  search_btn:'Search', search_kbd:'Ctrl K', pal_ph:'Machine, program, account, target or panel …',
+  pal_foot:'↑ ↓ select · Enter open · Esc close · machines open their detail, everything else filters the events',
+  pal_none:'Nothing found for "{q}".', pal_machine:'Machine', pal_noagent:'Computer', pal_prog:'Program',
+  pal_acct:'Account', pal_target:'Target', pal_panel:'Panel', pal_panel_sub:'jump',
+  pal_noagent_sub:'no agent · {n}× NTLM', pal_dom_sub:'domain view · {n}×', pal_target_sub:'{n}× NTLM',
+  nav_fail:'Failed attempts', nav_acc:'Accounts', pal_failed:'{n}× failed',
+  fail_h:'Failed NTLM attempts', fail_badge_spray:'Spraying?',
+  fail_meta:'{n} attempts · {a} accounts',
+  fail_from:'From', fail_to:'To', fail_why:'Reason', fail_locked:'locked',
+  fail_to_dc:'via DC', fail_to_dc_t:'Only seen by the domain controller (4776) - the target server has no agent or no failure auditing.',
+  fail_spray:'Many accounts from one machine: {l}. That is what password spraying looks like - or a script with stale credentials. Check it.',
+  fail_spray_n:'{n} accounts',
+  fail_blind:'On {n} machines "Audit Logon: Failure" is off - failed logons there only show up when a DC checks them.',
+  fail_empty:'No failed NTLM logons in the selected range.',
+  fv_local:'seen on the server', fv_dc:'seen by a DC', fv_both:'server and DC',
+  nt_0xc000006a:'wrong password', nth_0xc000006a:'Usually a service, scheduled task or mapped drive with an old password on the source machine.',
+  nt_0xc0000064:'no such account', nth_0xc0000064:'A mistyped or deleted account name - or someone trying names.',
+  nt_0xc0000234:'account locked out', nth_0xc0000234:'The account is locked out. Find the source that keeps trying with a wrong password.',
+  nt_0xc0000072:'account disabled', nth_0xc0000072:'A disabled account is still in use - look for the service, task or script.',
+  nt_0xc0000193:'account expired', nth_0xc0000193:'The account has expired but is still being used.',
+  nt_0xc0000071:'password expired', nth_0xc0000071:'Password expired - for service accounts: renew it or move to a gMSA.',
+  nt_0xc0000224:'password must change', nth_0xc0000224:'The account has to change its password at the next logon.',
+  nt_0xc000006f:'outside logon hours', nth_0xc000006f:'Logon at a restricted time.',
+  nt_0xc0000070:'workstation not allowed', nth_0xc0000070:'The account may not log on from this machine (userWorkstations).',
+  nt_0xc000015b:'logon type not granted', nth_0xc000015b:'The user right for this logon type is missing (e.g. "Access this computer from the network").',
+  nt_0xc000006d:'logon failure', nth_0xc000006d:'A generic failure without a more specific reason.',
+  nt_0xc0000133:'clock skew', nth_0xc0000133:'The machine clock is too far off the DC.',
+  nt_0xc0000413:'authentication firewall', nth_0xc0000413:'Selective authentication on a trust rejected the logon.',
+  acc_h:'Accounts using NTLM', acc_meta:'{n} accounts · {v} with NTLMv1',
+  acc_logons:'NTLM logons', acc_ver:'Version', acc_mach:'Machines', acc_tgt:'Targets', acc_failed:'Failed', acc_krb:'Kerberos',
+  acc_krb_t:'This account already gets Kerberos tickets - only part of it still runs over NTLM.',
+  acc_nover:'unknown', acc_nover_t:'The events name no version (8001/8003/8004 without a matching 4624 or 40xx).',
+  acc_anon:'anonymous', acc_anon_t:'Anonymous NTLM connection (null session): no credentials, often old printers, Samba/Linux queries or enumeration. Windows labels it "NTLM V1" - that is not real NTLMv1 here. Find the caller through the source machines and restrict anonymous access.',
+  acc_machine:'computer account', acc_machine_t:'A computer account signs in over NTLM - usually services running as SYSTEM that cannot use Kerberos (e.g. target by IP address or a missing SPN).',
+  acd_user:'user or service account', acd_last:'last seen {when}', acd_none:'There is no NTLM data for this account in the selected range.',
+  acd_failed_sub:'servers and DCs', acd_mixed:'partly on Kerberos already', acd_krb_only:'Kerberos only', acd_no_krb:'no Kerberos seen',
+  acd_via_agent:'agent', acd_via_server:'seen by the server', acd_via_dc:'seen by a DC',
+  acd_from:'From which machines', acd_to:'To which servers', acd_fails:'Failed attempts', acd_more:'… and {n} more',
+  acd_events:'Events of this account',
+  help_failed:'Failed NTLM logons: on the servers with an agent (4625) and at the domain controllers (4776). One failed logon is counted once. Most common causes: stale passwords in services or tasks - and password spraying when one machine tries many accounts. Failures do not count towards the NTLM share.',
+  help_accounts:'Every account that uses NTLM, from all directions: what the machines send (8001/4020), what the servers accept (8003/4022/4624) and what the DCs see (8004/4030). One logon is counted once. A click opens the account with its machines, servers, programs and failures.',
+  b_out_off:'outgoing off', b_out_off_t:'"Outgoing NTLM traffic to remote servers" is not set to "Audit all" - this machine writes no 8001. Which program and account use NTLM from here stays invisible.',
+  b_in_off:'incoming off', b_in_off_t:'"Audit Incoming NTLM Traffic" is off - no 8002/8003. Which service accepts NTLM here stays unknown; the logons themselves are still seen through 4624 and the DC.',
+  b_dom_off:'domain off', b_dom_off_t:'"Audit NTLM authentication in this domain" is off on this DC - no 8004. The domain view is missing for everything this DC validates.',
+  ag_gaps:'{n} machines lack NTLM auditing in at least one direction - NTLM stays wholly or partly invisible there. The red and amber badges name the policy.',
+  r_logon:'logons', r_logon_t:'"Audit Logon: Success" is on - this machine writes 4624, NTLMv1 is recognised here.',
+  b_logon_off:'no 4624', b_logon_off_t:'"Audit Logon" is set to "No Auditing" or failures only. Without successful 4624s NTLMv1 stays invisible on this machine. GPO: Advanced Audit Policy Configuration → Logon/Logoff → Audit Logon: Success.',
+  b_agent_old:'agent before 2.3', b_agent_old_t:'This agent collects 4624 on DCs only - NTLMv1 stays invisible on this machine until the agent is updated to 2.3.0 or later.',
+  b_logon_unk:'logon audit unknown', b_logon_unk_t:'The agent could not read the audit policy (auditpol). Whether NTLMv1 is recognised here is open.',
+  v1_blind:'NTLMv1 is invisible on {n} machines - {a} without logon auditing, {b} with an agent before 2.3. To the machines panel →',
+  md_loading:'Loading …', md_err:'Could not be loaded.', md_out:'Outgoing', md_in:'Incoming',
+  md_in_local:'Incoming (on the machine)', md_srcs_lbl:'sources', md_local:'{n} logged here',
+  md_v1:'{n} of them NTLMv1', md_v1none:'no NTLMv1', md_ready:'Switching off · last 30 days', md_progs:'Programs → targets',
+  md_from:'Who reaches it over NTLM', md_users:'Accounts', md_audit:'Auditing',
+  md_none_out:'No outgoing NTLM in the selected range.', md_none_in:'No incoming NTLM seen in the selected range.',
+  md_via_local:'logged here', md_via_dc:'seen by a DC', md_via_cli:'reported by the client',
+  md_more:'… and {n} more sources', md_seen:'last report {when}', md_since:'data since {when}',
+  md_stale:'not reporting', md_agent:'agent {v}', md_type_srv:'Server', md_type_cli:'Client',
+  md_filter:'Filter the dashboard to this machine', md_events:'Events of this machine',
+  svc_logon:'logon, no service named (4624)', blk_short:'blocked', kpi_share:'NTLM share', kpi_vs:'vs last week', kpi_sub:'Last 7 days: {a} · week before: {b}', kpi_new:'new', kpi_pts:'pts',
+  hc_l:'Handover · {r}', hc_r:'Goal: 100 % Kerberos', goal0:'Goal: 0',
+  theme_light:'Light theme', theme_dark:'Dark theme',
+  help_lbl:'What does this show?', menu_lbl:'Selection', orb_t:'Live - refreshes every minute',
+  help_trend:'NTLM activity in the selected range - these bars should approach zero over the weeks. Red = NTLMv1, yellow = NTLMv2, grey = NTLM without version info. Kerberos is in the tooltip for context. Click a bar for the events behind it.',
+  help_programs:'The work list: every program that reaches a target over NTLM, from the client events 8001 and 4020. Set a status once an entry is fixed or knowingly accepted. The line shows the last days, the red number attempts that were already blocked.',
+  help_why:'Why Windows chose NTLM over Kerberos - from the reason the enhanced events 4020 to 4023 carry, and from Kerberos failures (4769). Each reason comes with the usual fix; click for the events concerned.',
+  help_heat:'When NTLM happens, by weekday and hour. Bright cells outside working hours are mostly scheduled tasks, services or scripts - often the easiest ones to overlook. Click a cell for exactly that hour.',
+  help_v1:'Accounts still signing in with NTLMv1 - recognised from the logons on servers and DCs (4624) and from the enhanced events of Windows 11 24H2 / Server 2025. NTLMv1 is cheap to crack and should go first - usually LmCompatibilityLevel 5 on the client or an update of the device fixes it.',
+  help_v1sso:'Sign-ins with credentials derived from NTLMv1 (event 4024), often Wi-Fi or VPN with MS-CHAPv2. From October 2026 Windows blocks this by default - whatever is listed here will break then.',
+  help_noagent:'Machines where domain accounts signed in with NTLM but that run no agent - from the domain controllers\' NTLM validations (4776). Often printers, devices or forgotten servers.',
+  help_incoming:'Which services on which servers accept NTLM - from the incoming events 8002, 8003 and 4022 on the servers themselves. The counterpart to the programs: this is where NTLM gets switched off server-side.',
+  help_domain:'NTLM sign-ins of domain accounts as the domain controllers see them (8004, 4030-4033): from which machine to which server. Covers machines without an agent too.',
+  help_top:'The servers reached over NTLM most often. A target near the top is usually worth a look at SPN and DNS - a single fix can clear many entries at once.',
+  help_kerberos:'Services already getting Kerberos tickets (4769 on the domain controllers), with the negotiated encryption. Shows what already works - and where RC4 still runs instead of AES.',
+  help_kacc:'Accounts already using Kerberos. Useful as a cross-check: an account that appears here and under NTLM usually has only part of its access still on NTLM.',
+  help_agents:'Every machine with an agent: operating system, which auditing is on there, and whether it reports in. Where auditing is missing, the dashboard cannot see NTLM on that machine.',
+  help_events:'The individual events behind every number. Filters from the other panels land here; click a row for all fields with an explanation.',
+  blk_lage:'Situation', blk_lage_p:'Where NTLM still runs and why.',
+  blk_act:'Act', blk_act_p:'What can be switched off or fixed now.',
+  blk_det:'Details', blk_det_p:'Who, where to, when - for looking things up.',
+  nav_top:'Targets', nav_kacc:'Kerberos accounts',
+  fold_open:'Expand', fold_close:'Collapse',
+  show_all:'Show all {n}', show_less:'Show fewer',
+  rdy_h:'Ready to switch off', rdy_badge:'next step', nav_rdy:'Ready',
+  rdy_meta:'{o} outgoing · {i} incoming ready',
+  rdy_intro:'Ready means: auditing on, watched for {d} days and no NTLM in those {d} days - then "Restrict NTLM" can be set to "Deny" there. Incoming also counts what other machines and the domain controllers saw going to this machine; duplicates and phantoms do not count.',
+  rdy_th_out:'Outgoing', rdy_th_in:'Incoming', rdy_th_obs:'Watched', rdy_days:'{d} days',
+  rdy_ready:'ready', rdy_since:'last NTLM {when}', rdy_quiet:'no NTLM for {d} days',
+  rdy_busy_out:'{n}× NTLM', rdy_busy_in:'NTLM from {w} sources', rdy_from:'from', rdy_last:'latest {when}',
+  rdy_active:'already denied', rdy_young:'{r} more days to watch', rdy_young1:'1 more day to watch',
+  rdy_days1:'1 day', na_more:'… and {n} more, sorted by count - the most frequent are on top.', rdy_noaudit:'auditing off',
+  rdy_noaudit_t_out:'Without "Outgoing NTLM traffic: Audit all" (or Windows 11 24H2 / Server 2025) there is no telling whether outgoing NTLM happens.',
+  rdy_noaudit_t_in:'Without "Audit Incoming NTLM Traffic" (or Server 2025) there is no telling whether incoming NTLM happens. NTLM that other machines or the DCs see going to this machine is still caught.',
+  rdy_stale:'agent silent', rdy_stale_t:'No report for more than two days - no verdict without current data.',
+  rdy_dc:'a domain-wide decision',
+  na_h:'Machines without an agent', na_badge:'from 4776', nav_na:'No agent',
+  na_intro:'From the domain controllers\' NTLM validations (4776): machines where domain accounts logged on with NTLM but that run no agent. Often exactly the forgotten servers and devices.',
+  na_empty:'No NTLM from machines without an agent in the selected range.',
+  na_nodc:'No NTLM validations (4776) from the domain controllers yet - the agent on the DCs needs version 2.2.0 for that.',
   type_dc:'Domain controller', type_member:'Server/client',
   b_dcval_ok:'4776 arriving', b_dcval_ok_t:'Delivers NTLM validations (4776) for the phantom check, latest {when}.',
   b_dcval_none:'no 4776', b_dcval_none_t:'This DC delivers no NTLM validations (4776). While even one DC is missing, no 8001 is shown to be a phantom - update the agent to 2.2.0 or later; "Audit Credential Validation" has to be on.',
@@ -2237,8 +4336,8 @@ const HW = i => (i + 1) % 7;          // heat row index -> strftime %w
 const DN = () => LANG === 'de' ? ['So','Mo','Di','Mi','Do','Fr','Sa']
                                : ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
 
-// ---- Zustand -------------------------------------------------------------
-const S = {range:'30d', mach:'', hideDone:false, q:'', kind:'', acct:'all', shown:60,
+// ---- State ---------------------------------------------------------------
+const S = {range:'30d', mach:'', hideDone:false, q:'', kind:'', acct:'all', shown:25,
            bucket:'', wd:'', hr:'', pick:'', rsn:'', unconf:''};
            // bucket/wd/hr: drill-down from the charts, pick: from the handover bar,
            // unconf: list only the unconfirmed 8001s (never counted anywhere)
@@ -2318,6 +4417,9 @@ function params(extra){
   p.set('tzoff', String(TZOFF()));
   // A weekday of 0 (Sunday) and hour 0 are falsy but perfectly valid, so these
   // are tested against '' rather than for truthiness.
+  // Text search runs in the database, so the list holds every match rather
+  // than the matches among the newest few hundred rows.
+  if(S.q) p.set('q', S.q);
   if(S.bucket) p.set('bucket', S.bucket);
   if(S.wd !== '') p.set('wd', S.wd);
   if(S.hr !== '') p.set('hr', S.hr);
@@ -2336,16 +4438,22 @@ function params(extra){
   if(extra) for(const k in extra) if(extra[k]) p.set(k, extra[k]);
   return p;
 }
+// Only the newest request may paint: when the range is switched quickly or a
+// search is typed, an older answer arriving late must not overwrite a newer one.
+let LOAD_SEQ = 0;
 async function load(){
+  const my = ++LOAD_SEQ;
   let r;
   try { r = await fetch('/api/data?' + params().toString()); }
   catch(e){ return; }
   if(r.status === 401 || r.status === 403){ window.location = '/login'; return; }
-  DATA = await r.json();
+  const d = await r.json();
+  if(my !== LOAD_SEQ) return;
+  DATA = d;
   render();
 }
 
-// ---- Bausteine -----------------------------------------------------------
+// ---- Building blocks ---------------------------------------------------
 const tag = (cls, txt, ti) => '<span class="tag ' + cls + '"' +
   (ti ? ' title="' + esc(ti) + '"' : '') + '>' + esc(txt) + '</span>';
 const emptyBox = (a, b) => '<div class="empty"><b>' + esc(a) + '</b>' + esc(b || '') + '</div>';
@@ -2394,6 +4502,7 @@ function sortTable(th){
   rows.forEach(r => body.appendChild(r));
   table.querySelectorAll('th').forEach(o => o.setAttribute('aria-sort', 'none'));
   th.setAttribute('aria-sort', asc ? 'ascending' : 'descending');
+  clipOne(table);   // the first ten after sorting, not the first ten before
 }
 
 // On a narrow screen each row is stacked and every value needs its column name
@@ -2421,9 +4530,75 @@ document.addEventListener('keydown', function(e){
   if(th){ e.preventDefault(); sortTable(th); }
 });
 const CARD = (id, title, flag, meta, body, cls, extra) =>
-  '<section class="card ' + (cls || '') + '" id="' + id + '"><div class="ch"><h2>' + esc(title) + '</h2>' +
+  '<section class="card ' + (cls || '') + (FOLDED.has(id) ? ' folded' : '') + '" id="' + id + '"><div class="ch"><h2>' + esc(title) + '</h2>' +
   (flag ? '<span class="flag ' + (flag[1] || '') + '">' + esc(flag[0]) + '</span>' : '') +
-  (extra || '') + (meta ? '<span class="meta">' + esc(meta) + '</span>' : '') + '</div>' + body + '</section>';
+  (extra || '') + (meta ? '<span class="meta">' + esc(meta) + '</span>' : '') +
+  (hasHelp(id) ? '<button type="button" class="hlp" data-help="' + id + '" aria-expanded="' + HELPOPEN.has(id) +
+    '" aria-label="' + esc(t('help_lbl') + ': ' + title) + '" title="' + esc(t('help_lbl')) + '">?</button>' : '') +
+  '<button type="button" class="fold" data-fold="' + id + '" aria-expanded="' + !FOLDED.has(id) + '" aria-label="' +
+  esc(t(FOLDED.has(id) ? 'fold_open' : 'fold_close') + ': ' + title) + '"></button>' +
+  '</div>' + (hasHelp(id) ? '<div class="cnote help" id="help-' + id + '"' + (HELPOPEN.has(id) ? '' : ' hidden') + '>' +
+    esc(t(helpKey(id))) + '</div>' : '') + body + '</section>';
+// "What does this show?" - a short answer per panel, one click away, so the
+// dashboard also works for a colleague who has not followed the project.
+const helpKey = id => 'help_' + id.replace('sec-', '');
+const hasHelp = id => !!(I18N[LANG] && I18N[LANG][helpKey(id)]);
+const HELPOPEN = new Set();
+
+// ---- Folding and shortening ------------------------------------------------
+// The page had grown to 13.6 screen heights on a desktop and 53 on a phone. Any
+// panel folds from its header, and the choice is remembered per browser; on a
+// phone that has never chosen, only the panels that say what to do are open.
+// Long tables show their first ten rows with "show all n" below.
+const FOLD_KEY = 'ntlm.folded';
+const FOLDED = (() => {
+  try {
+    const v = localStorage.getItem(FOLD_KEY);
+    if(v !== null) return new Set(JSON.parse(v));
+  } catch(e){}
+  return new Set(innerWidth <= 760 ? ['sec-why', 'sec-heat', 'sec-v1', 'sec-v1sso', 'sec-noagent',
+    'sec-incoming', 'sec-domain', 'sec-top', 'sec-kerberos', 'sec-kacc', 'sec-agents'] : []);
+})();
+function saveFolded(){ try { localStorage.setItem(FOLD_KEY, JSON.stringify([...FOLDED])); } catch(e){} }
+function setFold(id, fold){
+  if(fold) FOLDED.add(id); else FOLDED.delete(id);
+  saveFolded();
+  const c = document.getElementById(id); if(!c) return;
+  c.classList.toggle('folded', fold);
+  const b = c.querySelector('.fold');
+  if(b){ b.setAttribute('aria-expanded', String(!fold));
+    b.setAttribute('aria-label', t(fold ? 'fold_open' : 'fold_close') + ': ' + c.querySelector('h2').textContent); }
+}
+const CLIP_AT = 10, CLIP_MIN = 13;   // fewer than 13 rows: not worth a button
+const EXPANDED = new Set();
+function clipOne(table){
+  const card = table.closest('.card');
+  if(!card || card.id === 'sec-events' || !table.tBodies[0]) return;
+  clipRows(card, [...table.tBodies[0].rows], table.closest('.tw') || table);
+}
+// Bar lists (NTLMv1 accounts, targets) fold the same way as tables.
+function clipBars(box){
+  const card = box.closest('.card');
+  if(card) clipRows(card, [...box.children], box);
+}
+function clipCard(card){
+  const tb = card.querySelector('table'); if(tb){ clipOne(tb); return; }
+  const b = card.querySelector('.bars'); if(b) clipBars(b);
+}
+function clipRows(card, rows, after){
+  let btn = card.querySelector('.showall');
+  if(rows.length < CLIP_MIN){ rows.forEach(r => r.classList.remove('clip')); if(btn) btn.remove(); return; }
+  const open = EXPANDED.has(card.id);
+  rows.forEach((r, i) => r.classList.toggle('clip', !open && i >= CLIP_AT));
+  if(!btn){
+    btn = document.createElement('button');
+    btn.type = 'button'; btn.className = 'showall'; btn.dataset.showall = card.id;
+    after.insertAdjacentElement('afterend', btn);
+  }
+  btn.textContent = open ? t('show_less') : t('show_all', {n: rows.length});
+  btn.setAttribute('aria-expanded', String(open));
+}
+function clipTables(){ document.querySelectorAll('#grid .card').forEach(c => { if(c.id !== 'sec-events') clipCard(c); }); }
 // SQLite's GROUP_CONCAT(DISTINCT ...) cannot take a separator, so these lists
 // arrive as "a,b,c" with no spaces - a wall of text in a wide column. Split
 // them, show the first few and count the rest; the full list stays in the
@@ -2443,9 +4618,9 @@ function encTags(v){
   return all.slice(0, 3).map(e => tag(/RC4|DES/i.test(e) ? 'v2' : 'krb', e)).join(' ') +
     (all.length > 3 ? '<span class="restn">+' + (all.length - 3) + '</span>' : '');
 }
-const stSel = (key, st) => '<select class="sel-st" data-key="' + esc(key) + '" onclick="event.stopPropagation()">' +
-  ['offen','arbeit','erledigt'].map(v => '<option value="' + v + '"' +
-    ((st || 'offen') === v ? ' selected' : '') + '>' + esc(t('st_' + v)) + '</option>').join('') + '</select>';
+const stSel = (key, st) => '<select class="sel-st st-' + esc(st || 'open') + '" data-key="' + esc(key) + '" aria-label="' + esc(t('th_status')) + '" onclick="event.stopPropagation()">' +
+  ['open','in_progress','done'].map(v => '<option value="' + v + '"' +
+    ((st || 'open') === v ? ' selected' : '') + '>' + esc(t('st_' + v)) + '</option>').join('') + '</select>';
 function spark(series){
   if(!series || series.length < 2) return '<span class="dm mn">&ndash;</span>';
   const v = series.map(x => x[1]), mx = Math.max.apply(null, v) || 1;
@@ -2473,7 +4648,7 @@ function countTo(el, to){
     if(p < 1) requestAnimationFrame(step); })(t0);
 }
 
-// ---- Kopfbereich ---------------------------------------------------------
+// ---- Header area -------------------------------------------------------
 function renderChrome(){
   document.documentElement.lang = LANG;
   // Set here, not in render(): renderChrome runs afterwards and overwrote it.
@@ -2484,13 +4659,28 @@ function renderChrome(){
     ? Math.round((st0.total - (st0.krb_ev || 0)) / st0.total * 100) : null;
   document.title = share0 === null ? t('doc_title')
                                    : t('doc_title') + ' \u2013 ' + share0 + ' % NTLM';
-  $('#range').innerHTML = [['24h', t('range')], ['7d', t('r7d')], ['30d', t('r30d')], ['all', t('rall')]]
+  $('#range').innerHTML = [['24h', t('r24h')], ['7d', t('r7d')], ['30d', t('r30d')], ['all', t('rall')]]
     .map(r => '<button data-r="' + r[0] + '"' + (S.range === r[0] ? ' aria-pressed="true"' : '') + '>' +
       esc(r[1]) + '</button>').join('');
+  // Phone: the controls live behind one button that still says what is set,
+  // so the current range and machine stay visible without opening it.
+  const rl = {'24h': t('r24h'), '7d': t('r7d'), '30d': t('r30d'), 'all': t('rall')}[S.range] || '';
+  const mb = $('#menu');
+  if(mb){ mb.innerHTML = '<span>' + esc(rl + (S.mach ? ' \u00b7 ' + S.mach : '')) + '</span><i></i>';
+    mb.setAttribute('aria-label', t('menu_lbl') + ': ' + rl + (S.mach ? ', ' + S.mach : '')); }
+  const orbEl = $('#orb'); if(orbEl) orbEl.title = t('orb_t');
+  const sb = $('#searchbtn');
+  if(sb){ $('#searchlbl').textContent = t('search_btn'); $('#searchkbd').textContent = IS_MAC ? '\u2318K' : t('search_kbd');
+    sb.setAttribute('aria-label', t('search_btn') + ' (' + (IS_MAC ? 'Cmd' : 'Ctrl') + '+K)'); }
+  const thb = $('#theme');
+  if(thb){ const lbl = t(effTheme() === 'light' ? 'theme_dark' : 'theme_light');
+    thb.setAttribute('aria-label', lbl); thb.title = lbl; }
   const src = (DATA && DATA.sources) || [];
   $('#mach').innerHTML = '<option value="">' + esc(t('g_all_mach')) + '</option>' +
     src.map(s => '<option' + (S.mach === s ? ' selected' : '') + '>' + esc(s) + '</option>').join('');
   $('#hide').textContent = t('g_hidedone');
+  $('#report').textContent = t('g_report');
+  $('#report').title = t('g_report_t');
   $('#logout').textContent = t('g_logout');
   $('#logout').title = t('g_logout_t');
   $('#hide').setAttribute('aria-pressed', S.hideDone);
@@ -2526,6 +4716,7 @@ function segTip(sg){
 }
 // After a drill-down the events panel is what the user wants to look at.
 function goEvents(){
+  if(FOLDED.has('sec-events')) setFold('sec-events', false);
   const el = document.getElementById('sec-events');
   if(el) el.scrollIntoView({behavior:'smooth', block:'start'});
 }
@@ -2608,7 +4799,7 @@ function renderOsDonut(){
   el.innerHTML =
     '<div class="oh">' + esc(t('osbar_lbl')) + '</div>' +
     '<div class="ow"><svg class="ring" width="120" height="120" viewBox="0 0 120 120">' +
-      '<circle cx="60" cy="60" r="' + R + '" fill="none" stroke="rgba(158,180,225,.09)" stroke-width="17"/>' +
+      '<circle cx="60" cy="60" r="' + R + '" fill="none" style="stroke:rgba(var(--line-rgb),.10)" stroke-width="17"/>' +
       arcs +
       '<text class="mid" x="60" y="58" text-anchor="middle" font-size="26">' + total + '</text>' +
       '<text class="midl" x="60" y="76" text-anchor="middle" font-size="11">' +
@@ -2698,69 +4889,140 @@ function renderHero(){
   setTimeout(function(){ document.querySelectorAll('.seg').forEach(function(s){
     s.style.width = s.dataset.w + '%';
     const b = s.querySelector('b'); if(b) b.style.opacity = 1; }); }, 100);
-  // Always all three, including a zero - "NTLMv1 0" is a result worth reading,
-  // and a category that silently vanishes reads as a rendering fault.
-  $('#handkey').innerHTML = [['--v1', 'leg_bad', st.v1], ['--v2', 'leg_old', st.v2],
-      ['--krb', 'leg_good', krb]]
-    .map(x => '<span class="kk' + (x[2] ? '' : ' nil') + '">' +
-      '<i style="background:var(' + x[0] + ')"></i>' +
-      '<b>' + x[2] + '</b><em>' + pctTxt(x[2], tot) + '</em>' +
-      esc(t(x[1])) + '</span>').join('');
+  // Key-figure tiles: the count for the range picked above, and how the last
+  // seven days compare with the seven before - the question everyone asks
+  // first. v1/v2/Kerberos filter the dashboard like the bar segments do.
+  const K = DATA.kpi || null;
+  const loc = LOCALE();
+  const fmtN = v => (v == null ? '\u2013' : Number(v).toLocaleString(loc));
+  const delta = (cur, prev, lowerIsBetter, pts) => {
+    if(cur == null || prev == null) return {txt: '\u2013', cls: 'flat'};
+    if(pts){ const d = Math.round((cur - prev) * 10) / 10;
+      return {txt: (d > 0 ? '+' : d < 0 ? '\u2212' : '\u00b1') + Math.abs(d).toLocaleString(loc) + ' ' + t('kpi_pts'),
+              cls: d === 0 ? 'flat' : ((d < 0) === lowerIsBetter ? 'good' : 'bad')}; }
+    if(!prev) return cur ? {txt: t('kpi_new'), cls: lowerIsBetter ? 'bad' : 'good'} : {txt: '\u00b10 %', cls: 'flat'};
+    const d = Math.round((cur - prev) / prev * 100);
+    return {txt: (d > 0 ? '+' : d < 0 ? '\u2212' : '\u00b1') + Math.abs(d) + ' %',
+            cls: d === 0 ? 'flat' : ((d < 0) === lowerIsBetter ? 'good' : 'bad')};
+  };
+  const tiles = [
+    {lbl: t('kpi_share'), col: '--gold', big: pct + ' %', pick: null, series: K && K.share,
+     d: K ? delta(K.cur.share, K.prev.share, true, true) : null,
+     sub: K ? t('kpi_sub', {a: fmtN(K.cur.share) + ' %', b: fmtN(K.prev.share) + ' %'}) : ''},
+    {lbl: t('leg_bad'), col: '--v1', big: fmtN(st.v1), pick: 'NTLMv1', series: K && K.v1,
+     d: K ? delta(K.cur.v1, K.prev.v1, true) : null, sub: K ? t('kpi_sub', {a: fmtN(K.cur.v1), b: fmtN(K.prev.v1)}) : ''},
+    {lbl: t('leg_old'), col: '--v2', big: fmtN(st.v2), pick: 'NTLMv2', series: K && K.v2,
+     d: K ? delta(K.cur.v2, K.prev.v2, true) : null, sub: K ? t('kpi_sub', {a: fmtN(K.cur.v2), b: fmtN(K.prev.v2)}) : ''},
+    {lbl: t('leg_good'), col: '--krb', big: fmtN(krb), pick: 'kerberos', series: K && K.krb,
+     d: K ? delta(K.cur.krb, K.prev.krb, false) : null, sub: K ? t('kpi_sub', {a: fmtN(K.cur.krb), b: fmtN(K.prev.krb)}) : ''}];
+  $('#handkey').innerHTML = tiles.map(x => {
+    const tag0 = x.pick ? 'button type="button" data-pick="' + esc(x.pick) + '"' : 'div';
+    const tag1 = x.pick ? 'button' : 'div';
+    return '<' + tag0 + ' class="kpi' + (x.pick && S.pick === x.pick ? ' on' : '') + '">' +
+      '<span class="kh"><i style="background:var(' + x.col + ')"></i>' + esc(x.lbl.split(' \u00b7 ')[0]) +
+        (x.lbl.indexOf(' \u00b7 ') > 0 ? '<span class="kq"> \u00b7 ' + esc(x.lbl.split(' \u00b7 ')[1]) + '</span>' : '') + '</span>' +
+      '<span class="kb"><b>' + esc(x.big) + '</b>' + kspark(x.series, x.col) + '</span>' +
+      (x.d ? '<span class="kd"><em class="dlt ' + x.d.cls + '">' + esc(x.d.txt) + '<span class="kq"> ' + esc(t('kpi_vs')) + '</span></em>' +
+        '<small>' + esc(x.sub) + '</small></span>' : '') + '</' + tag1 + '>';
+  }).join('');
+  const rl = {'24h': t('r24h'), '7d': t('r7d'), '30d': t('r30d'), 'all': t('rall')}[S.range] || '';
+  $('#hc_l').textContent = t('hc_l', {r: rl});
+  $('#hc_r').textContent = t('hc_r');
   $('#ddl_t').textContent = t('hero_ddl_t');
   $('#ddl_b').textContent = t('hero_ddl_b');
   countTo($('#pct'), pct);
   countTo($('#days'), Math.max(0, Math.round((new Date(2026, 9, 14) - new Date()) / 864e5)));
   const orb = $('#orb'); if(orb) orb.className = 'orb';
 }
+// A small line for a key-figure tile: the last fourteen days, one point each.
+function kspark(v, col){
+  if(!v || v.length < 2) return '';
+  const vals = v.map(x => x == null ? 0 : x), mx = Math.max.apply(null, vals) || 1, W = 110, H = 34;
+  const pts = vals.map((x, i) => (i * W / (vals.length - 1)).toFixed(1) + ',' + (H - 3 - x / mx * (H - 8)).toFixed(1)).join(' ');
+  return '<svg class="ksp" width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H + '" aria-hidden="true">' +
+    '<polygon points="0,' + H + ' ' + pts + ' ' + W + ',' + H + '" style="fill:var(' + col + ');opacity:.12"/>' +
+    '<polyline points="' + pts + '" fill="none" style="stroke:var(' + col + ')" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+}
+const FICON = {
+  big: '<path d="M4 20h16M7 16V9M12 16V5M17 16v-4"/>',
+  win: '<path d="M13 3 5 14h6l-1 7 8-11h-6l1-7z"/>',
+  due: '<circle cx="12" cy="13" r="8"/><path d="M12 9v4l2.5 2M9 2h6"/>',
+  odd: '<path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z"/>'};
+const ficon = (k, col) => '<span class="fi"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" ' +
+  'style="stroke:var(' + col + ')" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+  FICON[k] + '</svg></span>';
 function renderFocus(){
   const bl = DATA.blockers || [], v1u = DATA.v1_users || [], out = [];
-  if(bl.length) out.push('<button class="fc" data-prog="' + esc(bl[0].process) + '"><div class="k">' +
+  if(bl.length) out.push('<button class="fc" data-prog="' + esc(bl[0].process) + '">' + ficon('big', '--gold') + '<div class="ft"><div class="k">' +
     esc(t('foc_big')) + '</div><div class="v">' + esc(bl[0].process) + '</div><div class="w">' +
-    esc(t('foc_big_w', {n: bl[0].n, m: bl[0].sources})) + '</div></button>');
+    esc(t('foc_big_w', {n: bl[0].n, m: bl[0].sources})) + '</div></div></button>');
   const ip = bl.filter(b => /\d+\.\d+\.\d+\.\d+/.test(b.target || ''))[0];
-  if(ip) out.push('<button class="fc" data-prog="' + esc(ip.process) + '"><div class="k">' +
+  if(ip) out.push('<button class="fc" data-prog="' + esc(ip.process) + '">' + ficon('win', '--krb') + '<div class="ft"><div class="k">' +
     esc(t('foc_win')) + '</div><div class="v">' + esc(ip.process) + '</div><div class="w">' +
-    esc(t('foc_win_w', {n: ip.n})) + '</div></button>');
-  if(v1u.length) out.push('<button class="fc" data-q="' + esc(v1u[0].name) + '"><div class="k">' +
+    esc(t('foc_win_w', {n: ip.n})) + '</div></div></button>');
+  if(v1u.length) out.push('<button class="fc" data-q="' + esc(v1u[0].name) + '">' + ficon('due', '--v1') + '<div class="ft"><div class="k">' +
     esc(t('foc_due')) + '</div><div class="v">' + esc(v1u[0].name) + '</div><div class="w">' +
-    esc(t('foc_due_w', {n: v1u[0].n})) + '</div></button>');
+    esc(t('foc_due_w', {n: v1u[0].n})) + '</div></div></button>');
   let pd = -1, ph = 0, pv = 0;
   (DATA.heat || []).forEach((row, d) => row.forEach((v, h) => { if(v > pv){ pv = v; pd = d; ph = h; } }));
   // HW(pd) is the real weekday: 0 Sunday, 6 Saturday.
   if(pd >= 0 && (HW(pd) === 0 || HW(pd) === 6 || ph < 6 || ph > 19))
-    out.push('<button class="fc" data-go="sec-heat"><div class="k">' + esc(t('foc_odd')) +
+    out.push('<button class="fc" data-go="sec-heat">' + ficon('odd', '--v2') + '<div class="ft"><div class="k">' + esc(t('foc_odd')) +
       '</div><div class="v">' + esc(DN()[HW(pd)] + ', ' + String(ph).padStart(2, '0') + ':00') +
-      '</div><div class="w">' + esc(t('foc_odd_w', {n: pv})) + '</div></button>');
+      '</div><div class="w">' + esc(t('foc_odd_w', {n: pv})) + '</div></div></button>');
   $('#focus').innerHTML = out.join('');
 }
 
-// ---- Abschnitte ----------------------------------------------------------
+// ---- Panels --------------------------------------------------------------
 function secTrend(){
   const tr = DATA.trend || [];
   if(!tr.length) return CARD('sec-trend', t('trend_h'), [t('leg_goal')], '',
     emptyBox(t('trend_empty'), ''), 'c2');
-  const mx = Math.max.apply(null, tr.map(b => b.v1 + b.v2 + b.other)) || 1;
-  const body = '<div class="blocks">' + tr.map(b =>
-    '<div class="bcol' + (S.bucket === b.b ? ' on' : '') + '" data-bucket="' + esc(b.b) +
-    '" title="' + esc(b.b + ' \u00b7 ' + (b.v1 + b.v2 + b.other) + ' \u2013 ' + t('drill_hint')) + '">' +
-    '<span data-h="' + (b.other / mx * 100) + '" style="height:0;background:var(--grey)"></span>' +
-    '<span data-h="' + (b.v2 / mx * 100) + '" style="height:0;background:var(--v2)"></span>' +
-    '<span data-h="' + (b.v1 / mx * 100) + '" style="height:0;background:var(--v1)"></span></div>').join('') +
-    '</div><div class="axis">' + [0, .33, .66, 1].map(p => '<span>' +
-      esc(tr[Math.round(p * (tr.length - 1))].b) + '</span>').join('') + '</div>';
-  return CARD('sec-trend', t('trend_h'), null, DATA.trend_bucket === 'day' ? '' : t('range'), body, 'c2');
+  // Stacked area instead of bars: NTLMv1 at the bottom, NTLMv2 and version-less
+  // NTLM above, and the dashed line at zero is the goal. The shapes scale to the
+  // card's width; a transparent column per bucket keeps the click-through.
+  const n = tr.length, W = 1000, H = 190, top = 8;
+  const tot = tr.map(b => b.v1 + b.v2 + b.other), mx = Math.max.apply(null, tot) * 1.12 || 1;
+  const X = i => n === 1 ? W / 2 : i * W / (n - 1);
+  const Y = v => (H - (v / mx) * (H - top)).toFixed(1);
+  const layer = (lo, hi, col, op) => {
+    const up = tr.map((b, i) => X(i).toFixed(1) + ',' + Y(hi(b))).join(' ');
+    const dn = tr.map((b, i) => X(i).toFixed(1) + ',' + Y(lo(b))).reverse().join(' ');
+    const pts = n === 1 ? ('0,' + Y(hi(tr[0])) + ' ' + W + ',' + Y(hi(tr[0])) + ' ' + W + ',' + Y(lo(tr[0])) + ' 0,' + Y(lo(tr[0]))) : (up + ' ' + dn);
+    const ln = n === 1 ? ('0,' + Y(hi(tr[0])) + ' ' + W + ',' + Y(hi(tr[0]))) : up;
+    return '<polygon points="' + pts + '" style="fill:var(' + col + ');opacity:' + op + '"/>' +
+      '<polyline points="' + ln + '" fill="none" style="stroke:var(' + col + ')" stroke-width="2" vector-effect="non-scaling-stroke" stroke-linejoin="round"/>';
+  };
+  const step = n === 1 ? W : W / (n - 1);
+  const hits = tr.map((b, i) => {
+    const x0 = Math.max(0, X(i) - step / 2), x1 = Math.min(W, X(i) + step / 2);
+    return '<rect class="thit' + (S.bucket === b.b ? ' on' : '') + '" data-bucket="' + esc(b.b) + '" x="' + x0.toFixed(1) +
+      '" y="0" width="' + (x1 - x0).toFixed(1) + '" height="' + H + '"><title>' +
+      esc(b.b + ' \u00b7 ' + (b.v1 + b.v2 + b.other) + ' \u2013 ' + t('drill_hint')) + '</title></rect>';
+  }).join('');
+  const body = '<div class="tchart"><svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none" role="img" aria-label="' +
+      esc(t('trend_h')) + '">' +
+      [.33, .66].map(g => '<line x1="0" x2="' + W + '" y1="' + (H - g * (H - top)).toFixed(1) + '" y2="' + (H - g * (H - top)).toFixed(1) +
+        '" class="tgrid" vector-effect="non-scaling-stroke"/>').join('') +
+      layer(b => b.v1 + b.v2, b => b.v1 + b.v2 + b.other, '--grey', .35) +
+      layer(b => b.v1, b => b.v1 + b.v2, '--v2', .22) +
+      layer(b => 0, b => b.v1, '--v1', .30) +
+      '<line x1="0" x2="' + W + '" y1="' + (H - 1) + '" y2="' + (H - 1) + '" class="tgoal" vector-effect="non-scaling-stroke"/>' +
+      hits + '</svg><span class="tgoaltxt">' + esc(t('goal0')) + '</span></div>' +
+    '<div class="axis">' + [0, .33, .66, 1].map(p => '<span>' + esc(tr[Math.round(p * (n - 1))].b) + '</span>').join('') + '</div>';
+  return CARD('sec-trend', t('trend_h'), null, DATA.trend_bucket === 'day' ? '' : t('trend_hourly'), body, 'c2');
 }
 function secPrograms(){
   let bl = (DATA.blockers || []).slice();
-  if(S.hideDone) bl = bl.filter(b => b.st !== 'erledigt');
+  if(S.hideDone) bl = bl.filter(b => b.st !== 'done');
   const body = bl.length ? tbl([[t('th_prog')], [t('th_target')], [t('th_count'), 'r'],
       [t('th_trend2')], [t('th_users')], [t('th_status')]],
-    bl.map(b => '<tr class="click' + (b.st === 'erledigt' ? ' done' : '') +
+    bl.map(b => '<tr class="click' + (b.st === 'done' ? ' done' : '') +
       '" data-prog="' + esc(b.process) + '"><td class="nm">' + esc(b.process) + '</td>' +
       '<td class="mn dm"><span class="cut">' + esc(b.target || '\u2013') + '</span>' +
       (/\d+\.\d+\.\d+\.\d+/.test(b.target || '') ? ' ' + tag('v1', t('b_ip')) : '') + '</td>' +
-      '<td class="r">' + b.n + (b.blocked ? ' ' + tag('v1', b.blocked) : '') + '</td>' +
-      '<td>' + spark((DATA.spark || {})[b.process]) + '</td>' +
+      '<td class="r">' + b.n + (b.blocked ? '<div class="blkd">' + tag('v1', b.blocked + ' ' + t('blk_short'), t('tt_blocked')) + '</div>' : '') + '</td>' +
+      '<td class="nw">' + spark((DATA.spark || {})[b.process]) + '</td>' +
       '<td class="dm">' + nameList(b.who, 3) + '</td>' +
       '<td>' + stSel(b.key, b.st) + '</td></tr>').join(''))
     : emptyBox(t('empty_blockers'), '');
@@ -2776,9 +5038,15 @@ function secTargets(){
     bars(rows, 'amb', n => 'data-q="' + esc(n) + '"') || emptyBox(t('empty_blockers'), ''));
 }
 function secV1(){
-  const rows = (DATA.v1_users || []).slice(0, 8).map(u => [u.name, u.n]);
+  const rows = (DATA.v1_users || []).map(u => [u.name, u.n]);
+  // An empty list only means something if every machine can see NTLMv1. Say
+  // how many cannot, so "no NTLMv1" is never mistaken for "all clear".
+  const ag = DATA.agents || [];
+  const off = ag.filter(m => v1Sight(m) === 'off').length, old = ag.filter(m => v1Sight(m) === 'old').length;
+  const blind = off || old ? '<button type="button" class="v1blind" data-go="sec-agents">' +
+    esc(t('v1_blind', {n: off + old, a: off, b: old})) + '</button>' : '';
   return CARD('sec-v1', t('v1_h'), [t('b_deadline'), 'due'], '',
-    bars(rows, 'red', n => 'data-q="' + esc(n) + '"') || emptyBox(t('empty_v1'), ''));
+    blind + (bars(rows, 'red', n => 'data-q="' + esc(n) + '"') || emptyBox(t('empty_v1'), '')));
 }
 function secHeat(){
   return CARD('sec-heat', t('heat_h'), null, '', '<div class="hm" id="hm"></div>');
@@ -2824,7 +5092,7 @@ function secDomain(){
   const d = DATA.domain || [];
   const body = d.length ? tbl([[t('th_comp')], [t('th_target')], [t('th_users')],
       [t('th_count3'), 'r'], [t('th_last')]],
-    d.slice(0, 40).map(x => '<tr class="click" data-q="' + esc(x.workstation) + '">' +
+    d.map(x => '<tr class="click" data-q="' + esc(x.workstation) + '">' +
       '<td class="nm">' + esc(x.workstation) + '</td><td class="mn dm">' + esc(x.target) + '</td>' +
       '<td class="dm">' + nameList(x.who, 3) + '</td><td class="r">' + x.n + '</td>' +
       '<td class="mn dm">' + when(x.last_seen) + '</td></tr>').join(''))
@@ -2835,8 +5103,8 @@ function secIncoming(){
   const i = DATA.incoming || [];
   const body = i.length ? tbl([[t('th_machine')], [t('th_service')], [t('th_count4'), 'r'],
       [t('th_accounts'), 'r']],
-    i.map(x => '<tr class="click" data-mach="' + esc(x.machine) + '"><td class="nm">' + esc(x.machine) +
-      '</td><td class="dm">' + esc(x.process) + '</td><td class="r">' + x.n + '</td>' +
+    i.map(x => '<tr class="click" data-machine="' + esc(x.machine) + '"><td class="nm">' + esc(x.machine) +
+      '</td><td class="dm">' + esc(x.process === '(unknown)' ? t('svc_logon') : x.process) + '</td><td class="r">' + x.n + '</td>' +
       '<td class="r dm">' + x.users + '</td></tr>').join(''))
     : emptyBox(t('empty_events'), '');
   return CARD('sec-incoming', t('inc_h'), [t('nav_label')], String(i.length), body);
@@ -2861,34 +5129,79 @@ function secKrb(){
 function secKrbAcc(){
   const k = DATA.kerberos_accounts || [];
   const body = k.length ? tbl([[t('th_account')], [t('th_services'), 'r'], [t('th_count6'), 'r'], [t('th_enc2')]],
-    k.slice(0, 12).map(x => '<tr class="click" data-q="' + esc(x.account) + '">' +
+    k.map(x => '<tr class="click" data-q="' + esc(x.account) + '">' +
       '<td class="mn"><span class="cut">' + esc(x.account) + '</span></td>' +
       '<td class="r dm">' + x.svc_count + '</td><td class="r">' + x.n + '</td>' +
       '<td>' + encTags(x.enc) + '</td></tr>').join(''))
     : emptyBox(t('empty_krba'), '');
-  return CARD('sec-kacc', t('krba_h'), [t('leg_good'), 'ok'], '', body);
+  return CARD('sec-kacc', t('krba_h'), [t('leg_good'), 'ok'], '', body, 'c2');
+}
+// Can this machine show NTLMv1 at all? It needs 4624s: from agent 2.3 on every
+// machine, before that only on DCs - and "Audit Logon: Success" either way.
+//   ok  - logon auditing on        off - off or failures only
+//   old - agent before 2.3 on a non-DC (sends no 4624 from here)
+//   unk - agent 2.3+ that could not read the policy
+function verLt(a, b){
+  const p = s => String(s || '0').split('.').map(x => parseInt(x, 10) || 0);
+  const x = p(a), y = p(b);
+  for(let i = 0; i < 3; i++){ if((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) < (y[i] || 0); }
+  return false;
+}
+function v1Sight(m){
+  if(m.logon_audit === 'success' || m.logon_audit === 'success_failure') return 'ok';
+  if(m.logon_audit === 'none' || m.logon_audit === 'failure') return 'off';
+  if(!m.is_dc && verLt(m.agent_version, '2.3.0')) return 'old';
+  if(m.logon_audit === 'unknown') return 'unk';
+  return '';
+}
+// Audit badges, LmCompat and the October verdict of one agent - shared by the
+// machines panel and the machine detail, so both always say the same.
+function agentBadges(m){
+  const au = [];
+  // Each missing audit is named: a machine without it sends nothing for that
+  // direction, and an absent green badge alone is too easy to overlook.
+  if(m.outgoing_audit === 'off') au.push(tag('v1', t('b_out_off'), t('b_out_off_t')));
+  else if(m.outgoing_audit) au.push(tag('krb', t('r_out')));
+  if(m.incoming_audit === 'off') au.push(tag('v2', t('b_in_off'), t('b_in_off_t')));
+  else if(m.incoming_audit) au.push(tag('krb', t('r_in')));
+  if(m.is_dc && m.domain_audit === 'off') au.push(tag('v1', t('b_dom_off'), t('b_dom_off_t')));
+  else if(m.domain_audit === 'on') au.push(tag('krb', t('r_dom')));
+  // Logon auditing decides whether NTLMv1 is visible on this machine at all.
+  const v1 = v1Sight(m);
+  if(v1 === 'ok') au.push(tag('krb', t('r_logon'), t('r_logon_t')));
+  else if(v1 === 'off') au.push(tag('v1', t('b_logon_off'), t('b_logon_off_t')));
+  else if(v1 === 'old') au.push(tag('v2', t('b_agent_old'), t('b_agent_old_t')));
+  else if(v1 === 'unk') au.push(tag('n', t('b_logon_unk'), t('b_logon_unk_t')));
+  if(m.cg) au.push(tag('v1', t('b_cg_machine', {n: m.cg})));
+  // A DC that sends no 4776 blocks every phantom verdict - say which one.
+  if(m.is_dc) au.push(m.dcval
+    ? tag('krb', t('b_dcval_ok'), t('b_dcval_ok_t', {when: when(m.dcval_last)}))
+    : tag('v2', t('b_dcval_none'), t('b_dcval_none_t')));
+  if(m.ntlm_log_kb && +m.ntlm_log_kb < 20480) au.push(tag('v2', t('b_logsize')));
+  const lm = m.lm_level;
+  const oct = m.cred_guard === 'on' ? tag('krb', t('oct_cg'))
+    : m.block_v1sso === 'deny' ? tag('krb', t('oct_enf'))
+    : lm && +lm >= 4 ? tag('v2', t('oct_aff')) : tag('n', t('oct_unk'));
+  const lmTag = lm ? tag(+lm >= 5 ? 'krb' : +lm >= 3 ? 'v2' : 'v1', 'LmCompat ' + lm) : '';
+  return {au: au, oct: oct, lm: lmTag};
+}
+// Machines whose auditing leaves NTLM unseen in some direction.
+function auditGaps(m){
+  const g = [];
+  if(m.outgoing_audit === 'off') g.push('out');
+  if(m.incoming_audit === 'off') g.push('in');
+  if(m.is_dc && m.domain_audit === 'off') g.push('dom');
+  if(v1Sight(m) === 'off') g.push('logon');
+  return g;
 }
 function secAgents(){
   const a = DATA.agents || [];
-  const AU = {audit: t('au_out_on'), deny: t('au_out_on'), aus: t('au_out_off'), an: t('au_dom_on')};
+  const gaps = a.filter(m => auditGaps(m).length).length;
   const body = a.length ? tbl([[t('th_machine')], [t('th_type')], [t('th_status2')], ['LmCompat'],
       [t('th_oct')], [t('th_count'), 'r'], [t('th_last')]],
     a.map(m => {
-      const au = [];
-      if(m.outgoing_audit && m.outgoing_audit !== 'aus') au.push(tag('krb', t('r_out')));
-      if(m.incoming_audit && m.incoming_audit !== 'aus') au.push(tag('krb', t('r_in')));
-      if(m.domain_audit === 'an') au.push(tag('krb', t('r_dom')));
-      if(m.cg) au.push(tag('v1', t('b_cg_machine', {n: m.cg})));
-      // A DC that sends no 4776 blocks every phantom verdict - say which one.
-      if(m.is_dc) au.push(m.dcval
-        ? tag('krb', t('b_dcval_ok'), t('b_dcval_ok_t', {when: when(m.dcval_last)}))
-        : tag('v2', t('b_dcval_none'), t('b_dcval_none_t')));
-      if(m.ntlm_log_kb && +m.ntlm_log_kb < 20480) au.push(tag('v2', t('b_logsize')));
-      const lm = m.lm_level;
-      const oct = m.cred_guard === 'on' ? tag('krb', t('oct_cg'))
-        : m.block_v1sso === 'deny' ? tag('krb', t('oct_enf'))
-        : lm && +lm >= 4 ? tag('v2', t('oct_aff')) : tag('n', t('oct_unk'));
-      return '<tr class="click" data-mach="' + esc(m.source) + '"><td class="nm">' + esc(m.source) +
+      const b = agentBadges(m), au = b.au, lm = m.lm_level, oct = b.oct;
+      return '<tr class="click" data-machine="' + esc(m.source) + '"><td class="nm">' + esc(m.source) +
         ' ' + (m.is_dc ? tag('n', t('type_dc')) : '') + '</td>' +
         '<td class="dm">' + esc(m.os_version || '\u2013') +
         (m.os_version && !/2600\d|2[6-9]\d{3}/.test(m.os_version) ? ' ' + tag('n', t('b_os_old')) : '') + '</td>' +
@@ -2898,7 +5211,112 @@ function secAgents(){
         '<td class="mn dm">' + when(m.last_seen) + '</td></tr>'; }).join(''))
     : emptyBox(t('empty_agents'), '');
   return CARD('sec-agents', t('ag_h'), null,
-    t('cov_ok', {d: DATA.stats.coverage_days}), body, 'c2');
+    t('cov_ok', {d: DATA.stats.coverage_days}), (gaps ? '<div class="v1blind" style="cursor:default">' + esc(t('ag_gaps', {n: gaps})) + '</div>' : '') + body, 'c2');
+}
+// ---- Ready to switch off -----------------------------------------------
+function rdyCell(v, dir, compact){
+  if(!v) return '<span class="dm">\u2013</span>';
+  const note = x => '<div class="rdd">' + x + '</div>';
+  switch(v.st){
+    case 'ready':
+      return tag('krb', t('rdy_ready')) +
+        note(esc(v.since ? t('rdy_since', {when: when(v.since)}) : t('rdy_quiet', {d: v.d})));
+    case 'busy': {
+      // Some events name no source machine or process - leave the gap out
+      // rather than print a placeholder.
+      const dash = v => v ? esc(v) : '\u2013';
+      const items = (v.top || []).map(x => dir === 'out'
+        ? dash(x[0]) + ' \u2192 ' + dash(x[1]) + ' <span class="dm">(' + x[2] + ')</span>'
+        : dash(x[0]) + (x[1] ? ' <span class="dm">' + esc(t('rdy_from')) + '</span> ' + esc(x[1]) : '') +
+          ' <span class="dm">(' + x[2] + ')</span>');
+      // compact: the machine detail lists the programs right below, so the
+      // verdict there needs only the status and when NTLM was last seen.
+      return tag('v2', dir === 'out' ? t('rdy_busy_out', {n: v.n}) : t('rdy_busy_in', {w: v.who})) +
+        (compact ? '' : note(items.join('<br>'))) + note(esc(t('rdy_last', {when: when(v.last)})));
+    }
+    case 'active':  return tag('krb', t('rdy_active'));
+    case 'young': {
+      const r = Math.max(1, ((DATA.readiness || {}).quiet_days || 30) - v.d);
+      return tag('n', r === 1 ? t('rdy_young1') : t('rdy_young', {r: r}));
+    }
+    case 'noaudit': return tag('n', t('rdy_noaudit'), t('rdy_noaudit_t_' + dir));
+    case 'stale':   return tag('v1', t('rdy_stale'), t('rdy_stale_t'));
+    case 'dc':      return '<span class="rdd" style="margin:0">' + esc(t('rdy_dc')) + '</span>';
+  }
+  return '<span class="dm">\u2013</span>';
+}
+function secReady(){
+  const r = DATA.readiness || {rows: []}, rows = r.rows || [];
+  const body = rows.length
+    ? '<div class="cnote">' + esc(t('rdy_intro', {d: r.quiet_days || 30})) + '</div>' +
+      tbl([[t('th_machine')], [t('rdy_th_out')], [t('rdy_th_in')], [t('rdy_th_obs'), 'r']],
+        rows.map(x => '<tr class="click" data-machine="' + esc(x.machine) + '">' +
+          '<td class="nm">' + esc(x.machine) + (x.is_dc ? ' ' + tag('n', t('type_dc')) : '') + '</td>' +
+          '<td>' + rdyCell(x.out, 'out') + '</td><td>' + rdyCell(x['in'], 'in') + '</td>' +
+          '<td class="r dm">' + esc(x.obs === 1 ? t('rdy_days1') : t('rdy_days', {d: x.obs})) + '</td></tr>').join(''))
+    : emptyBox(t('empty_agents'), '');
+  return CARD('sec-ready', t('rdy_h'), [t('rdy_badge'), 'ok'],
+    t('rdy_meta', {o: r.out_ready || 0, i: r.in_ready || 0}), body, 'c2');
+}
+// ---- Machines without an agent --------------------------------------------
+function secAgentless(){
+  const a = DATA.agentless || {rows: [], dcs: 0}, rows = a.rows || [];
+  const body = rows.length
+    ? tbl([[t('th_comp')], [t('th_users')], [t('th_count3'), 'r'], [t('th_last')]],
+        rows.map(x => '<tr><td class="nm">' + esc(x.machine) + '</td>' +
+          '<td class="dm">' + nameList((x.who || []).join(','), 3) +
+          (x.users > (x.who || []).length ? ' <span class="dm">+' + (x.users - x.who.length) + '</span>' : '') + '</td>' +
+          '<td class="r">' + x.n + '</td><td class="mn dm">' + when(x.last) + '</td></tr>').join('')) +
+      ((a.total || rows.length) > rows.length ? '<div class="cnote" style="padding-top:12px">' +
+        esc(t('na_more', {n: a.total - rows.length})) + '</div>' : '')
+    : emptyBox(a.dcs ? t('na_empty') : t('na_nodc'), '');
+  return CARD('sec-noagent', t('na_h'), [t('na_badge')], String(a.total || rows.length), body);
+}
+const blk = k => '<div class="blk" id="blk-' + k + '"><h2>' + esc(t('blk_' + k)) + '</h2><p>' +
+  esc(t('blk_' + k + '_p')) + '</p></div>';
+// ---- Failed NTLM attempts ----------------------------------------------
+// NT status as text, with what usually lies behind it.
+const ntText = c => c ? (I18N[LANG]['nt_' + String(c).toLowerCase()] ? t('nt_' + String(c).toLowerCase()) : c) : '–';
+const ntHint = c => c && I18N[LANG]['nth_' + String(c).toLowerCase()] ? t('nth_' + String(c).toLowerCase()) : '';
+const viaTxt = v => t('fv_' + v);
+function secFailed(){
+  const F = DATA.failures || {rows: [], spray: []}, rows = F.rows || [];
+  const fmt = n => Number(n || 0).toLocaleString(LOCALE());
+  const notes = (F.spray || []).length
+    ? '<div class="v1blind bad">' + esc(t('fail_spray', {l: F.spray.map(x => x[0] + ' (' + t('fail_spray_n', {n: x[1]}) + ')').join(', ')})) + '</div>' : '';
+  const blind = F.blind ? '<div class="v1blind" style="cursor:default">' + esc(t('fail_blind', {n: F.blind})) + '</div>' : '';
+  const body = rows.length
+    ? notes + blind + tbl([[t('th_account')], [t('fail_from')], [t('fail_to')], [t('fail_why')], [t('th_count'), 'r'], [t('th_last')]],
+        rows.map(x => '<tr class="click" data-account="' + esc(x.key) + '"><td class="nm">' + esc(x.user) +
+          (x.locked ? ' ' + tag('v1', t('fail_locked'), t('nth_0xc0000234')) : '') + '</td>' +
+          '<td class="mn">' + esc(x.from || '–') + '</td>' +
+          '<td class="mn dm">' + (x.to.length ? esc(x.to.join(', ')) : '<span title="' + esc(t('fail_to_dc_t')) + '">' + esc(t('fail_to_dc')) + '</span>') + '</td>' +
+          '<td><span title="' + esc(ntHint(x.code) + (x.code ? ' (' + x.code + ')' : '')) + '">' + esc(ntText(x.code)) + '</span>' +
+          '<div class="rdd">' + esc(viaTxt(x.via)) + '</div></td>' +
+          '<td class="r">' + fmt(x.n) + '</td><td class="mn dm">' + when(x.last) + '</td></tr>').join(''))
+    : blind + emptyBox(t('fail_empty'), '');
+  return CARD('sec-failed', t('fail_h'), (F.spray || []).length ? [t('fail_badge_spray'), 'due'] : null,
+    F.total ? t('fail_meta', {n: fmt(F.n), a: fmt(F.accounts)}) : '', body, 'c2');
+}
+// ---- Accounts using NTLM ------------------------------------------------
+function secAccounts(){
+  const A = DATA.accounts || {rows: []}, rows = A.rows || [];
+  const fmt = n => Number(n || 0).toLocaleString(LOCALE());
+  const body = rows.length
+    ? tbl([[t('th_account')], [t('acc_logons'), 'r'], [t('acc_ver')], [t('acc_mach'), 'r'], [t('acc_tgt'), 'r'],
+          [t('acc_failed'), 'r'], [t('acc_krb'), 'r'], [t('th_last')]],
+        rows.map(x => '<tr class="click" data-account="' + esc(x.key) + '"><td class="nm">' + esc(x.name) +
+          (x.key === 'ANONYMOUS LOGON' ? ' ' + tag('v2', t('acc_anon'), t('acc_anon_t'))
+            : /\$$/.test(x.key) ? ' ' + tag('n', t('acc_machine'), t('acc_machine_t')) : '') + '</td>' +
+          '<td class="r">' + fmt(x.n) + '</td>' +
+          '<td>' + (x.v1 ? tag('v1', 'v1 ' + fmt(x.v1)) + ' ' : '') + (x.v2 ? tag('v2', 'v2 ' + fmt(x.v2)) : '') +
+            (!x.v1 && !x.v2 && x.n ? '<span class="dm" title="' + esc(t('acc_nover_t')) + '">' + esc(t('acc_nover')) + '</span>' : '') + '</td>' +
+          '<td class="r dm">' + fmt(x.machines) + '</td><td class="r dm">' + fmt(x.targets) + '</td>' +
+          '<td class="r">' + (x.failed ? '<span style="color:var(--v1)">' + fmt(x.failed) + '</span>' : '<span class="dm">0</span>') + '</td>' +
+          '<td class="r">' + (x.krb ? '<span style="color:var(--krb)" title="' + esc(t('acc_krb_t')) + '">' + fmt(x.krb) + '</span>' : '<span class="dm">0</span>') + '</td>' +
+          '<td class="mn dm">' + when(x.last) + '</td></tr>').join(''))
+    : emptyBox(t('empty_events'), '');
+  return CARD('sec-accounts', t('acc_h'), [t('nav_label')], t('acc_meta', {n: fmt(A.total || 0), v: fmt(A.v1 || 0)}), body, 'c2');
 }
 function secEvents(){
   return CARD('sec-events', t('ev_h'), null, '\u2013',
@@ -2985,22 +5403,54 @@ function renderEvents(){
   window.__EVLIST = list;
 }
 function renderJump(){
-  const items = [['sec-trend', 'trend_h', null], ['sec-programs', 'nav_prog', (DATA.blockers || []).length],
-    ['sec-top', 'top_h', null], ['sec-v1', 'nav_v1', (DATA.v1_users || []).length],
-    ['sec-heat', 'nav_heat', null], ['sec-why', 'nav_why', (DATA.reasons || []).length],
-    ['sec-domain', 'nav_dom', (DATA.domain || []).length],
-    ['sec-incoming', 'nav_inc', (DATA.incoming || []).length],
-    ['sec-v1sso', 'nav_v1sso', (DATA.v1sso || []).length],
-    ['sec-kerberos', 'nav_krb', (DATA.kerberos || []).length],
-    ['sec-kacc', 'krba_h', (DATA.kerberos_accounts || []).length],
-    ['sec-agents', 'nav_mach', (DATA.agents || []).length],
-    ['sec-events', 'nav_ev', (DATA.events || []).length]];
-  $('#jump').innerHTML = items.map(x => '<button class="jl' + (x[2] === 0 ? ' nil' : '') +
-    '" data-go="' + x[0] + '">' + esc(t(x[1])) +
-    (x[2] === null ? '' : ' <b>' + x[2] + '</b>') + '</button>').join('');
+  // Counts are what is there, not how much was fetched: lists are capped at 50
+  // rows server-side and the event list loads 300 - "Events 300" next to 5,533
+  // real ones was simply wrong.
+  const cap = v => v >= 500 ? '500+' : v;
+  const R = DATA.readiness || {}, A = DATA.agentless || {};
+  const groups = [
+    ['lage', [['sec-trend', 'trend_h', null], ['sec-programs', 'nav_prog', cap((DATA.blockers || []).length)],
+      ['sec-why', 'nav_why', (DATA.reasons || []).length], ['sec-heat', 'nav_heat', null]]],
+    ['act', [['sec-ready', 'nav_rdy', (R.rows || []).filter(x => x.out.st === 'ready' || x['in'].st === 'ready').length],
+      ['sec-v1', 'nav_v1', cap((DATA.v1_users || []).length)], ['sec-v1sso', 'nav_v1sso', (DATA.v1sso || []).length],
+      ['sec-failed', 'nav_fail', (DATA.failures || {}).total || 0],
+      ['sec-noagent', 'nav_na', A.total || 0], ['sec-incoming', 'nav_inc', cap((DATA.incoming || []).length)]]],
+    ['det', [['sec-accounts', 'nav_acc', (DATA.accounts || {}).total || 0],
+      ['sec-domain', 'nav_dom', cap((DATA.domain || []).length)], ['sec-top', 'nav_top', null],
+      ['sec-kerberos', 'nav_krb', cap((DATA.kerberos || []).length)],
+      ['sec-kacc', 'nav_kacc', cap((DATA.kerberos_accounts || []).length)],
+      ['sec-agents', 'nav_mach', (DATA.agents || []).length],
+      ['sec-events', 'nav_ev', DATA.events_total != null ? DATA.events_total : (DATA.events || []).length]]]];
+  const fmt = v => typeof v === 'number' ? v.toLocaleString(LOCALE()) : v;
+  $('#jump').innerHTML = groups.map(g => '<span class="jg">' + esc(t('blk_' + g[0])) + '</span>' +
+    g[1].map(x => '<button class="jl' + (x[2] === 0 ? ' nil' : '') + '" data-go="' + x[0] + '">' + esc(t(x[1])) +
+      (x[2] === null ? '' : ' <b>' + fmt(x[2]) + '</b>') + '</button>').join('')).join('');
 }
+// Mark the section being read in the bar, so it doubles as "where am I": the
+// panel whose top edge last passed under the pinned bars. An IntersectionObserver
+// band was ambiguous - the panel before was often still inside it.
+// --stick is the real height of what is pinned (the bar wraps to two rows on
+// many screens), so jumping to a panel no longer hides its title underneath.
+function stickH(){
+  const hd = document.querySelector('header'), jp = $('#jump');
+  const h = (hd && getComputedStyle(hd).position === 'sticky' ? hd.offsetHeight : 0) + (jp ? jp.offsetHeight : 0);
+  document.documentElement.style.setProperty('--stick', h + 'px');
+  return h;
+}
+let SPY_Y = 150, SPY_RAF = 0;
+function spyUpdate(){
+  SPY_RAF = 0;
+  let cur = null;
+  for(const c of document.querySelectorAll('#grid .card')){
+    if(c.getBoundingClientRect().top <= SPY_Y) cur = c.id;
+  }
+  document.querySelectorAll('#jump .jl').forEach(b => b.classList.toggle('on', b.dataset.go === cur));
+}
+function spy(){ SPY_Y = stickH() + 24; spyUpdate(); }
+addEventListener('scroll', () => { if(!SPY_RAF) SPY_RAF = requestAnimationFrame(spyUpdate); }, {passive: true});
+addEventListener('resize', () => { SPY_Y = stickH() + 24; });
 
-// ---- Schublade -----------------------------------------------------------
+// ---- Drawer ------------------------------------------------------------
 function openEvent(i){
   const e = (window.__EVLIST || [])[i]; if(!e) return;
   $('#dtitle').innerHTML = tag(KINDC[e.kind] || 'n', kindName(e.kind)) +
@@ -3033,12 +5483,12 @@ function openEvent(i){
     '<div class="dact">' +
       (e.process ? '<button data-prog="' + esc(e.process) + '">' + esc(e.process) + '</button>' : '') +
       (e.user ? '<button data-q="' + esc(e.user) + '">' + esc(e.user) + '</button>' : '') +
-      '<button data-mach="' + esc(e.source) + '">' + esc(e.source) + '</button>' +
+      '<button data-machine="' + esc(e.source) + '">' + esc(e.source) + '</button>' +
       '<button data-kind="' + esc(e.kind) + '">' + esc(kindName(e.kind)) + '</button></div>';
   openDrawer();
 }
 function openExceptions(){
-  const rows = (DATA.blockers || []).filter(b => b.st !== 'erledigt' && b.target);
+  const rows = (DATA.blockers || []).filter(b => b.st !== 'done' && b.target);
   const seen = {}, list = [];
   rows.forEach(b => { const n = String(b.target).replace(/^[A-Za-z]+\//, '');
     if(!seen[n]){ seen[n] = 1; list.push(n); } });
@@ -3050,19 +5500,170 @@ function openExceptions(){
                  : emptyBox(t('exc_empty'), ''));
   openDrawer();
 }
+// ---- Machine detail -------------------------------------------------------
+// One machine at a glance, in the side drawer: what it sends, who reaches it,
+// whether it is ready to switch off, and how it is audited. Filtering the whole
+// dashboard to it is one button away rather than the only thing a click did.
+let MD_TOK = 0;
+function openMachine(name){
+  const tok = ++MD_TOK; ++AC_TOK;
+  $('#dtitle').textContent = name;
+  $('#dwhen').textContent = '';
+  $('#dbody').innerHTML = '<div class="md"><div class="md-load">' + esc(t('md_loading')) + '</div></div>';
+  openDrawer();
+  const q = new URLSearchParams({name: name, range: S.range, tzoff: String(TZOFF())});
+  fetch('/api/machine?' + q.toString(), {credentials: 'same-origin'})
+    .then(r => r.json())
+    .then(d => { if(tok === MD_TOK) renderMachine(d); })
+    .catch(() => { if(tok === MD_TOK) $('#dbody').innerHTML = '<div class="md"><div class="md-load">' + esc(t('md_err')) + '</div></div>'; });
+}
+let AC_TOK = 0;
+// Same normalisation as user_key() on the server: "DOM\\user" and
+// "user@dom" become "USER". The detail is always asked for by that key, so
+// every panel and the search reach the same answer.
+function acctKey(u){
+  u = String(u || '').trim();
+  if(u.indexOf('@') > -1) u = u.split('@')[0];
+  else if(u.indexOf('\\') > -1) u = u.split('\\')[1];
+  return u.toUpperCase();
+}
+function openAccount(name){
+  const tok = ++AC_TOK; ++MD_TOK;
+  $('#dtitle').textContent = name;
+  name = acctKey(name);
+  $('#dwhen').textContent = '';
+  $('#dbody').innerHTML = '<div class="md"><div class="md-load">' + esc(t('md_loading')) + '</div></div>';
+  openDrawer();
+  const q = new URLSearchParams({name: name, range: S.range, tzoff: String(TZOFF())});
+  fetch('/api/account?' + q.toString(), {credentials: 'same-origin'})
+    .then(r => r.json())
+    .then(d => { if(tok === AC_TOK) renderAccount(d); })
+    .catch(() => { if(tok === AC_TOK) $('#dbody').innerHTML = '<div class="md"><div class="md-load">' + esc(t('md_err')) + '</div></div>'; });
+}
+function renderAccount(d){
+  if(!d || d.unknown){ $('#dbody').innerHTML = '<div class="md"><div class="md-load">' + esc(t('acd_none')) + '</div></div>'; return; }
+  $('#dtitle').textContent = d.name;
+  // Last activity of any kind: an account that only fails still has a "last seen".
+  const last = [d.last].concat(d.failed.rows.map(x => x.last)).filter(Boolean).sort().pop();
+  $('#dwhen').textContent = [d.anonymous ? t('acc_anon') : d.machine_account ? t('acc_machine') : t('acd_user'),
+    last ? t('acd_last', {when: when(last)}) : ''].filter(Boolean).join(' · ');
+  const sec = (h, inner) => '<div class="md-sec"><div class="md-h">' + esc(h) + '</div>' + inner + '</div>';
+  const fmt = v => Number(v || 0).toLocaleString(LOCALE());
+  const known = new Set((DATA.agents || []).map(a => String(a.source).toUpperCase()));
+  const mach = m => known.has(String(m).toUpperCase())
+    ? '<button type="button" class="md-link" data-machine="' + esc(m) + '">' + esc(m) + '</button>' : esc(m);
+  const note = d.anonymous ? '<div class="cnote help" style="margin:14px 0 0">' + esc(t('acc_anon_t')) + '</div>'
+    : d.machine_account ? '<div class="cnote help" style="margin:14px 0 0">' + esc(t('acc_machine_t')) + '</div>' : '';
+  const kpis = '<div class="md-kpis md-k3">' +
+    '<div class="md-k"><span>' + esc(t('acc_logons')) + '</span><b>' + fmt(d.n) + '</b>' +
+      (d.v1 ? tag('v1', t('md_v1', {n: fmt(d.v1)})) : '<em>' + esc(d.n ? t('md_v1none') : '–') + '</em>') + '</div>' +
+    '<div class="md-k"><span>' + esc(t('acc_failed')) + '</span><b' + (d.failed.n ? ' style="color:var(--v1)"' : '') + '>' +
+      fmt(d.failed.n) + '</b><em>' + esc(t('acd_failed_sub')) + '</em></div>' +
+    '<div class="md-k"><span>' + esc(t('acc_krb')) + '</span><b' + (d.krb ? ' style="color:var(--krb)"' : '') + '>' + fmt(d.krb) + '</b><em>' +
+      esc(d.krb && d.n ? t('acd_mixed') : d.krb ? t('acd_krb_only') : t('acd_no_krb')) + '</em></div></div>';
+  const chart = (d.series && d.series.n && Math.max.apply(null, d.series.n) > 0)
+    ? mdChart({b: d.series.b, out: d.series.n, label: t('acc_logons')}) : '';
+  const via = {agent: t('acd_via_agent'), server: t('acd_via_server'), dc: t('acd_via_dc')};
+  const list = (rows, fn, more) => rows.length ? '<div class="md-list">' + rows.map(fn).join('') +
+    (more > rows.length ? '<div class="md-more">' + esc(t('acd_more', {n: more - rows.length})) + '</div>' : '') + '</div>'
+    : '<div class="md-none">–</div>';
+  const from = sec(t('acd_from'), list(d.from, x => '<div class="md-row"><span>' + mach(x[0]) +
+    ' <span class="md-via">' + esc(via[x[2]] || '') + '</span></span><span class="n">' + fmt(x[1]) + '</span></div>', d.from_total));
+  const to = sec(t('acd_to'), list(d.to, x => '<div class="md-row"><span>' + mach(x[0]) + '</span><span class="n">' + fmt(x[1]) + '</span></div>', d.to_total));
+  const progs = d.programs.length ? sec(t('md_progs'), '<div class="md-list">' + d.programs.map(x =>
+      '<button type="button" class="md-row" data-prog="' + esc(x[0]) + '"><span>' + esc(x[0] || '–') +
+      ' <span class="dm">→ ' + esc(x[1] || '–') + ' · ' + esc(x[2]) + '</span>' + (x[4] ? ' ' + tag('v1', 'NTLMv1') : '') +
+      '</span><span class="n">' + fmt(x[3]) + '</span></button>').join('') + '</div>') : '';
+  const fails = d.failed.rows.length ? sec(t('acd_fails'), '<div class="md-list">' + d.failed.rows.map(x =>
+      '<div class="md-row"><span>' + esc(ntText(x.code)) + ' <span class="dm">' + esc(t('rdy_from')) + ' ' + esc(x.from || '–') +
+      (x.to.length ? ' → ' + esc(x.to.join(', ')) : '') + '</span> <span class="md-via">' + esc(viaTxt(x.via)) + '</span>' +
+      (x.locked ? ' ' + tag('v1', t('fail_locked'), t('nth_0xc0000234')) : '') +
+      (ntHint(x.code) ? '<div class="rdd">' + esc(ntHint(x.code)) + '</div>' : '') +
+      '</span><span class="n">' + fmt(x.n) + '</span></div>').join('') + '</div>') : '';
+  const acts = '<div class="md-acts"><button type="button" class="ghost" data-q="' + esc(d.name) + '">' + esc(t('acd_events')) + '</button></div>';
+  $('#dbody').innerHTML = '<div class="md">' + note + '<div class="md-sec">' + kpis + chart + '</div>' +
+    fails + from + to + progs + acts + '</div>';
+}
+function mdChart(sr){
+  if(!sr || !sr.b || sr.b.length < 2) return '';
+  // Without an "inc" series (the account view) only the one line is drawn.
+  const inc = sr.inc || null;
+  const all = sr.out.concat(inc || []), mx = Math.max.apply(null, all) || 0;
+  if(!mx) return '';
+  const W = 480, H = 80, n = sr.b.length;
+  const line = (v, col) => '<polyline points="' + v.map((x, i) => (i * W / (n - 1)).toFixed(1) + ',' +
+    (H - 3 - x / mx * (H - 10)).toFixed(1)).join(' ') + '" fill="none" style="stroke:var(' + col + ')" ' +
+    'stroke-width="2" vector-effect="non-scaling-stroke" stroke-linejoin="round" stroke-linecap="round"/>';
+  return '<div class="md-chart"><svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none" aria-hidden="true">' +
+    line(sr.out, '--gold') + (inc ? line(inc, '--pol') : '') + '</svg>' +
+    '<div class="md-legend"><span><i style="background:var(--gold)"></i>' + esc(sr.label || t('md_out')) + '</span>' +
+    (inc ? '<span><i style="background:var(--pol)"></i>' + esc(t('md_in_local')) + '</span>' : '') +
+    '<span class="md-axis">' + esc(sr.b[0]) + ' \u2013 ' + esc(sr.b[n - 1]) + '</span></div></div>';
+}
+function renderMachine(d){
+  if(!d || d.unknown){ $('#dbody').innerHTML = '<div class="md"><div class="md-load">' + esc(t('md_err')) + '</div></div>'; return; }
+  const ag = (DATA.agents || []).find(a => a.source === d.name) || null;
+  const rd = ((DATA.readiness || {}).rows || []).find(r => r.machine === d.name) || null;
+  const type = ag ? (ag.is_dc ? t('type_dc') : /server/i.test(ag.os_version || '') ? t('md_type_srv') : t('md_type_cli')) : '';
+  $('#dwhen').textContent = [type, ag && ag.os_version, ag && ag.agent_version ? t('md_agent', {v: ag.agent_version}) : '']
+    .filter(Boolean).join(' \u00b7 ');
+  const sec = (h, inner) => '<div class="md-sec"><div class="md-h">' + esc(h) + '</div>' + inner + '</div>';
+  const loc = LOCALE(), fmt = v => Number(v || 0).toLocaleString(loc);
+  let live = '';
+  if(ag){
+    const age = (Date.now() - new Date(String(ag.last_seen).slice(0, 19) + 'Z').getTime()) / 864e5;
+    live = '<div class="md-live"><span class="md-dot' + (age >= 2 ? ' off' : '') + '"></span>' +
+      esc(t('md_seen', {when: when(ag.last_seen)})) + (age >= 2 ? ' ' + tag('v1', t('md_stale')) : '') +
+      (d.first ? '<span class="md-sep">\u00b7</span>' + esc(t('md_since', {when: when(d.first)})) : '') + '</div>';
+  }
+  const kpis = '<div class="md-kpis">' +
+    '<div class="md-k"><span>' + esc(t('md_out')) + '</span><b>' + fmt(d.out.n) + '</b>' +
+      (d.out.v1 ? tag('v1', t('md_v1', {n: fmt(d.out.v1)})) : '<em>' + esc(t('md_v1none')) + '</em>') + '</div>' +
+    '<div class="md-k"><span>' + esc(t('md_in')) + '</span><b>' + fmt(d.inc.who) + '</b><em>' +
+      esc(t('md_srcs_lbl')) + (d.inc.local ? ' \u00b7 ' + esc(t('md_local', {n: fmt(d.inc.local)})) : '') + '</em></div></div>';
+  const ready = rd ? sec(t('md_ready'), '<div class="md-rdy"><span class="dm">' + esc(t('rdy_th_out')) + '</span><div>' +
+      rdyCell(rd.out, 'out', true) + '</div><span class="dm">' + esc(t('rdy_th_in')) + '</span><div>' + rdyCell(rd['in'], 'in', true) + '</div></div>') : '';
+  const progs = sec(t('md_progs'), d.out.top.length ? '<div class="md-list">' + d.out.top.map(x =>
+      '<button type="button" class="md-row" data-prog="' + esc(x[0]) + '"><span>' + esc(x[0] || '\u2013') +
+      ' <span class="dm">\u2192 ' + esc(x[1] || '\u2013') + '</span>' + (x[3] ? ' ' + tag('v1', 'NTLMv1') : '') +
+      '</span><span class="n">' + fmt(x[2]) + '</span></button>').join('') + '</div>'
+    : '<div class="md-none">' + esc(t('md_none_out')) + '</div>');
+  const via = {local: t('md_via_local'), dc: t('md_via_dc'), cli: t('md_via_cli')};
+  const inc = sec(t('md_from'), d.inc.pairs.length ? '<div class="md-list">' + d.inc.pairs.map(x =>
+      '<div class="md-row"><span>' + esc(x[0] || '\u2013') + (x[1] ? ' <span class="dm">' + esc(t('rdy_from')) + ' ' + esc(x[1]) + '</span>' : '') +
+      ' <span class="md-via">' + esc(via[x[3]] || '') + '</span></span><span class="n">' + fmt(x[2]) + '</span></div>').join('') +
+      (d.inc.who > d.inc.pairs.length ? '<div class="md-more">' + esc(t('md_more', {n: d.inc.who - d.inc.pairs.length})) + '</div>' : '') +
+      '</div>'
+    : '<div class="md-none">' + esc(t('md_none_in')) + '</div>');
+  const users = d.out.users.length ? sec(t('md_users'), '<div class="md-chips">' + d.out.users.map(u =>
+      '<button type="button" class="md-chip" data-q="' + esc(u[0]) + '">' + esc(u[0] || '\u2013') + ' <b>' + fmt(u[1]) + '</b></button>').join('') + '</div>') : '';
+  let audit = '';
+  if(ag){ const b = agentBadges(ag);
+    audit = sec(t('md_audit'), '<div class="md-tags">' + (b.au.join(' ') || '<span class="dm">\u2013</span>') +
+      (b.lm ? ' ' + b.lm : '') + '</div><div class="md-tags" style="margin-top:8px"><span class="dm">' +
+      esc(t('th_oct')) + '</span> ' + b.oct + '</div>'); }
+  const acts = '<div class="md-acts"><button type="button" class="ghost" data-mach="' + esc(d.name) + '">' +
+    esc(t('md_filter')) + '</button><button type="button" class="ghost" data-mach-ev="' + esc(d.name) + '">' +
+    esc(t('md_events')) + '</button></div>';
+  $('#dbody').innerHTML = '<div class="md">' + live + '<div class="md-sec">' + kpis + mdChart(d.series) + '</div>' +
+    ready + progs + inc + users + audit + acts + '</div>';
+}
 const openDrawer = () => { $('#drawer').classList.add('on'); $('#scrim').classList.add('on');
   $('#dclose').focus(); };
 const closeDrawer = () => { $('#drawer').classList.remove('on'); $('#scrim').classList.remove('on'); };
 
-// ---- Zeichnen ------------------------------------------------------------
+// ---- Drawing -----------------------------------------------------------
 function render(){
   if(!DATA) return;
   writeUrlState();
   setTimeout(labelCells, 0);   // after the panels have written their rows
   renderChrome(); renderOsDonut(); renderHero(); renderFocus();
-  $('#grid').innerHTML = [secTrend(), secPrograms(), secTargets(), secV1(), secHeat(), secWhy(),
-    secDomain(), secIncoming(), secSso(), secKrb(), secKrbAcc(), secAgents(), secEvents()].join('');
-  fillHeat(); renderEvents(); renderJump();
+  // Three blocks in the order the work goes: what the situation is, what can be
+  // done now, and the detail to look things up in.
+  $('#grid').innerHTML = [blk('lage'), secTrend(), secPrograms(), secWhy(), secHeat(),
+    blk('act'), secReady(), secV1(), secSso(), secFailed(), secAgentless(), secIncoming(),
+    blk('det'), secAccounts(), secDomain(), secTargets(), secKrb(), secKrbAcc(), secAgents(), secEvents()].join('');
+  fillHeat(); renderEvents(); renderJump(); clipTables(); spy();
   const qi = $('#q'); if(qi) qi.value = S.q;
   requestAnimationFrame(function(){
     document.querySelectorAll('.bfl').forEach(function(b){
@@ -3077,12 +5678,20 @@ function render(){
     }, {rootMargin: '-30px'}); cards.forEach(c => io.observe(c)); }
 }
 
-// ---- Ereignisse ----------------------------------------------------------
+// ---- Events --------------------------------------------------------------
 document.addEventListener('click', function(ev){
   const el = ev.target;
   if(el.id === 'scrim' || el.id === 'dclose'){ closeDrawer(); return; }
   if(el.id === 'excbtn'){ openExceptions(); return; }
-  if(el.id === 'more'){ S.shown += 60; renderEvents(); return; }
+  if(el.id === 'more'){ S.shown += 50; renderEvents(); return; }
+  if(el.id === 'report'){
+    // The report knows 7, 30 and 90 days; 24 hours is too short for a trend
+    // and "all" too long to compare against, so both open the 30-day report.
+    const rg = S.range === '7d' ? '7d' : '30d';
+    window.open(window.STATIC_REPORT ? window.STATIC_REPORT(LANG, rg)
+      : '/report?' + new URLSearchParams({range: rg, lang: LANG, tzoff: String(TZOFF())}).toString(), '_blank', 'noopener');
+    return;
+  }
   if(el.id === 'csv'){ window.location = '/api/export.csv?' + params({q: S.q, kind: S.kind}).toString(); return; }
   if(el.id === 'logout'){ window.location = '/logout'; return; }
   if(el.id === 'hide'){ S.hideDone = !S.hideDone; render(); return; }
@@ -3091,49 +5700,72 @@ document.addEventListener('click', function(ev){
     LANG = lang.dataset.l;
     try { localStorage.setItem('ntlm.lang', LANG); } catch(e){}
     render(); return; }
+  if(el.closest('#menu')){ toggleMenu(); return; }
+  if(el.closest('#theme')){ toggleTheme(); return; }
+  if(el.closest('#searchbtn')){ palOpen(); return; }
   const r = el.closest('[data-r]');
-  if(r){ S.range = r.dataset.r; load(); return; }
+  if(r){ S.range = r.dataset.r; toggleMenu(false); load(); return; }
+  const hb = el.closest('[data-help]');
+  if(hb){ const id = hb.dataset.help, open = !HELPOPEN.has(id);
+    if(open) HELPOPEN.add(id); else HELPOPEN.delete(id);
+    const box = document.getElementById('help-' + id); if(box) box.hidden = !open;
+    hb.setAttribute('aria-expanded', String(open));
+    if(open && FOLDED.has(id)) setFold(id, false);   // asking what a folded panel shows opens it
+    return; }
+  const fold = el.closest('[data-fold]');
+  if(fold){ setFold(fold.dataset.fold, !FOLDED.has(fold.dataset.fold)); return; }
+  const sa = el.closest('[data-showall]');
+  if(sa){ const id = sa.dataset.showall, card = document.getElementById(id);
+    if(EXPANDED.has(id)) EXPANDED.delete(id); else EXPANDED.add(id);
+    if(card) clipCard(card);
+    // collapsing a long list leaves the reader far below it - bring the panel back
+    if(!EXPANDED.has(id) && card && card.getBoundingClientRect().top < 0)
+      card.scrollIntoView({block: 'start'});
+    return; }
   const go = el.closest('[data-go]');
   if(go){ const c = document.getElementById(go.dataset.go);
-    if(c) c.scrollIntoView({behavior: 'smooth', block: 'start'}); return; }
+    if(c){ if(FOLDED.has(c.id)) setFold(c.id, false);   // jumping to a folded panel opens it
+      c.scrollIntoView({behavior: 'smooth', block: 'start'}); } return; }
   const evrow = el.closest('[data-ev]');
   if(evrow){ openEvent(+evrow.dataset.ev); return; }
   const clr = el.closest('[data-clr]');
   if(clr){ const k = clr.dataset.clr;
     if(k === 'all'){ S.q = ''; S.kind = ''; S.mach = ''; S.bucket = ''; S.wd = ''; S.hr = '';
       S.pick = ''; S.rsn = ''; S.unconf = ''; load(); }
-    else if(k === 'unconf'){ S.unconf = ''; S.shown = 60; load(); }
+    else if(k === 'unconf'){ S.unconf = ''; S.shown = 25; load(); }
     else if(k === 'pick'){ S.pick = ''; load(); }
     else if(k === 'rsn'){ S.rsn = ''; load(); }
     else if(k === 'mach'){ S.mach = ''; load(); }
     else if(k === 'bucket'){ S.bucket = ''; load(); }
     else if(k === 'when'){ S.wd = ''; S.hr = ''; load(); }
+    else if(k === 'q'){ S.q = ''; load(); }
     else { S[k] = ''; render(); }
     return; }
   // Drill-down out of the two charts. Both are server-side filters, so the
   // whole payload is refetched - a day three weeks back is not in the event
   // list the page happens to be holding.
   const unc = el.closest('[data-unconf]');
-  if(unc){ S.unconf = '1'; S.shown = 60; load().then(goEvents); return; }
+  if(unc){ S.unconf = '1'; S.shown = 25; load().then(goEvents); return; }
   const rw = el.closest('[data-rsn]');
   if(rw){
     S.rsn = S.rsn === rw.dataset.rsn ? '' : rw.dataset.rsn;
-    S.pick = ''; S.shown = 60;
+    S.pick = ''; S.shown = 25;
     load().then(function(){ if(S.rsn) goEvents(); });
     return; }
-  const sg = el.closest('#handbar .seg');
+  // Bar segments and the key-figure tiles pick the same filter.
+  const sg = el.closest('#handbar .seg, .kpi[data-pick]');
   if(sg){
     S.pick = S.pick === sg.dataset.pick ? '' : sg.dataset.pick;
     // Mutually exclusive with the reason filter in both directions: both want
     // the 'kind' parameter, and a chip that is displayed but ignored would be
     // worse than no chip at all.
-    S.rsn = ''; S.shown = 60;
+    S.rsn = ''; S.shown = 25;
     load().then(function(){ if(S.pick) goEvents(); });
     return; }
   const bar = el.closest('[data-bucket]');
   if(bar){
     S.bucket = S.bucket === bar.dataset.bucket ? '' : bar.dataset.bucket;
-    S.wd = ''; S.hr = ''; S.shown = 60;
+    S.wd = ''; S.hr = ''; S.shown = 25;
     load().then(() => { if(S.bucket) goEvents(); });
     return; }
   const cell = el.closest('[data-wd]');
@@ -3141,27 +5773,183 @@ document.addEventListener('click', function(ev){
     const same = String(S.wd) === cell.dataset.wd && String(S.hr) === cell.dataset.hr;
     S.wd = same ? '' : cell.dataset.wd;
     S.hr = same ? '' : cell.dataset.hr;
-    S.bucket = ''; S.shown = 60;
+    S.bucket = ''; S.shown = 25;
     load().then(() => { if(S.wd !== '') goEvents(); });
     return; }
   const chip = el.closest('.chip');
   if(chip){ if(chip.dataset.k !== undefined) S.kind = chip.dataset.k;
     if(chip.dataset.a) S.acct = chip.dataset.a;
-    S.shown = 60; renderEvents(); return; }
+    S.shown = 25; renderEvents(); return; }
+  const aco = el.closest('[data-account]');
+  if(aco){ openAccount(aco.dataset.account); return; }
+  const mdo = el.closest('[data-machine]');
+  if(mdo){ openMachine(mdo.dataset.machine); return; }
+  const mev = el.closest('[data-mach-ev]');
+  if(mev){ S.mach = mev.dataset.machEv; S.shown = 25; closeDrawer(); load().then(goEvents); return; }
   const jd = el.closest('[data-prog],[data-q],[data-mach],[data-kind]');
   if(jd){
     if(jd.dataset.mach){ S.mach = jd.dataset.mach; closeDrawer(); load(); return; }
+    const qBefore = S.q;
     if(jd.dataset.prog) S.q = jd.dataset.prog;
     if(jd.dataset.q) S.q = jd.dataset.q;
     if(jd.dataset.kind) S.kind = jd.dataset.kind;
-    S.shown = 60; closeDrawer(); render();
+    S.shown = 25; closeDrawer();
+    if(S.q !== qBefore){ load().then(goEvents); return; }
+    render();
     const c = document.getElementById('sec-events');
     if(c) setTimeout(function(){ c.scrollIntoView({behavior: 'smooth', block: 'start'}); }, 50);
   }
 });
+// Typing filters the loaded rows at once, then asks the database after a short
+// pause. Reloading rebuilds the list with its search field, so focus and caret
+// are put back where they were.
+let Q_TIMER = 0;
 document.addEventListener('input', function(e){
-  if(e.target.id === 'q'){ S.q = e.target.value; S.shown = 60; renderEvents(); } });
+  if(e.target.id !== 'q') return;
+  S.q = e.target.value; S.shown = 25; renderEvents();
+  clearTimeout(Q_TIMER);
+  Q_TIMER = setTimeout(function(){
+    const qi = $('#q'), had = qi && document.activeElement === qi, pos = qi ? qi.selectionStart : 0;
+    load().then(function(){
+      const n = $('#q');
+      if(had && n){ n.focus(); try { n.setSelectionRange(pos, pos); } catch(err){} }
+    });
+  }, 450);
+});
+// Opens and closes the control drawer on a phone; closes by itself once a range
+// or machine is picked, so the choice shows straight away.
+// The theme actually showing: the viewer's choice if there is one, else the system's.
+function effTheme(){
+  const a = document.documentElement.getAttribute('data-theme');
+  return a || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+}
+function toggleTheme(){
+  const nx = effTheme() === 'light' ? 'dark' : 'light';
+  document.documentElement.setAttribute('data-theme', nx);
+  try { localStorage.setItem('ntlm.theme', nx); } catch(e){}
+  renderChrome();
+}
+// ---- Quick search (Ctrl+K, / or the header button) --------------------------
+// One box over everything the dashboard currently shows: machines open their
+// detail, programs, accounts and targets filter the event list, panels are
+// jumped to. Built from DATA when opened, so it always matches the range.
+let PAL_ITEMS = [], PAL_HITS = [], PAL_SEL = 0, PAL_OPENER = null;
+const palNorm = v => String(v || '').toLowerCase();
+function palIndex(){
+  const out = [], seen = new Set();
+  const add = (type, label, sub, act, w) => {
+    if(!label) return;
+    const k = type + '|' + palNorm(label);
+    if(seen.has(k)) return; seen.add(k);
+    out.push({type: type, label: String(label), sub: sub || '', act: act, w: w});
+  };
+  const splitU = v => String(v || '').split(',').map(x => x.trim()).filter(Boolean);
+  const fmt = n => Number(n || 0).toLocaleString(LOCALE());
+  const agents = DATA.agents || [];
+  const known = new Set(agents.map(a => palNorm(a.source)));
+  agents.forEach(a => add('machine', a.source,
+    [a.is_dc ? t('type_dc') : /server/i.test(a.os_version || '') ? t('md_type_srv') : t('md_type_cli'), a.os_version].filter(Boolean).join(' \u00b7 '),
+    () => openMachine(a.source), 5));
+  ((DATA.agentless || {}).rows || []).forEach(x => { if(!known.has(palNorm(x.machine)))
+    add('noagent', x.machine, t('pal_noagent_sub', {n: fmt(x.n)}), () => palFilter(x.machine), 3); });
+  (DATA.domain || []).forEach(x => { if(!known.has(palNorm(x.workstation)))
+    add('noagent', x.workstation, t('pal_dom_sub', {n: fmt(x.n)}), () => palFilter(x.workstation), 2); });
+  (DATA.blockers || []).forEach(b => {
+    add('prog', b.process, (b.target || '') + ' \u00b7 ' + fmt(b.n) + '\u00d7', () => palFilter(b.process), 4);
+    add('target', b.target, t('pal_target_sub', {n: fmt(b.n)}), () => palFilter(b.target), 2);
+  });
+  (DATA.incoming || []).forEach(x => add('prog', x.process, x.machine + ' \u00b7 ' + t('md_in'), () => palFilter(x.process), 3));
+  (DATA.domain || []).forEach(x => add('target', x.target, t('pal_target_sub', {n: fmt(x.n)}), () => palFilter(x.target), 2));
+  ((DATA.accounts || {}).rows || []).forEach(a => add('acct', a.name,
+    [a.v1 ? 'NTLMv1' : a.n ? 'NTLM' : '', a.failed ? t('pal_failed', {n: fmt(a.failed)}) : ''].filter(Boolean).join(' \u00b7 '),
+    () => openAccount(a.key), a.v1 ? 5 : 4));
+  (DATA.v1_users || []).forEach(u => add('acct', u.name, 'NTLMv1 \u00b7 ' + fmt(u.n) + '\u00d7', () => openAccount(u.name), 4));
+  (DATA.blockers || []).concat(DATA.domain || [], DATA.incoming || []).forEach(x =>
+    splitU(x.users).forEach(u => add('acct', u, 'NTLM', () => openAccount(u), 3)));
+  (DATA.kerberos_accounts || []).forEach(k => add('acct', k.account, 'Kerberos', () => openAccount(k.account), 2));
+  document.querySelectorAll('#grid .card').forEach(c => {
+    const h = c.querySelector('h2'); if(!h) return;
+    add('panel', h.textContent, t('pal_panel_sub'), () => { if(FOLDED.has(c.id)) setFold(c.id, false);
+      c.scrollIntoView({behavior: calm ? 'auto' : 'smooth', block: 'start'}); }, 1);
+  });
+  return out;
+}
+function palFilter(v){ S.q = v; S.shown = 25; closeDrawer(); load().then(goEvents); }
+function palScore(it, q){
+  const l = palNorm(it.label);
+  if(!q) return it.type === 'machine' || it.type === 'panel' ? it.w : -1;
+  let sc = -1;
+  if(l === q) sc = 1000;
+  else if(l.startsWith(q)) sc = 600;
+  else { const i = l.indexOf(q);
+    if(i > 0) sc = /[\s\\/._@-]/.test(l[i - 1]) ? 400 : 200 - Math.min(i, 100); }
+  if(sc < 0 && palNorm(it.sub).includes(q)) sc = 50;
+  return sc < 0 ? -1 : sc + it.w;
+}
+function palMark(label, q){
+  const l = palNorm(label), i = q ? l.indexOf(q) : -1;
+  if(i < 0) return esc(label);
+  return esc(label.slice(0, i)) + '<mark>' + esc(label.slice(i, i + q.length)) + '</mark>' + esc(label.slice(i + q.length));
+}
+function palRender(){
+  const q = palNorm($('#palq').value.trim());
+  PAL_HITS = PAL_ITEMS.map(it => [palScore(it, q), it]).filter(x => x[0] >= 0)
+    .sort((a, b) => b[0] - a[0] || a[1].label.localeCompare(b[1].label)).slice(0, 40).map(x => x[1]);
+  PAL_SEL = Math.min(PAL_SEL, Math.max(0, PAL_HITS.length - 1));
+  const box = $('#palres');
+  box.innerHTML = PAL_HITS.length ? PAL_HITS.map((it, i) =>
+      '<li role="option" id="pal-' + i + '" data-pal="' + i + '" aria-selected="' + (i === PAL_SEL) + '">' +
+      '<span class="pty">' + esc(t('pal_' + it.type)) + '</span><span class="plb">' + palMark(it.label, q) + '</span>' +
+      (it.sub ? '<span class="psb">' + esc(it.sub) + '</span>' : '') + '</li>').join('')
+    : '<li class="palnone">' + esc(t('pal_none', {q: $('#palq').value.trim()})) + '</li>';
+  $('#palq').setAttribute('aria-activedescendant', PAL_HITS.length ? 'pal-' + PAL_SEL : '');
+  const cur = document.getElementById('pal-' + PAL_SEL); if(cur) cur.scrollIntoView({block: 'nearest'});
+}
+function palOpen(){
+  if(!DATA) return;
+  PAL_ITEMS = palIndex(); PAL_SEL = 0; PAL_OPENER = document.activeElement;
+  toggleMenu(false);
+  $('#pal').hidden = false; $('#palq').value = ''; $('#palq').placeholder = t('pal_ph');
+  $('#palfoot').textContent = t('pal_foot');
+  palRender(); $('#palq').focus();
+}
+function palClose(){
+  $('#pal').hidden = true;
+  if(PAL_OPENER && PAL_OPENER.focus) PAL_OPENER.focus();
+}
+function palRun(i){ const it = PAL_HITS[i]; if(!it) return; palClose(); it.act(); }
+const IS_MAC = /Mac|iPhone|iPad/.test(navigator.platform || '');
+document.addEventListener('keydown', e => {
+  const typing = /^(INPUT|TEXTAREA|SELECT)$/.test((e.target && e.target.tagName) || '') || (e.target && e.target.isContentEditable);
+  if((e.ctrlKey || e.metaKey) && !e.altKey && (e.key === 'k' || e.key === 'K')){
+    e.preventDefault(); if($('#pal').hidden) palOpen(); else palClose(); return; }
+  if(e.key === '/' && !typing && !e.ctrlKey && !e.metaKey && !e.altKey && $('#pal').hidden){ e.preventDefault(); palOpen(); }
+});
+$('#palq').addEventListener('input', () => { PAL_SEL = 0; palRender(); });
+$('#palq').addEventListener('keydown', e => {
+  if(e.key === 'ArrowDown'){ e.preventDefault(); PAL_SEL = Math.min(PAL_SEL + 1, PAL_HITS.length - 1); palRender(); }
+  else if(e.key === 'ArrowUp'){ e.preventDefault(); PAL_SEL = Math.max(PAL_SEL - 1, 0); palRender(); }
+  else if(e.key === 'Enter'){ e.preventDefault(); palRun(PAL_SEL); }
+  else if(e.key === 'Escape'){ e.preventDefault(); e.stopPropagation(); palClose(); }
+  else if(e.key === 'Tab'){ e.preventDefault(); }   // one field and a list: focus stays here
+});
+$('#pal').addEventListener('mousedown', e => {
+  const li = e.target.closest('[data-pal]');
+  if(li){ e.preventDefault(); palRun(+li.dataset.pal); return; }
+  if(!e.target.closest('.palbox')) palClose();
+});
+$('#palres').addEventListener('mousemove', e => {
+  const li = e.target.closest('[data-pal]');
+  if(li && +li.dataset.pal !== PAL_SEL){ PAL_SEL = +li.dataset.pal; palRender(); }
+});
+function toggleMenu(open){
+  const h = document.querySelector('header'), b = $('#menu'); if(!h || !b) return;
+  const on = open === undefined ? !h.classList.contains('open') : open;
+  h.classList.toggle('open', on); b.setAttribute('aria-expanded', String(on));
+}
+document.addEventListener('keydown', e => { if(e.key === 'Escape') toggleMenu(false); });
 document.addEventListener('change', function(e){
+  if(e.target && e.target.id === 'mach') toggleMenu(false);
   if(e.target.id === 'mach'){ S.mach = e.target.value; load(); return; }
   const k = e.target.dataset && e.target.dataset.key;
   if(k){ const v = e.target.value;
@@ -3288,17 +6076,17 @@ def main():
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--db", default="ntlm.db")
     ap.add_argument("--key", default=os.environ.get("NTLM_API_KEY", ""),
-                    help="Shared secret; Agents senden ihn als X-Api-Key")
+                    help="Shared secret; agents send it as X-Api-Key")
     ap.add_argument("--password", default=os.environ.get("NTLM_DASHBOARD_PASSWORD", ""),
                     help="Password for the dashboard login. Empty = login OFF (open). "
-                         "Besser ueber Env NTLM_DASHBOARD_PASSWORD setzen statt als Argument.")
+                         "Better set via the environment variable NTLM_DASHBOARD_PASSWORD than as an argument.")
     ap.add_argument("--secure-cookie", action="store_true",
-                    help="Session-Cookie als 'Secure' markieren (nur ueber HTTPS senden). "
-                         "Bei aktivem --cert/--tlskey automatisch an.")
+                    help="Mark the session cookie as 'Secure' (sent over HTTPS only). "
+                         "On automatically when --cert/--tlskey are set.")
     ap.add_argument("--cert", default="",
                     help="Path to the TLS certificate (PEM). Together with --tlskey this enables HTTPS.")
     ap.add_argument("--tlskey", default="",
-                    help="Pfad zum privaten TLS-Schluessel (PEM).")
+                    help="Path to the private TLS key (PEM).")
     ap.add_argument("--retention-days", type=int, default=0,
                     help="Automatically delete events older than N days (0 = off). "
                          "Runs at startup and every 6 hours after that.")
@@ -3355,6 +6143,8 @@ def main():
                             "DELETE FROM events WHERE event_time < ?", (cutoff,))
                         conn.execute(
                             "DELETE FROM dc_validations WHERE event_time < ?", (cutoff,))
+                        conn.execute(
+                            "DELETE FROM ntlm_failures WHERE event_time < ?", (cutoff,))
                         conn.commit()
                     if cur.rowcount:
                         print(f"[NTLM-Analyzer] retention: deleted {cur.rowcount} events "

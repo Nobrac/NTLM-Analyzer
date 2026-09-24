@@ -95,7 +95,7 @@ Under `Computer Configuration → Policies → Windows Settings → Security Set
 | All machines · *Local Policies → Security Options* | Restrict NTLM: **Outgoing NTLM traffic to remote servers** | `Audit all` — **not** `Deny all` |
 | All machines · *Local Policies → Security Options* | Restrict NTLM: **Audit Incoming NTLM Traffic** | `Enable auditing for domain accounts` |
 | DCs · *Local Policies → Security Options* | Restrict NTLM: **Audit NTLM authentication in this domain** | `Enable all` |
-| DCs · *Advanced Audit Policy → Logon/Logoff* | **Audit Logon** | `Success` — the only source of the NTLMv1/v2 distinction |
+| DCs and member servers · *Advanced Audit Policy → Logon/Logoff* | **Audit Logon** | `Success and Failure` — Success is before Server 2025 the only source of the NTLMv1/v2 distinction (on by default on Windows Server); Failure shows failed NTLM logons |
 | DCs · *Advanced Audit Policy → Account Logon* (optional) | **Audit Kerberos Service Ticket Operations** | `Success and Failure` — failures feed the *Why NTLM?* panel |
 
 Then `gpupdate /force`. The dashboard's **Machines & auditing status** panel
@@ -142,6 +142,11 @@ every agent with a green heartbeat.
 - **Enhanced 40xx events** (process names for NTLM) exist on Windows 11 24H2 /
   Server 2025 only; older systems still deliver everything else, and the
   dashboard says so instead of showing empty panels.
+- **Status report:** the *Report* button turns the current state into a
+  printable page (PDF from the browser) for everyone who does not open the
+  dashboard — trend, progress, risks and next steps, in German or English.
+- **What changed** in each version: [CHANGELOG](CHANGELOG.md) and the
+  [Releases page](https://github.com/Nobrac/NTLM-Analyzer/releases).
 - All CLI options: `python3 ntlm-collector.py --help` and `ntlm-agent.exe --help`.
 - **Everything else** — component details, every CLI flag, troubleshooting and
   the checklist for actually turning NTLM off — lives in the
