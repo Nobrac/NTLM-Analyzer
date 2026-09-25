@@ -143,6 +143,38 @@ struct AgentStatus {
     forest_level: Option<String>,
 }
 
+/// Longest value sent for any field. Values that come from the network (names
+/// a client picks for itself) could otherwise be as long as a sender likes.
+const FIELD_MAX: usize = 4096;
+
+impl Event {
+    /// Every text field cut to FIELD_MAX, so no single event can grow past a
+    /// few dozen kilobytes however it was crafted.
+    fn capped(mut self) -> Self {
+        let cut = |s: &mut String| {
+            if s.len() > FIELD_MAX {
+                *s = eventlog::cap_at(s, FIELD_MAX);
+            }
+        };
+        cut(&mut self.log);
+        cut(&mut self.kind);
+        cut(&mut self.event_time);
+        for f in [
+            &mut self.user, &mut self.domain, &mut self.ntlm_version, &mut self.process,
+            &mut self.target_server, &mut self.workstation, &mut self.ip, &mut self.logon_type,
+            &mut self.enc_type, &mut self.auth_method, &mut self.reason, &mut self.reason_id,
+            &mut self.mic, &mut self.epa, &mut self.server_os, &mut self.failure_code,
+            &mut self.process_path,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            cut(f);
+        }
+        self
+    }
+}
+
 #[derive(Serialize)]
 struct IngestBody<'a> {
     source: &'a str,
@@ -308,28 +340,76 @@ pub fn run_cycle(cfg: &Config) -> Result<(), String> {
         return Ok(());
     }
 
-    // 4) Push in batches; only store watermarks after a successful push
+    // 4) Push in batches; only store watermarks after a successful push.
+    // Batches are bounded by size as well as count, so a burst of long values
+    // can never push one past the collector's body limit (10 MB): a batch it
+    // refused would be retried every cycle and the machine would go silent.
     let ingest_url = format!("{}/ingest", cfg.collector_url.trim_end_matches('/'));
-    let batch_size = 500usize;
+    let sizes: Vec<usize> = collected
+        .iter()
+        .map(|e| serde_json::to_vec(e).map(|v| v.len() + 1).unwrap_or(FIELD_MAX * 20))
+        .collect();
     let mut total = 0usize;
-    let mut idx = 0usize;
-    while idx < collected.len() {
-        let end = (idx + batch_size).min(collected.len());
-        let body = serde_json::to_string(&IngestBody {
-            source: &me,
-            events: &collected[idx..end],
-        })
-        .map_err(|e| e.to_string())?;
-        post_json(&ingest_url, &cfg.api_key, &body)
+    let mut skipped = 0usize;
+    for (from, to) in plan_batches(&sizes, BATCH_MAX_BYTES, BATCH_MAX_EVENTS) {
+        let mut send = |events: &[Event]| -> Result<(), PostError> {
+            let body = serde_json::to_string(&IngestBody { source: &me, events })
+                .map_err(|e| PostError { code: None, msg: e.to_string() })?;
+            post_json(&ingest_url, &cfg.api_key, &body)
+        };
+        skipped += send_split(&collected[from..to], &mut send)
             .map_err(|e| format!("[{me}] push failed: {e}"))?;
-        total += end - idx;
-        idx = end;
+        total += to - from;
+    }
+    if skipped > 0 {
+        config::log(&format!("[{me}] {skipped} events refused by the collector as too large - skipped."));
     }
 
     merge_watermarks(&mut state, new_seen);
     config::save_state(&state)?;
-    config::log(&format!("[{me}] {total} events sent."));
+    config::log(&format!("[{me}] {} events sent.", total - skipped));
     Ok(())
+}
+
+const BATCH_MAX_BYTES: usize = 2 * 1024 * 1024;
+const BATCH_MAX_EVENTS: usize = 500;
+
+/// Consecutive ranges of at most `max_count` events and `max_bytes` bytes.
+/// An event larger than `max_bytes` on its own still gets a batch of one.
+fn plan_batches(sizes: &[usize], max_bytes: usize, max_count: usize) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut bytes = 0usize;
+    for (i, &s) in sizes.iter().enumerate() {
+        if i > start && (bytes + s > max_bytes || i - start >= max_count) {
+            out.push((start, i));
+            start = i;
+            bytes = 0;
+        }
+        bytes += s;
+    }
+    if start < sizes.len() {
+        out.push((start, sizes.len()));
+    }
+    out
+}
+
+/// Sends one batch. A "too large" answer (HTTP 413) splits it in halves; a
+/// single event the collector still refuses is skipped rather than blocking
+/// every later one. Returns how many were skipped; any other error aborts.
+fn send_split<F>(events: &[Event], send: &mut F) -> Result<usize, PostError>
+where
+    F: FnMut(&[Event]) -> Result<(), PostError>,
+{
+    match send(events) {
+        Ok(()) => Ok(0),
+        Err(e) if e.code == Some(413) && events.len() > 1 => {
+            let mid = events.len() / 2;
+            Ok(send_split(&events[..mid], send)? + send_split(&events[mid..], send)?)
+        }
+        Err(e) if e.code == Some(413) => Ok(1),
+        Err(e) => Err(e),
+    }
 }
 
 fn merge_watermarks(state: &mut HashMap<String, i64>, new_seen: HashMap<String, i64>) {
@@ -362,7 +442,7 @@ fn gather(
             new_seen.insert(key.to_string(), seen);
             for e in &raw {
                 if let Some(ev) = mapper(e) {
-                    collected.push(ev);
+                    collected.push(ev.capped());
                 }
             }
         }
@@ -651,7 +731,7 @@ fn sniff_process(e: &RawEvent, fallback_idx: usize) -> Option<String> {
         .chain(e.positional.iter())
         .map(|s| s.trim())
         .find(|s| !s.is_empty() && *s != "-" && looks_exe(s))
-        .map(|s| base_name(s))
+        .map(base_name)
         .or_else(|| {
             e.positional
                 .get(fallback_idx)
@@ -1286,7 +1366,20 @@ fn map_enc(code: &str) -> String {
 
 // ----------------------------- HTTP -----------------------------
 
-fn post_json(url: &str, api_key: &str, body: &str) -> Result<(), String> {
+/// A failed push: the HTTP status when there was one, and what happened.
+#[derive(Debug)]
+struct PostError {
+    code: Option<u16>,
+    msg: String,
+}
+
+impl std::fmt::Display for PostError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.msg)
+    }
+}
+
+fn post_json(url: &str, api_key: &str, body: &str) -> Result<(), PostError> {
     // Overall timeout so that a hanging collector cannot block the cycle - and
     // with it a service stop.
     // redirects(0): ureq would otherwise re-send the request - including the
@@ -1305,8 +1398,8 @@ fn post_json(url: &str, api_key: &str, body: &str) -> Result<(), String> {
     }
     match req.send_string(body) {
         Ok(_) => Ok(()),
-        Err(ureq::Error::Status(code, _)) => Err(format!("HTTP {code}")),
-        Err(e) => Err(e.to_string()),
+        Err(ureq::Error::Status(code, _)) => Err(PostError { code: Some(code), msg: format!("HTTP {code}") }),
+        Err(e) => Err(PostError { code: None, msg: e.to_string() }),
     }
 }
 
@@ -1775,5 +1868,96 @@ mod logon_event_tests {
         assert_eq!(norm_nt_status("0x0"), None);
         assert_eq!(norm_nt_status("%%2313"), None);
         assert_eq!(norm_nt_status(""), None);
+    }
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+
+    const MSG: &str = "This server was accessed with NTLM.\n\nClient Information:\n  Hostname: EVIL\nNTLM Version: NTLMv2\n  Username: bob\n\nNTLM Security:\n  NTLM Version: NTLMv1\n";
+
+    fn xml(msg: &str) -> String {
+        format!(
+            "<Events><Event><System><EventID>4022</EventID><EventRecordID>5</EventRecordID>\
+             <TimeCreated SystemTime=\"2026-09-25T10:00:00.0000000Z\"/></System>\
+             <EventData><Data Name=\"ClientName\">EVIL&#10;NTLM Version: NTLMv2</Data>\
+             <Data Name=\"UserName\">bob</Data></EventData>\
+             <RenderingInfo><Message>{msg}</Message></RenderingInfo></Event></Events>"
+        )
+    }
+
+    #[test]
+    fn a_line_break_in_a_client_name_cannot_fake_the_version() {
+        // Without the fix the injected line is found first.
+        let raw = RawEvent {
+            record_id: 5, event_id: 4022, time: String::new(),
+            named: HashMap::new(), positional: vec![], message: Some(MSG.to_string()),
+        };
+        assert_eq!(from_message(&raw, L_VERSION).as_deref(), Some("NTLMv2"));
+        // Parsed the normal way, the value is flattened and the real line wins.
+        let ev = &eventlog::parse_events(&xml(MSG)).unwrap()[0];
+        assert_eq!(from_message(ev, L_VERSION).as_deref(), Some("NTLMv1"));
+        let mapped = map_enhanced(ev).unwrap();
+        assert_eq!(mapped.ntlm_version.as_deref(), Some("NTLMv1"));
+    }
+
+    #[test]
+    fn crlf_rendering_is_neutralised_too() {
+        let msg = MSG.replace('\n', "\r\n");
+        let ev = &eventlog::parse_events(&xml(&msg)).unwrap()[0];
+        assert_eq!(from_message(ev, L_VERSION).as_deref(), Some("NTLMv1"));
+    }
+
+    #[test]
+    fn every_field_is_capped() {
+        let long = "ä".repeat(10_000); // multi-byte: the cut must land on a char boundary
+        let e = Event {
+            user: Some(long.clone()), workstation: Some("x".repeat(100_000)),
+            reason: Some(long.clone()), kind: "outgoing".into(), ..Default::default()
+        }
+        .capped();
+        assert!(e.user.as_ref().unwrap().len() <= FIELD_MAX);
+        assert_eq!(e.workstation.as_ref().unwrap().len(), FIELD_MAX);
+        assert!(e.reason.unwrap().chars().all(|c| c == 'ä'));
+        assert!(serde_json::to_vec(&e.user).unwrap().len() < FIELD_MAX * 2);
+    }
+
+    #[test]
+    fn batches_respect_size_and_count() {
+        let mb = 1024 * 1024;
+        assert_eq!(plan_batches(&[mb, mb, mb], 2 * mb, 500), vec![(0, 2), (2, 3)]);
+        assert_eq!(plan_batches(&[10; 7], 1000, 3), vec![(0, 3), (3, 6), (6, 7)]);
+        // One oversized event still gets its own batch instead of being lost.
+        assert_eq!(plan_batches(&[10, 5 * mb, 10], 2 * mb, 500), vec![(0, 1), (1, 2), (2, 3)]);
+        assert!(plan_batches(&[], 10, 10).is_empty());
+    }
+
+    #[test]
+    fn a_refused_batch_is_split_and_only_the_culprit_skipped() {
+        let events: Vec<Event> = (0..8)
+            .map(|i| Event { record_id: i, kind: "outgoing".into(), ..Default::default() })
+            .collect();
+        let mut delivered = Vec::new();
+        // The "collector" refuses any batch containing record 5, and anything above 2 events.
+        let mut send = |b: &[Event]| -> Result<(), PostError> {
+            if b.len() > 2 || b.iter().any(|e| e.record_id == 5) {
+                return Err(PostError { code: Some(413), msg: "HTTP 413".into() });
+            }
+            delivered.extend(b.iter().map(|e| e.record_id));
+            Ok(())
+        };
+        let skipped = send_split(&events, &mut send).unwrap();
+        assert_eq!(skipped, 1);
+        assert_eq!(delivered, vec![0, 1, 2, 3, 4, 6, 7]);
+    }
+
+    #[test]
+    fn other_errors_still_stop_the_push() {
+        let events = vec![Event::default(), Event::default()];
+        let mut send = |_: &[Event]| -> Result<(), PostError> {
+            Err(PostError { code: Some(401), msg: "HTTP 401".into() })
+        };
+        assert!(send_split(&events, &mut send).is_err());
     }
 }

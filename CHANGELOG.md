@@ -4,204 +4,97 @@ Every release with its full notes, installers and downloads is on the
 [Releases page](https://github.com/Nobrac/NTLM-Analyzer/releases). This file
 carries the latest release in full and a one-line summary of each earlier one.
 
-## Unreleased
+## v2.3.1 — Security fixes for the agent
 
-- **Automated tests.** Every counting rule of the collector has a test that
-  runs against a real collector on a throwaway database: 8001/4020 duplicates,
-  unconfirmed and phantom 8001s, 4624 twins and the NTLM version travelling
-  across one logon, failed logons counted once, spraying, anonymous logons,
-  one logon seen three times per account, readiness, machines without an
-  agent, the report, login and API key. They run on every push on Python 3.7
-  and 3.13, together with a syntax check of the dashboard's JavaScript; the
-  agent's unit tests now run in its build and stop it when they fail.
-- **Status report in dark.** On screen the report now follows a dark system
-  theme; printed or saved as PDF it stays on white paper.
-- The collector's module description was still partly German; it is English
-  now, and a test keeps it that way.
+Security fixes for the agent, from a review of its code, installer and build.
+**Update every agent** - the dashboard now marks machines that still run an
+older one ("security update"). Update the collector first, as always.
 
-## v2.3.0 — Every account, every attempt, and a report for everyone else
+### Security fixes
 
-The biggest release so far. 2.2 made the numbers right; 2.3 makes them
-complete, and turns them into things to do. NTLMv1 is now visible where it
-used to be hidden, failed and anonymous logons are no longer dropped, every
-account has its own view, the dashboard names the machines it cannot see into,
-and a printable status report carries all of it to people who never open the
-dashboard.
+- **Data folder taken over before installation (high).** Any user may create
+  folders under `C:\ProgramData`. Whoever created `NtlmAgent` before the agent
+  was installed stayed its owner and could give himself access back at any
+  time: read the API key, redirect the collector, silence the agent, or plant
+  links that turned the service's own file writes into writes anywhere on the
+  system - as SYSTEM. Now the folder is made safe before anything is written:
+  a folder that is not ours (someone else's, a link, a file) is moved aside, a
+  fresh one is created with a protected ACL from its first moment and owned by
+  Administrators, and the service refuses to start from a folder that is not
+  safe. Most relevant on terminal servers, where many users log on.
+- **API key readable after a failed lockdown (medium).** The configuration
+  with the key was written before the folder's ACL was restricted, and a
+  failing `icacls` was only logged. Now nothing is written unless the lockdown
+  worked.
+- **NTLMv1 could be disguised as NTLMv2 (medium).** On Server 2025 and
+  Windows 11 24H2 the agent reads the NTLM version from the event's message
+  text, which also contains names chosen by the remote client. A name with a
+  line break and a fake "NTLM Version: NTLMv2" line was read before the real
+  one. Values with line breaks are now flattened before the text is read.
+- **An attacker could make an agent go silent (medium).** Values from the
+  network were not all capped, and batches were limited by count, not size. A
+  batch over the collector's 10 MB limit was refused and retried every cycle -
+  nothing more arrived from that machine. Every field is capped now, batches
+  stay under 2 MB, and a refused batch is split so only an oversized event is
+  skipped.
+- **API key in the install log (medium).** The installer handed the key to a
+  helper that logged the whole command line. The configuration is now written
+  by the agent itself with its command line hidden from the log, which the
+  build checks on every run. New `--api-key *` (asks without echo) and
+  `--api-key-env NAME` keep the key out of shell history and event 4688.
+- **HTTPS required (low).** `install`/`configure` refuse an `http://` collector
+  unless `--allow-http` (MSI: `ALLOWHTTP=1`) is given. Existing configurations
+  keep working and warn at every service start.
+- **Build supply chain (low).** `Cargo.lock` is committed and every build uses
+  exactly those versions (`--locked`); GitHub Actions are pinned to commits;
+  known vulnerabilities in dependencies are checked on every push and weekly
+  (`cargo audit`); Dependabot proposes updates. No dependency had a known
+  vulnerability.
 
-### Highlights
+### Also fixed
 
-- **NTLMv1 on member servers.** The agent collects 4624 on every machine, so a
-  Server 2016–2022 file server finally says which NTLM version each logon used.
-- **Accounts using NTLM**, with an **account detail view**: from which
-  machines, to which servers, with which programs.
-- **Failed NTLM attempts** (4625 + failed 4776) with the reason in plain words,
-  locked-out accounts and **password-spraying detection**.
-- **Anonymous logons** (null sessions) are kept and labelled, instead of being
-  dropped or miscounted as NTLMv1.
-- **Auditing gaps are named** per machine instead of showing up as silence.
-- **Ready to switch off** and **machines without an agent** — the two lists
-  that turn findings into a plan.
-- **Machine detail**, **Ctrl+K search** over everything, and a reworked,
-  faster-reading dashboard with a **light theme**.
-- **Status report** to print or save as PDF, with risks and next steps.
+- The MSI did not start the service after installing it - it only ran after
+  the next reboot. It starts right away now.
+- `configure` without a key no longer wipes the stored one, so changing the URL
+  or upgrading silently keeps it (`--clear-api-key` removes it on purpose).
+- New [SECURITY.md](https://github.com/Nobrac/NTLM-Analyzer/blob/main/SECURITY.md): how to report a vulnerability privately.
 
----
+### Tests
 
-### NTLMv1 where it was invisible
+- **Collector:** every counting rule has a test that runs against a real
+  collector on a throwaway database - 8001/4020 duplicates, unconfirmed and
+  phantom 8001s, 4624 twins and the NTLM version travelling across one logon,
+  failed logons counted once, spraying, anonymous logons, one logon seen three
+  times per account, readiness, machines without an agent, the report, login
+  and API key. They run on every push on Python 3.7 and 3.13, with a syntax
+  check of the dashboard's JavaScript.
+- **Agent:** 28 unit tests, now part of every build, including the fixes
+  above. The MSI build installs the package with a key and checks that the key
+  is not in the log, that the data folder belongs to Administrators with
+  access for SYSTEM and Administrators only, that the service is running, and
+  that `http://` is refused.
 
-The classic NTLM events (8001, 8003, 8004) never say which NTLM version a
-logon used. Before Server 2025 the only place a member server records it is
-its **4624**, and the agent collected that on domain controllers only. An
-NTLMv1 logon to a Server 2022 file server showed up as "NTLM, version
-unknown".
+### Smaller changes
 
-- **The agent now collects 4624 on every machine.** The filter keeps it to
-  NTLM logons, so the volume stays small.
-- **One logon, one count.** A member server usually writes both an 8003 and a
-  4624 for the same logon. They are matched per logon — same machine, same
-  account, same client, within ten seconds — and only the 8003 counts, since
-  it names the service that accepted the logon. Without an 8003 (incoming
-  audit off) the 4624 itself is the incoming event.
-- **The version travels.** The 4624's version is handed to every trace of the
-  same logon that lacks one: the 8003 on the server, the 8004 on the DC and
-  the 8001 on the client. So NTLMv1 now shows up in the domain view and in the
-  program list — which program on which client still speaks NTLMv1 —
-  whichever of the events reaches the collector first.
-- **Logon auditing is checked.** The agent reads "Audit Logon" (via
-  `auditpol /backup`, whose numeric column is the same in every Windows
-  language) and the machines panel shows per machine: **logons** (NTLMv1 is
-  recognised here), **no 4624** (auditing off — NTLMv1 stays invisible, GPO
-  path in the tooltip) or **agent before 2.3**. The NTLMv1 panel says how many
-  machines are blind that way, so an empty list is never read as "all clear".
-
-### Every account, every attempt
-
-- **Accounts using NTLM.** One row per account: NTLM logons, v1/v2, from how
-  many machines to how many servers, failed attempts, and whether it already
-  uses Kerberos elsewhere. The same logon is often seen three times — by the
-  client (8001), the server (8003) and the DC (8004); per account and server
-  the side that saw the most counts, never the sum.
-- **Account detail.** A click on an account (or Ctrl+K) opens it in the side
-  drawer: trend, from which machines, to which servers, with which programs,
-  and its failed attempts with the reason in plain words.
-- **Failed NTLM attempts.** The agent now also collects **4625** (failed NTLM
-  logons) on every machine; the DCs' failed **4776** were already there. One
-  failure seen by both the server and the DC counts once.
-  - The reason is spelled out: wrong password, no such account, locked out,
-    expired, disabled, outside logon hours, …
-  - A stale password in a service or scheduled task is named as the likely
-    cause, where it is.
-  - **Password spraying** is flagged when one machine fails with five or more
-    accounts.
-  - Failures live in their own table and never count towards the NTLM share.
-- **Anonymous logons** (null sessions) are no longer dropped. They carry no
-  credential, so Windows' "NTLM V1" label on them is ignored — they show up as
-  *anonymous* instead of inflating the NTLMv1 figures.
-- **Auditing gaps are named.** A machine with outgoing, incoming or (on a DC)
-  domain NTLM auditing off gets a red or amber badge, and the machines panel
-  says how many are affected.
-- **No more cut-off lists.** Panels ended at 50 rows (NTLMv1 accounts at 15).
-  They now receive up to 500 and fold to ten with *show all*; the jump bar says
-  "500+" when the cap is reached.
-
-### Act on it
-
-- **Ready to switch off.** Per machine and direction: auditing on, watched for
-  30 days, no NTLM in those 30 days — then "Restrict NTLM: Deny" can be set.
-  Otherwise it names what would break. Incoming counts what other machines and
-  the DCs saw going to the machine too, so a server with its own auditing off
-  is still caught.
-- **Machines without an agent.** Every NTLM logon of a domain account is
-  validated by a DC (4776, collected since 2.2.0). Any client in there without
-  an agent is listed — often the forgotten server or device.
-- **Machine detail.** A click on a machine opens everything about it in one
-  place: outgoing and incoming NTLM with its trend, readiness, programs and
-  targets, who reaches it and from where, its accounts and its auditing.
-
-### Status report
-
-A **Report** button in the header opens a status report for everyone who does
-not open the dashboard: a page to print or save as PDF, in German or English,
-over 7, 30 or 90 days.
-
-- **Page one, the overview:** the NTLM share and its change against the period
-  before, key figures, the weekly trend towards zero with NTLMv1 per week, the
-  work list (done, in progress, open) and the machines ready to switch off.
-- **Page two, what to do:** risks rated *act / watch / fine* — NTLMv1, the
-  October 2026 change, failed logons and spraying, gaps in visibility, relay
-  exposure — and up to six next steps derived from the data, with names.
-- **Page three, the detail:** the largest programs and accounts still using
-  NTLM, and how everything is counted.
-
-Rendered on the server as plain HTML; no script needed to read it.
-
-### Quick search
-
-**Ctrl+K** (⌘K on a Mac), **/** or the search button in the header opens one
-box over everything the dashboard shows: machines and accounts open their
-detail; programs and targets filter the event list; panels are jumped to. Full
-keyboard use, screen-reader labels, and a single button on phones.
-
-Text search in the event list now runs in the database. Before, it filtered
-only the newest few hundred loaded rows — a program with 171 logons could show
-11. Typing waits for a short pause and keeps the cursor where it was, and a
-late answer can no longer overwrite a newer one.
-
-### A dashboard that reads faster
-
-- Three blocks in the order the work goes: **Situation**, **Act**, **Details**.
-  Panels fold, long tables show ten rows with "show all", and the jump bar
-  shows real counts and marks where you are.
-- **Key-figure tiles** with the change against the week before; the trend as
-  an area with the goal line at zero; work status as coloured chips.
-- **Light theme**, following the system or picked in the header.
-- A **"What does this show?"** answer on every panel, a compact phone header,
-  the brand mark in the header.
-- Fixed: a stray brace in the stylesheet had silently dropped two rules (the
-  live dot and the data-basis line); the 24-hour button was labelled "Time
-  range"; the jump bar showed fetch limits ("Events 300") instead of counts.
-
-### Live demo
-
-The [live demo](https://nobrac.github.io/NTLM-Analyzer/demo/) has all of the
-above: machine and account details, failed attempts including a spraying burst
-and a locked-out account, an anonymous printer, a machine with auditing off,
-a work list in progress, and the status report in both languages.
-
-### Under the hood
-
-- Code, comments and identifiers are English throughout. Work status values
-  are now `open`, `in_progress` and `done`; audit states reported by the agent
-  are `on`/`off` instead of `an`/`aus`. Existing databases are rewritten once
-  on start, and the old values are still accepted from older agents and pages.
-  The German UI translation and the German Windows labels the agent and
-  collector recognise stay German — they have to.
-- New table `ntlm_failures`; 4776 status codes are stored in one spelling
-  (`0xC000006A`). Retention cleans both.
-- New endpoints `/api/machine`, `/api/account` and `/report`, all behind the
-  dashboard login.
-- Agent: 12 unit tests for the audit-policy parser and the new event mappings.
+- The status report follows a dark system theme on screen; printed or saved as
+  PDF it stays white.
+- Remaining German text in the collector's description and one agent message
+  is English now; a test keeps the collector's comments that way.
 
 ### Upgrading
 
-1. **Collector:** replace `ntlm-collector.py`, restart, hard-refresh
-   (Ctrl+F5). Database changes happen on start, nothing to do by hand.
-2. **Agent — member servers first.** They are the ones that now send the
-   4624s that carry the version, and the 4625s. Then everything else. The MSI
-   upgrades in place and keeps the configuration.
-3. **GPO: "Audit Logon" to *Success and Failure*** on DCs and member servers
-   (*Advanced Audit Policy → Logon/Logoff*). Success gives the NTLM version,
-   Failure the failed attempts; the dashboard shows where either is missing.
-
-### Compatibility
-
-- **Agent 2.2.x with collector 2.3:** works; those machines just send no
-  member-server 4624 (so no NTLMv1 there) and no 4625.
-- **Agent 2.3 with collector 2.2.x:** don't. The older collector would count
-  the failed logons as NTLM in use. **Update the collector first.**
+1. **Collector:** replace `ntlm-collector.py`, restart, hard-refresh.
+2. **Agents:** install the new MSI over the old one with the collector URL
+   (`COLLECTORURL=https://...`) - the stored API key is kept. Installed with
+   the bare EXE? `ntlm-agent.exe uninstall`, then `ntlm-agent.exe install
+   --collector-url https://...` with the new EXE - the key is kept there too. The dashboard shows which machines are
+   still on an older version.
+3. Collector on plain HTTP? Use `https://` - or add `ALLOWHTTP=1` (MSI) /
+   `--allow-http` (EXE) to keep HTTP knowingly.
 
 ## Earlier releases
 
+- **[v2.3.0](https://github.com/Nobrac/NTLM-Analyzer/releases/tag/v2.3.0)** — Every account, every attempt, and a report for everyone else
 - **[v2.2.0](https://github.com/Nobrac/NTLM-Analyzer/releases/tag/v2.2.0)** — Numbers you can trust
 - **[v2.1.1](https://github.com/Nobrac/NTLM-Analyzer/releases/tag/v2.1.1)** — Usable on phones
 - **[v2.1.0](https://github.com/Nobrac/NTLM-Analyzer/releases/tag/v2.1.0)** — Installer, live demo, shareable views

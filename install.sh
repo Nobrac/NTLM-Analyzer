@@ -283,7 +283,12 @@ fi
 echo "  ${C_BOLD}API key${C_RESET}     ${API_KEY}"
 echo
 echo "  ${C_BOLD}Agent install command (on each Windows machine, elevated):${C_RESET}"
-echo "      ntlm-agent.exe install --collector-url ${SCHEME}://${HOSTNAME_FQDN}:${PORT} --api-key ${API_KEY}"
+# "--api-key *" asks for the key, so it does not end up in a shell history.
+# Agents refuse http:// unless told otherwise - say so where it applies.
+HTTP_FLAG=""
+[[ "$SCHEME" == "http" ]] && HTTP_FLAG=" --allow-http"
+echo "      ntlm-agent.exe install --collector-url ${SCHEME}://${HOSTNAME_FQDN}:${PORT} --api-key *${HTTP_FLAG}"
+echo "      ${C_DIM}(it asks for the API key shown above)${C_RESET}"
 echo
 echo "  ${C_DIM}Service:   systemctl status|restart ntlm-analyzer"
 echo "  Logs:      journalctl -u ntlm-analyzer -f"

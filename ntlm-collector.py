@@ -3892,6 +3892,7 @@ de: {
   ag_gaps:'Auf {n} Maschinen fehlt NTLM-Auditing in mindestens einer Richtung – dort bleibt NTLM ganz oder teilweise unsichtbar. Die roten und gelben Abzeichen nennen die Richtlinie.',
   r_logon:'Anmeldungen', r_logon_t:'„Anmelden überwachen: Erfolg" ist aktiv – diese Maschine schreibt 4624, NTLMv1 wird hier erkannt.',
   b_logon_off:'4624 fehlt', b_logon_off_t:'„Anmelden überwachen" steht auf „Keine Überwachung" oder nur „Fehler". Ohne erfolgreiche 4624 bleibt NTLMv1 auf dieser Maschine unsichtbar. GPO: Erweiterte Überwachungsrichtlinienkonfiguration → An-/Abmelden → Anmelden überwachen: Erfolg.',
+  b_agent_sec:'Agent {v}: Sicherheitsupdate', b_agent_sec_t:'Agent-Versionen vor {s} haben bekannte Sicherheitslücken (u. a. im Umgang mit dem Datenordner). Bitte auf {s} oder neuer aktualisieren.',
   b_agent_old:'Agent vor 2.3', b_agent_old_t:'Dieser Agent sammelt 4624 nur auf DCs – NTLMv1 bleibt auf dieser Maschine unsichtbar, bis der Agent auf 2.3.0 oder neuer aktualisiert ist.',
   b_logon_unk:'Anmelde-Audit unbekannt', b_logon_unk_t:'Der Agent konnte die Auditrichtlinie nicht lesen (auditpol). Ob NTLMv1 hier erkannt wird, ist offen.',
   v1_blind:'Auf {n} Maschinen ist NTLMv1 unsichtbar – {a} ohne Anmelde-Audit, {b} mit Agent vor 2.3. Zum Maschinen-Panel →',
@@ -4224,6 +4225,7 @@ en: {
   ag_gaps:'{n} machines lack NTLM auditing in at least one direction - NTLM stays wholly or partly invisible there. The red and amber badges name the policy.',
   r_logon:'logons', r_logon_t:'"Audit Logon: Success" is on - this machine writes 4624, NTLMv1 is recognised here.',
   b_logon_off:'no 4624', b_logon_off_t:'"Audit Logon" is set to "No Auditing" or failures only. Without successful 4624s NTLMv1 stays invisible on this machine. GPO: Advanced Audit Policy Configuration → Logon/Logoff → Audit Logon: Success.',
+  b_agent_sec:'agent {v}: security update', b_agent_sec_t:'Agent versions before {s} have known security issues (among them the handling of the data folder). Please update to {s} or later.',
   b_agent_old:'agent before 2.3', b_agent_old_t:'This agent collects 4624 on DCs only - NTLMv1 stays invisible on this machine until the agent is updated to 2.3.0 or later.',
   b_logon_unk:'logon audit unknown', b_logon_unk_t:'The agent could not read the audit policy (auditpol). Whether NTLMv1 is recognised here is open.',
   v1_blind:'NTLMv1 is invisible on {n} machines - {a} without logon auditing, {b} with an agent before 2.3. To the machines panel →',
@@ -5168,6 +5170,8 @@ function secKrbAcc(){
 //   ok  - logon auditing on        off - off or failures only
 //   old - agent before 2.3 on a non-DC (sends no 4624 from here)
 //   unk - agent 2.3+ that could not read the policy
+// Oldest agent without known security issues.
+const AGENT_SECURE = '2.3.1';
 function verLt(a, b){
   const p = s => String(s || '0').split('.').map(x => parseInt(x, 10) || 0);
   const x = p(a), y = p(b);
@@ -5200,6 +5204,10 @@ function agentBadges(m){
   else if(v1 === 'old') au.push(tag('v2', t('b_agent_old'), t('b_agent_old_t')));
   else if(v1 === 'unk') au.push(tag('n', t('b_logon_unk'), t('b_logon_unk_t')));
   if(m.cg) au.push(tag('v1', t('b_cg_machine', {n: m.cg})));
+  // Agents before AGENT_SECURE have known security issues (see SECURITY.md
+  // and the release notes) - the badge is how an admin finds them.
+  if(m.agent_version && verLt(m.agent_version, AGENT_SECURE))
+    au.push(tag('v1', t('b_agent_sec', {v: m.agent_version}), t('b_agent_sec_t', {s: AGENT_SECURE})));
   // A DC that sends no 4776 blocks every phantom verdict - say which one.
   if(m.is_dc) au.push(m.dcval
     ? tag('krb', t('b_dcval_ok'), t('b_dcval_ok_t', {when: when(m.dcval_last)}))

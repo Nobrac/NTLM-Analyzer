@@ -30,16 +30,17 @@ jobs:
         working-directory: ntlm-agent-rs
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install Rust (stable, MSVC)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
         with:
+          toolchain: stable
           targets: x86_64-pc-windows-msvc
           components: clippy, rustfmt
 
       - name: Cache cargo registry and build output
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
@@ -54,16 +55,19 @@ jobs:
       # Style hints are informative, not blocking: without "-D warnings" they
       # stay warnings and do not turn the run red.
       - name: Clippy
-        run: cargo clippy --release
+        run: cargo clippy --release --locked
         continue-on-error: true
 
+      # --locked: build exactly the versions in Cargo.lock, never whatever
+      # was published last - a release must not pick up a dependency nobody
+      # has looked at.
       - name: Build
-        run: cargo build --release
+        run: cargo build --release --locked
 
       # Parsers for the audit policy and the logon events. Blocking: a wrong
       # mapping here silently puts wrong data into every dashboard.
       - name: Unit tests
-        run: cargo test --release
+        run: cargo test --release --locked
 
       # winresource needs rc.exe from the Windows SDK. If it is missing, build.rs
       # only prints a warning and the EXE ships without icon or version info -
@@ -94,7 +98,7 @@ jobs:
           Write-Host "resource check passed"
 
       - name: Upload ntlm-agent.exe
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           # Named so it cannot be mistaken for the installer: this is the bare
           # console binary, and double-clicking it only flashes a window.

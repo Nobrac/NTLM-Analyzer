@@ -28,16 +28,17 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install Rust (stable, MSVC)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
         with:
+          toolchain: stable
           targets: x86_64-pc-windows-msvc
 
       - name: Build agent
         working-directory: ntlm-agent-rs
-        run: cargo build --release
+        run: cargo build --release --locked
 
       # The agent now carries its own version resource, but the MSI is told the
       # version explicitly anyway: ProductVersion has stricter rules than a file
@@ -126,39 +127,56 @@ jobs:
           -out ntlm-agent.msi
 
       # A package that installs but does not uninstall is worse than none, so
-      # both directions run here before anyone downloads it.
+      # both directions run here before anyone downloads it - together with the
+      # security properties of the result: the key stays out of the log, the
+      # data folder belongs to Administrators, and http:// is refused.
       - name: Install and uninstall silently
         shell: pwsh
         run: |
           $log = "install.log"
+          $secret = "ci-secret-" + [guid]::NewGuid().ToString("N")
           $p = Start-Process msiexec -Wait -PassThru -ArgumentList `
             "/i","ntlm-agent.msi","/qn","/l*v",$log,`
-            "COLLECTORURL=https://collector.invalid:8443"
-          if ($p.ExitCode -ne 0) { Get-Content $log -Tail 40; throw "install failed: $($p.ExitCode)" }
+            "COLLECTORURL=https://collector.invalid:8443","APIKEY=$secret"
+          if ($p.ExitCode -ne 0) { Get-Content $log -Tail 60; throw "install failed: $($p.ExitCode)" }
           if (-not (Get-Service NtlmAgent -ErrorAction SilentlyContinue)) { throw "service missing" }
-          $cfg = "$env:ProgramData\NtlmAgent\config.json"
+          $dir = "$env:ProgramData\NtlmAgent"
+          $cfg = "$dir\config.json"
           if (-not (Test-Path $cfg)) { throw "config.json not written" }
           $j = Get-Content $cfg -Raw | ConvertFrom-Json
           if ($j.collector_url -ne "https://collector.invalid:8443") {
             throw "collector_url not applied: $($j.collector_url)"
           }
-          # This is the recommended silent path: no key on the command line.
-          # Assert that nothing key-shaped ends up in the log for it - an empty
-          # --api-key "" is expected and fine, a filled one would mean someone
-          # hardcoded a secret. Note this cannot prove the interactive path is
-          # log-clean; two attempts to hide a supplied key failed, and the agent
-          # README says so plainly.
-          if (Select-String -Path $log -Pattern '--api-key "[^"]+"' -Quiet) {
-            throw "a non-empty API key reached the install log"
+          if ($j.api_key -ne $secret) { throw "api_key not applied" }
+          if (Select-String -Path $log -Pattern $secret -SimpleMatch -Quiet) {
+            throw "the API key reached the install log"
           }
-          if ($j.api_key -ne "") { throw "api_key should be empty here: '$($j.api_key)'" }
+          $acl = Get-Acl $dir
+          $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+          if ($owner -ne "S-1-5-32-544") { throw "data folder owner is $owner, not Administrators" }
+          if (-not $acl.AreAccessRulesProtected) { throw "data folder still inherits from ProgramData" }
+          $sids = $acl.Access | ForEach-Object {
+            $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
+          } | Sort-Object -Unique
+          if (($sids -join ",") -ne "S-1-5-18,S-1-5-32-544") {
+            throw "unexpected access on the data folder: $($sids -join ', ')"
+          }
+          # The service checks its folder on start and stops if it is not
+          # trusted - still running means that check passed on real Windows.
+          Start-Sleep -Seconds 8
+          $st = (Get-Service NtlmAgent).Status
+          if ($st -ne "Running") { Get-Content "$dir\agent.log" -ErrorAction SilentlyContinue; throw "service not running: $st" }
           $p = Start-Process msiexec -Wait -PassThru -ArgumentList "/x","ntlm-agent.msi","/qn"
           if ($p.ExitCode -ne 0) { throw "uninstall failed: $($p.ExitCode)" }
           if (Get-Service NtlmAgent -ErrorAction SilentlyContinue) { throw "service survived uninstall" }
-          Write-Host "install/uninstall OK, no secret in the log"
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList `
+            "/i","ntlm-agent.msi","/qn","COLLECTORURL=http://collector.invalid:8080"
+          if ($p.ExitCode -eq 0) { throw "an http:// URL was accepted without ALLOWHTTP=1" }
+          if (Get-Service NtlmAgent -ErrorAction SilentlyContinue) { throw "service installed despite http://" }
+          Write-Host "install/uninstall OK, key not in the log, data folder locked down, http refused"
 
       - name: Upload MSI
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           # This is the one to download and double-click.
           name: installer-msi-double-click-this

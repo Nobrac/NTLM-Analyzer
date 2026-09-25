@@ -29,6 +29,7 @@
 mod agent;
 mod config;
 mod eventlog;
+mod secure_dir;
 mod service;
 
 use std::process::exit;
@@ -48,18 +49,19 @@ fn main() {
         }
         "install" => match config::Config::from_args(rest) {
             Ok(cfg) => {
-                if cfg
-                    .collector_url
-                    .trim_start()
-                    .to_ascii_lowercase()
-                    .starts_with("http://")
-                {
+                if cfg.allow_http && cfg.collector_url.trim_start().to_ascii_lowercase().starts_with("http://") {
                     eprintln!(
-                        "WARNING: --collector-url uses HTTP (unencrypted). \
-                         Telemetry and API key travel over the network in clear \
-                         text. Recommendation: switch the collector to HTTPS."
+                        "WARNING: the collector URL uses HTTP (allowed with --allow-http). \
+                         The API key and all findings travel unencrypted."
                     );
                 }
+                // The folder must be ours before the key goes into it.
+                if let Err(e) = service::prepare_data_dir() {
+                    eprintln!("The data folder could not be secured: {e}");
+                    exit(1);
+                }
+                let mut cfg = cfg;
+                cfg.keep_stored_key();
                 if let Err(e) = cfg.save() {
                     eprintln!("Saving the configuration failed: {e}");
                     exit(1);
@@ -97,7 +99,7 @@ fn main() {
                 }
             }
             Err(e) => {
-                eprintln!("Argumentfehler: {e}\n");
+                eprintln!("Argument error: {e}\n");
                 print_usage();
                 exit(2);
             }
@@ -109,23 +111,22 @@ fn main() {
         // shared with `install`.
         "configure" => match config::Config::from_args(rest) {
             Ok(cfg) => {
-                if cfg
-                    .collector_url
-                    .trim_start()
-                    .to_ascii_lowercase()
-                    .starts_with("http://")
-                {
+                if cfg.allow_http && cfg.collector_url.trim_start().to_ascii_lowercase().starts_with("http://") {
                     eprintln!(
-                        "WARNING: --collector-url uses HTTP (unencrypted). \
-                         Telemetry and API key travel over the network in clear \
-                         text. Recommendation: switch the collector to HTTPS."
+                        "WARNING: the collector URL uses HTTP (allowed with --allow-http). \
+                         The API key and all findings travel unencrypted."
                     );
                 }
+                if let Err(e) = service::prepare_data_dir() {
+                    eprintln!("The data folder could not be secured: {e}");
+                    exit(1);
+                }
+                let mut cfg = cfg;
+                cfg.keep_stored_key();
                 if let Err(e) = cfg.save() {
                     eprintln!("Saving the configuration failed: {e}");
                     exit(1);
                 }
-                service::harden_data_dir();
                 println!("Configuration written to {}.", config::config_path().display());
             }
             Err(e) => {
@@ -140,19 +141,27 @@ fn main() {
                 exit(1);
             }
         },
-        "run" => match config::Config::load_or_args(rest) {
-            Ok(cfg) => {
-                if let Err(e) = agent::run_cycle(&cfg) {
-                    eprintln!("Run failed: {e}");
-                    exit(1);
+        "run" => {
+            // Same rule as the service: the data folder must be ours first.
+            #[cfg(windows)]
+            if let Err(e) = secure_dir::check(&config::data_dir()) {
+                eprintln!("{e}");
+                exit(1);
+            }
+            match config::Config::load_or_args(rest) {
+                Ok(cfg) => {
+                    if let Err(e) = agent::run_cycle(&cfg) {
+                        eprintln!("Run failed: {e}");
+                        exit(1);
+                    }
+                    println!("One-off run finished.");
                 }
-                println!("One-off run finished.");
+                Err(e) => {
+                    eprintln!("Config/arguments: {e}");
+                    exit(2);
+                }
             }
-            Err(e) => {
-                eprintln!("Config/arguments: {e}");
-                exit(2);
-            }
-        },
+        }
         _ => print_usage(),
     }
 }
@@ -162,17 +171,22 @@ fn print_usage() {
         "NTLM-Analyzer agent (Windows service)
 
 Usage:
-  ntlm-agent.exe install --collector-url <URL> [--api-key <KEY>]
-                         [--interval <MIN>] [--days-back <N>]
+  ntlm-agent.exe install --collector-url <URL> [--api-key <KEY|*> | --api-key-env <VAR>]
+                         [--interval <MIN>] [--days-back <N>] [--allow-http]
                          [--skip-kerberos] [--enable-outgoing-audit]
                          [--service-account <ACCOUNT> [--service-password <PW|*>]]
         Writes the configuration (C:\\ProgramData\\NtlmAgent\\config.json),
         creates the service (auto-start) and starts it.
+        --api-key * asks for the key without showing it; --api-key-env reads
+        it from an environment variable. Both keep it out of the command line.
+        Without a key option the key already stored is kept.
+        The URL must use https://; http:// only with --allow-http.
         Without --service-account the service runs as LocalSystem.
         With --service-account it runs under that account; a gMSA is detected
         by the trailing '$' and needs no password
         (e.g. --service-account \"DOM\\gmsa-ntlm$\").
 
+  ntlm-agent.exe configure ...  Same options as install, writes the configuration only.
   ntlm-agent.exe uninstall      Stop and remove the service.
   ntlm-agent.exe run [args]     One-off cycle in the console (for testing).
   ntlm-agent.exe service        Invoked by the service control manager.

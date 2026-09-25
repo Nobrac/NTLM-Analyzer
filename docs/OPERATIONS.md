@@ -213,7 +213,8 @@ The enhanced 40xx auditing (Windows 11 24H2 / Server 2025) is **enabled by defau
 
 | Command | Purpose |
 | --- | --- |
-| `install --collector-url <URL> [--api-key K] [--interval MIN] [--days-back N] [--skip-kerberos] [--enable-outgoing-audit] [--service-account A [--service-password P|*]]` | Writes the config, installs and starts the service. Default account: LocalSystem; a trailing `$` marks a gMSA (no password). `--service-password *` prompts with hidden input, keeping the password out of the shell history and out of command-line auditing (event 4688). See the agent README for the required rights. |
+| `install --collector-url <URL> [--api-key K\|* \| --api-key-env VAR] [--allow-http] [--interval MIN] [--days-back N] [--skip-kerberos] [--enable-outgoing-audit] [--service-account A [--service-password P|*]]` | Writes the config, installs and starts the service. Default account: LocalSystem; a trailing `$` marks a gMSA (no password). `--api-key *` and `--service-password *` prompt with hidden input, `--api-key-env` reads the key from an environment variable - both keep secrets out of the shell history and out of command-line auditing (event 4688). The URL must use https:// unless `--allow-http` is given. See the agent README for the required rights. |
+| `configure ...` | Same options as `install`; writes the configuration only (what the MSI uses). Without a key option the stored key is kept; `--clear-api-key` removes it. |
 | `uninstall` | Stops and removes the service |
 | `run` | One-off collect/push cycle in the console (for testing) |
 | `service` | Internal — invoked by the service control manager |
@@ -342,6 +343,8 @@ correctly, each in their own local time — and "peak on Sunday at 03:00" means
 
 ```
 README.md                     the short front page
+CHANGELOG.md                  what changed in which version
+SECURITY.md                   how to report a vulnerability privately
 LICENSE                       GPL-3.0
 .gitignore                    keeps databases, logs, certificates and build output out of git
 .github/workflows/            CI: build-agent.yml (EXE, with the agent's unit tests) and
@@ -363,7 +366,8 @@ ntlm-agent-rs/                the Windows agent (Rust)
 ├── README.md                 build, install and service control
 ├── build.rs                  embeds the icon and version resource into the EXE
 ├── Cargo.toml
-└── src/                      main, config, eventlog, agent, service
+├── Cargo.lock                exact dependency versions; builds use --locked
+└── src/                      main, config, eventlog, agent, service, secure_dir
 ```
 
 Running the tests locally, from the repository root:

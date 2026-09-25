@@ -24,13 +24,15 @@
 //! `winreg` crates and is only compiled for the Windows target. Other targets
 //! get stubs with identical signatures so the project type-checks everywhere.
 
+#[cfg_attr(not(windows), allow(dead_code))]
 const SERVICE_NAME: &str = "NtlmAgent";
+#[cfg_attr(not(windows), allow(dead_code))]
 const DISPLAY_NAME: &str = "NTLM-Analyzer Agent";
 
 #[cfg(not(windows))]
-pub use stub_impl::{harden_data_dir, install, run, uninstall};
+pub use stub_impl::{install, prepare_data_dir, run, uninstall};
 #[cfg(windows)]
-pub use windows_impl::{harden_data_dir, install, run, uninstall};
+pub use windows_impl::{install, prepare_data_dir, run, uninstall};
 
 #[cfg(windows)]
 mod windows_impl {
@@ -90,6 +92,23 @@ mod windows_impl {
 
         let status_handle = service_control_handler::register(SERVICE_NAME, event_handler)?;
 
+        // Before the first byte goes into the data folder: is it ours? If not,
+        // stop with a service-specific error (logged by the SCM as event 7024)
+        // rather than write the log into a folder someone else controls.
+        if let Err(e) = crate::secure_dir::check(&config::data_dir()) {
+            eprintln!("{e}");
+            status_handle.set_service_status(ServiceStatus {
+                service_type: SERVICE_TYPE,
+                current_state: ServiceState::Stopped,
+                controls_accepted: ServiceControlAccept::empty(),
+                exit_code: ServiceExitCode::ServiceSpecific(1),
+                checkpoint: 0,
+                wait_hint: Duration::default(),
+                process_id: None,
+            })?;
+            return Ok(());
+        }
+
         let set_state = |state: ServiceState, accept: ServiceControlAccept| -> R {
             status_handle.set_service_status(ServiceStatus {
                 service_type: SERVICE_TYPE,
@@ -119,6 +138,16 @@ mod windows_impl {
                 return Ok(());
             }
         };
+
+        // Configurations from before 2.3.1 may still name an http:// collector.
+        // They keep working - an upgrade must not cut machines off - but the log
+        // says each start what that means.
+        if cfg.collector_url.trim_start().to_ascii_lowercase().starts_with("http://") {
+            config::log(
+                "WARNING: the collector URL uses http:// - the API key and all findings travel \
+                 unencrypted. Switch the collector to HTTPS and run 'configure' with https://.",
+            );
+        }
 
         let interval = Duration::from_secs(u64::from(cfg.interval_minutes.max(1)) * 60);
 
@@ -164,44 +193,20 @@ mod windows_impl {
         }
     }
 
-    /// Restricts the ACL of C:\ProgramData\NtlmAgent to SYSTEM and Administrators
-    /// (by SID, so it works regardless of the system language). Prevents normal
-    /// users from redirecting config.json - and with it the telemetry target.
-    /// Not fatal: if icacls fails it is logged and the installation continues.
-    /// Public so the `configure` path (used by the MSI, which owns the files
-    /// and the service itself) can lock the data folder down without going
-    /// through the full `install`.
-    pub fn harden_data_dir() {
-        let dir = config::data_dir();
-        let _ = std::fs::create_dir_all(&dir);
-        let status = std::process::Command::new(config::system32("icacls.exe"))
-            .arg(&dir)
-            .args([
-                "/inheritance:r",
-                "/grant:r",
-                "*S-1-5-18:(OI)(CI)F", // SYSTEM
-                "*S-1-5-32-544:(OI)(CI)F", // BUILTIN\Administrators
-            ])
-            .status();
-        match status {
-            Ok(s) if s.success() => {
-                config::log("Data folder ACL restricted to SYSTEM + Administrators.")
-            }
-            Ok(s) => config::log(&format!(
-                "icacls exited with status {s} - please check the data folder ACL manually."
-            )),
-            Err(e) => config::log(&format!(
-                "could not run icacls: {e} - please set the data folder ACL manually."
-            )),
-        }
+    /// Makes C:\ProgramData\NtlmAgent ours before anything is written to it
+    /// (see secure_dir). Called by `install` and `configure` - the MSI uses
+    /// the latter - before the configuration with the API key is saved. An
+    /// error stops the installation: an unprotected folder is not an option.
+    pub fn prepare_data_dir() -> Result<(), String> {
+        crate::secure_dir::prepare(&config::data_dir())?;
+        config::log("Data folder checked: owned by Administrators, access for SYSTEM + Administrators only.");
+        Ok(())
     }
 
     /// Create the service (auto-start), configure auto-restart and start it.
     pub fn install(cfg: &config::Config) -> R {
-        // Protect the data folder (config.json/state.json/agent.log) from tampering
-        // by normal users - done here because install has admin rights.
-        harden_data_dir();
-        // A dedicated service account needs write access to the data folder
+        // The data folder was prepared by main before the configuration was
+        // written. A dedicated service account needs write access to the data folder
         // (state.json, agent.log) - SYSTEM+Administrators is not enough then.
         if let Some(acct) = &cfg.service_account {
             let dir = config::data_dir();
@@ -386,7 +391,9 @@ mod stub_impl {
     pub fn run() -> R {
         not_supported()
     }
-    pub fn harden_data_dir() {}
+    pub fn prepare_data_dir() -> Result<(), String> {
+        Ok(())
+    }
     pub fn install(_cfg: &config::Config) -> R {
         not_supported()
     }

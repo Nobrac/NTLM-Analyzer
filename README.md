@@ -152,8 +152,10 @@ double-click, or unattended:
 msiexec /i ntlm-agent.msi /qn COLLECTORURL=https://collector.example.local:8443
 ```
 
-Or with the bare EXE: `ntlm-agent.exe install --collector-url https://… --api-key …`
-— copies itself to Program Files, hardens ACLs, registers and starts the service.
+Or with the bare EXE: `ntlm-agent.exe install --collector-url https://… --api-key *`
+(asks for the key) — copies itself to Program Files, secures its data folder,
+registers and starts the service. The URL must be `https://`; plain `http://`
+only with `--allow-http` (MSI: `ALLOWHTTP=1`).
 
 ### 4. Open the dashboard
 

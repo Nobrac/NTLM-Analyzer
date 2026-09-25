@@ -66,8 +66,11 @@ Watermarks are kept **per source/purpose** (`Security#4624`, `Security#4769`,
 Prerequisite: Rust toolchain (`rustup`, MSVC target).
 
 ```cmd
-cargo build --release
+cargo build --release --locked
+cargo test --release --locked
 ```
+
+`--locked` builds exactly the dependency versions in `Cargo.lock`.
 
 Result: `target\release\ntlm-agent.exe` (a single, dependency-free EXE).
 
@@ -82,68 +85,63 @@ ntlm-agent.exe install --collector-url https://collector.example.local:8443
 ```
 
 > **Security:** `install` copies the EXE itself to `C:\Program Files\NtlmAgent\`
-> and registers the service from there — so the SYSTEM service never runs from a
-> user-writable folder (e.g. Downloads). It therefore does not matter where you
-> run `install` from. In addition, `install` automatically restricts the ACL of
-> `C:\ProgramData\NtlmAgent\` to SYSTEM + Administrators (SID-based, locale-independent)
-> so regular users cannot tamper with `config.json`. For production, the collector
-> should be reachable over **HTTPS**; with `http://`, `install` prints a warning
-> because telemetry and API key would otherwise travel in cleartext.
+> and registers the service from there, so the SYSTEM service never runs from a
+> user-writable folder (e.g. Downloads). The data folder
+> `C:\ProgramData\NtlmAgent\` is made safe **before** anything is written to it:
+> a folder that someone else created beforehand (any user may create folders in
+> ProgramData) or that is a link is moved aside, and a fresh one is created that
+> belongs to Administrators and is accessible to SYSTEM and Administrators only.
+> If that cannot be done, installation stops. The service checks the same when
+> it starts and refuses to run from a folder that is not safe.
+>
+> The collector URL must use **https://**. `http://` is refused unless you add
+> `--allow-http` (MSI: `ALLOWHTTP=1`), because the API key and every reported
+> logon would otherwise cross the network unencrypted. Configurations from
+> before 2.3.1 that use http:// keep working; the log warns at every start.
 
 ```cmd
-:: more options:
+:: more options (--api-key * asks for the key without showing it):
 ntlm-agent.exe install --collector-url https://collector.example.local:8443 ^
-    --api-key SECRET123 --interval 15 --days-back 1 ^
+    --api-key * --interval 15 --days-back 1 ^
     --skip-kerberos --enable-outgoing-audit
 
 :: stop and remove the service
 ntlm-agent.exe uninstall
+```
 
-### The API key and the installer
+### The API key
 
-The wizard has a masked field for it and the property is marked hidden, so it
-stays out of the property table in a log. **That is not the same as safe.** Two
-attempts to keep a supplied key out of a verbose install log failed: the value
-reaches the log through the helper action that runs the configuration command,
-not through the property table. So:
+A key typed on a command line ends up in the shell history, in the process
+list and - where command-line auditing is on - in event 4688. So there are two
+ways to hand it over without that:
 
-- **Interactive install, no verbose log** - fine. A plain double-click writes no
-  verbose log at all.
-- **`msiexec /l*v`** - assume the key is in that log file. Delete it afterwards.
-- **Silent install with `APIKEY=` on the command line** - the key is visible in
-  the process list while the installer runs, and on machines with command-line
-  auditing it lands in event 4688. Nothing in the installer can prevent that.
+- `--api-key *` asks for it, without showing what you type.
+- `--api-key-env NAME` reads it from an environment variable - for scripts and
+  software distribution, where the variable comes from a secret store.
 
-For an unattended rollout, leave the key out of the MSI and set it separately:
+`configure` without any key option keeps the key already stored, so changing
+the URL or upgrading the MSI does not wipe it. `--clear-api-key` removes it.
+
+**Installer.** The wizard's key field is masked, the property is hidden, and the
+action that writes the configuration hides its command line from the install
+log, so a verbose log (`msiexec /l*v`) does not contain the key. On an msiexec
+command line (`APIKEY=...`) the key is still visible in the process list while
+the installer runs. For unattended rollouts, install without it and set it
+afterwards:
 
 ```cmd
 msiexec /i ntlm-agent.msi /qn COLLECTORURL=https://collector.example.local:8443
 "C:\Program Files\NtlmAgent\ntlm-agent.exe" configure ^
-    --collector-url https://collector.example.local:8443 --api-key SECRET123
+    --collector-url https://collector.example.local:8443 --api-key-env NTLM_API_KEY
 sc stop NtlmAgent && sc start NtlmAgent
 ```
 
-If the collector runs without `the key switch`, leave the field empty - nothing is
-checked then.
-
-
-For an unattended rollout, run step 2 from the same script that deploys the MSI
-so the key never sits in a stored install command. If the collector runs without
-`--key`, skip step 2 entirely - no key is checked then.
+If the collector runs without `--key`, no key is checked and none is needed.
 
 ```cmd
-:: install without the key, then set it once, interactively
-msiexec /i ntlm-agent.msi /qn COLLECTORURL=https://collector.example.local:8443
-ntlm-agent.exe configure --collector-url https://collector.example.local:8443 --api-key SECRET123
-```
-
-Or deploy a per-machine key that is worth little on its own. The collector only
-checks the key at all when it was started with `--key`.
-
 :: write or change the configuration only - no file copy, no service changes.
-:: Useful to correct the collector URL or the API key on a machine that is
-:: already installed.
-ntlm-agent.exe configure --collector-url https://collector.example.local:8443 --api-key SECRET123
+:: Useful to correct the collector URL or the API key on an installed machine.
+ntlm-agent.exe configure --collector-url https://collector.example.local:8443 --api-key *
 ```
 
 The configuration lives in `C:\ProgramData\NtlmAgent\config.json`; watermarks in
@@ -186,6 +184,7 @@ service the agent runs as `LocalSystem` and has them automatically.
 | `src/eventlog.rs` | Reading event logs via `wevtutil` + XML parsing |
 | `src/agent.rs` | One collect/push cycle (4624/4769/8004/8001 + status) |
 | `src/service.rs` | Windows service: dispatcher, control handler, install/uninstall |
+| `src/secure_dir.rs` | Makes the data folder safe before use (owner, links, ACL) |
 
 ## Running under a service account or gMSA (least privilege)
 
@@ -194,11 +193,11 @@ run under a dedicated account instead:
 
 ```cmd
 :: classic service account
-ntlm-agent.exe install --collector-url https://collector:8443 --api-key KEY ^
-    --service-account "DOM\svc-ntlm" --service-password "..."
+ntlm-agent.exe install --collector-url https://collector:8443 --api-key * ^
+    --service-account "DOM\svc-ntlm" --service-password *
 
 :: group managed service account (gMSA) - no password, Windows retrieves it from AD
-ntlm-agent.exe install --collector-url https://collector:8443 --api-key KEY ^
+ntlm-agent.exe install --collector-url https://collector:8443 --api-key * ^
     --service-account "DOM\gmsa-ntlm$"
 ```
 

@@ -184,6 +184,8 @@ pub fn parse_events(xml: &str) -> Result<Vec<RawEvent>, String> {
 
         let mut named: HashMap<String, String> = HashMap::new();
         let mut positional: Vec<String> = Vec::new();
+        // Uncapped originals, only to neutralise them in the message below.
+        let mut multiline: Vec<String> = Vec::new();
 
         if let Some(ed) = child_node(&ev, "EventData") {
             for d in ed
@@ -196,7 +198,11 @@ pub fn parse_events(xml: &str) -> Result<Vec<RawEvent>, String> {
                 // ingest batch past the collector's body limit - that would 413
                 // forever and pin the watermark in place. 4 KB keeps every
                 // legitimate value intact (SPNs, paths, messages).
-                let val = cap(d.text().unwrap_or(""));
+                let text = d.text().unwrap_or("");
+                if text.contains(['\r', '\n']) {
+                    multiline.push(text.to_string());
+                }
+                let val = cap(text);
                 positional.push(val.clone());
                 if let Some(name) = d.attribute("Name") {
                     named.insert(name.to_string(), val);
@@ -205,7 +211,11 @@ pub fn parse_events(xml: &str) -> Result<Vec<RawEvent>, String> {
         } else if let Some(ud) = child_node(&ev, "UserData") {
             if let Some(inner) = ud.children().find(|n| n.is_element()) {
                 for d in inner.children().filter(|n| n.is_element()) {
-                    let val = cap(d.text().unwrap_or(""));
+                    let text = d.text().unwrap_or("");
+                    if text.contains(['\r', '\n']) {
+                        multiline.push(text.to_string());
+                    }
+                    let val = cap(text);
                     positional.push(val.clone());
                     named.insert(d.tag_name().name().to_string(), val);
                 }
@@ -215,7 +225,7 @@ pub fn parse_events(xml: &str) -> Result<Vec<RawEvent>, String> {
         // With /f:RenderedXml the rendered text lives under RenderingInfo/Message.
         let message = child_node(&ev, "RenderingInfo")
             .and_then(|ri| child_text(&ri, "Message"))
-            .map(|m| m.trim().to_string())
+            .map(|m| neutralize(m.trim(), &multiline))
             .filter(|m| !m.is_empty());
 
         out.push(RawEvent {
@@ -243,6 +253,32 @@ fn child_text(parent: &roxmltree::Node, name: &str) -> Option<String> {
     child_node(parent, name).and_then(|n| n.text().map(|t| t.to_string()))
 }
 
+/// The rendered message is read line by line ("NTLM Version: NTLMv1"), and
+/// some of the values inside it come from the remote client - its user and
+/// workstation name. A name with a line break and "NTLM Version: NTLMv2" in it
+/// would otherwise add a line of its own, found before the real one, and pass
+/// an NTLMv1 logon off as NTLMv2. So every value that contains a line break
+/// is flattened in the message before anyone reads it.
+pub(crate) fn neutralize(message: &str, values: &[String]) -> String {
+    const MAX_MESSAGE: usize = 64 * 1024;
+    let mut out = message.to_string();
+    for v in values {
+        let flat: String = v.chars().map(|c| if c == '\r' || c == '\n' { ' ' } else { c }).collect();
+        // Windows may render a line break inside an insertion as CRLF.
+        let crlf = v.replace("\r\n", "\n").replace('\n', "\r\n");
+        for form in [v.as_str(), crlf.as_str()] {
+            if !form.is_empty() && out.contains(form) {
+                out = out.replace(form, &flat);
+            }
+        }
+    }
+    // Only read for labels; a legitimate message is a few hundred bytes.
+    if out.len() > MAX_MESSAGE {
+        out = cap_at(&out, MAX_MESSAGE);
+    }
+    out
+}
+
 fn cap(s: &str) -> String {
     const MAX: usize = 4096;
     if s.len() <= MAX {
@@ -250,6 +286,18 @@ fn cap(s: &str) -> String {
     }
     // Cut on a char boundary so multi-byte characters cannot cause a panic.
     let mut end = MAX;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
+}
+
+/// Cut on a char boundary.
+pub(crate) fn cap_at(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
     while end > 0 && !s.is_char_boundary(end) {
         end -= 1;
     }

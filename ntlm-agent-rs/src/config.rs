@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// Version reported with every status push (shown in the dashboard).
-pub const AGENT_VERSION: &str = "2.3.0";
+pub const AGENT_VERSION: &str = "2.3.1";
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Config {
@@ -36,6 +36,15 @@ pub struct Config {
     pub skip_kerberos: bool,
     #[serde(default)]
     pub enable_outgoing_audit: bool,
+    /// Accept an http:// collector URL. Off by default: over plain HTTP the
+    /// API key and every reported logon cross the network readable.
+    #[serde(default)]
+    pub allow_http: bool,
+    /// Whether this run was given a key at all (--api-key / --api-key-env).
+    /// Without one, `configure` keeps the key already stored, so changing
+    /// the URL or an MSI upgrade does not silently wipe it.
+    #[serde(skip)]
+    pub api_key_given: bool,
     /// Service account used at install time (e.g. "DOM\\svc-ntlm" or the gMSA
     /// "DOM\\gmsa-ntlm$"). NOT stored in config.json - the credentials are
     /// managed by the Windows service manager itself.
@@ -63,6 +72,8 @@ impl Default for Config {
             days_back: 1,
             skip_kerberos: false,
             enable_outgoing_audit: false,
+            allow_http: false,
+            api_key_given: false,
             service_account: None,
             service_password: None,
         }
@@ -142,8 +153,9 @@ impl Config {
         serde_json::from_str(&s).map_err(|e| e.to_string())
     }
 
+    /// The data folder must exist already: `prepare_data_dir` creates it with
+    /// its protection. Creating it here would give it ProgramData's defaults.
     pub fn save(&self) -> Result<(), String> {
-        std::fs::create_dir_all(data_dir()).map_err(|e| e.to_string())?;
         let s = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
         std::fs::write(config_path(), s).map_err(|e| e.to_string())
     }
@@ -163,8 +175,30 @@ impl Config {
                 }
                 "--api-key" => {
                     i += 1;
-                    c.api_key = args.get(i).cloned().ok_or("--api-key requires a value")?;
+                    let v = args.get(i).cloned().ok_or("--api-key requires a value")?;
+                    // "*" = prompt without echo. A key typed on the command line
+                    // lands in the shell history, the process list and - with
+                    // command-line auditing - in event 4688.
+                    c.api_key = if v == "*" { prompt_password("API key: ")? } else { v };
+                    // An empty value (what the MSI passes when no key was entered)
+                    // means "not given": the stored key stays.
+                    c.api_key_given = !c.api_key.is_empty();
                 }
+                "--api-key-env" => {
+                    i += 1;
+                    let name = args.get(i).cloned().ok_or("--api-key-env requires a variable name")?;
+                    c.api_key = std::env::var(&name)
+                        .map_err(|_| format!("environment variable {name} is not set"))?;
+                    if c.api_key.is_empty() {
+                        return Err(format!("environment variable {name} is empty"));
+                    }
+                    c.api_key_given = true;
+                }
+                "--clear-api-key" => {
+                    c.api_key.clear();
+                    c.api_key_given = true;
+                }
+                "--allow-http" => c.allow_http = true,
                 "--interval" => {
                     i += 1;
                     c.interval_minutes = args
@@ -220,6 +254,7 @@ impl Config {
         if c.collector_url.trim().is_empty() {
             return Err("--collector-url is required".into());
         }
+        check_url(&c.collector_url, c.allow_http)?;
         // Validate the service account early instead of failing at the SCM call.
         if c.service_password.is_some() && c.service_account.is_none() {
             return Err("--service-password without --service-account makes no sense".into());
@@ -246,6 +281,15 @@ impl Config {
         Ok(c)
     }
 
+    /// For install/configure: keep the stored key when this run was given none.
+    pub fn keep_stored_key(&mut self) {
+        if !self.api_key_given {
+            if let Ok(old) = Config::load() {
+                self.api_key = old.api_key;
+            }
+        }
+    }
+
     /// For `run`: load the stored configuration when no arguments are given.
     pub fn load_or_args(args: &[String]) -> Result<Config, String> {
         if args.is_empty() {
@@ -253,6 +297,24 @@ impl Config {
         } else {
             Config::from_args(args)
         }
+    }
+}
+
+/// https:// always; http:// only when asked for; anything else is a typo.
+pub fn check_url(url: &str, allow_http: bool) -> Result<(), String> {
+    let u = url.trim().to_ascii_lowercase();
+    if u.starts_with("https://") && u.len() > "https://".len() {
+        Ok(())
+    } else if u.starts_with("http://") {
+        if allow_http {
+            Ok(())
+        } else {
+            Err("the collector URL uses http:// - the API key and all findings would \
+                 travel unencrypted. Use https://, or add --allow-http to accept that."
+                .into())
+        }
+    } else {
+        Err(format!("the collector URL must start with https:// (got '{url}')"))
     }
 }
 
@@ -264,7 +326,6 @@ pub fn load_state() -> HashMap<String, i64> {
 }
 
 pub fn save_state(s: &HashMap<String, i64>) -> Result<(), String> {
-    std::fs::create_dir_all(data_dir()).map_err(|e| e.to_string())?;
     let body = serde_json::to_string(s).map_err(|e| e.to_string())?;
     // Atomic: write to a temp file first, then rename. That way a power loss
     // in the middle of a write cannot leave a half-written (and therefore
@@ -276,8 +337,8 @@ pub fn save_state(s: &HashMap<String, i64>) -> Result<(), String> {
 }
 
 /// Simple logging to C:\ProgramData\NtlmAgent\agent.log (+ stderr).
+/// Never creates the data folder (see `save`): without it, only stderr.
 pub fn log(msg: &str) {
-    let _ = std::fs::create_dir_all(data_dir());
     // Rotation: once agent.log grows past ~5 MB it becomes agent.log.1 (a
     // single generation, the older one is replaced). The service runs
     // permanently - without a cap the file would grow without bound.
@@ -299,4 +360,49 @@ pub fn log(msg: &str) {
         let _ = writeln!(f, "[{ts}] {msg}");
     }
     eprintln!("{msg}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn https_is_required_unless_allowed() {
+        assert!(Config::from_args(&args(&["--collector-url", "https://c:8443"])).is_ok());
+        assert!(Config::from_args(&args(&["--collector-url", "http://c:8080"])).is_err());
+        assert!(Config::from_args(&args(&["--collector-url", "http://c:8080", "--allow-http"])).is_ok());
+        assert!(Config::from_args(&args(&["--collector-url", "c:8080"])).is_err());
+        assert!(Config::from_args(&args(&["--collector-url", "https://"])).is_err());
+    }
+
+    #[test]
+    fn key_from_the_environment() {
+        std::env::set_var("NTLM_TEST_KEY_1", "s3cret");
+        let c = Config::from_args(&args(&["--collector-url", "https://c", "--api-key-env", "NTLM_TEST_KEY_1"])).unwrap();
+        assert_eq!(c.api_key, "s3cret");
+        assert!(c.api_key_given);
+        assert!(Config::from_args(&args(&["--collector-url", "https://c", "--api-key-env", "NTLM_TEST_UNSET_9"])).is_err());
+    }
+
+    #[test]
+    fn an_empty_key_means_not_given() {
+        let c = Config::from_args(&args(&["--collector-url", "https://c", "--api-key", ""])).unwrap();
+        assert!(!c.api_key_given);
+        let c = Config::from_args(&args(&["--collector-url", "https://c", "--api-key", "k"])).unwrap();
+        assert!(c.api_key_given);
+        let c = Config::from_args(&args(&["--collector-url", "https://c", "--clear-api-key"])).unwrap();
+        assert!(c.api_key_given && c.api_key.is_empty());
+    }
+
+    #[test]
+    fn switches_that_the_service_does_not_need_are_not_stored() {
+        let c = Config::from_args(&args(&["--collector-url", "https://c", "--api-key", "k"])).unwrap();
+        let json = serde_json::to_string(&c).unwrap();
+        assert!(!json.contains("api_key_given"));
+        assert!(json.contains("\"allow_http\":false"));
+    }
 }
