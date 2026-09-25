@@ -32,7 +32,7 @@ jobs:
       matrix:
         python: ["3.7", "3.13"]
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Run tests
         run: python -m unittest discover -s tests -v
 
@@ -40,7 +40,7 @@ jobs:
     name: Dashboard JavaScript syntax
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Parse every embedded script with Node
         run: python3 tests/check_dashboard_js.py
 
@@ -48,7 +48,7 @@ jobs:
     name: Agent dependencies (known vulnerabilities)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Checks Cargo.lock against the RustSec advisory database. Fails on a
       # known vulnerability; "unmaintained" notices are shown but do not fail.
       - name: cargo audit
