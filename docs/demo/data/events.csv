@@ -1,10 +1,10 @@
 ﻿Time (UTC);Machine;Kind;EventID;NTLM version;Auth path;User;Domain;Process;Target;Source/Workstation;IP;Logon type;Encryption;Reason;Reason ID;MIC;Channel binding;Server OS;Kerberos failure;Process path
+2026-09-25T18:35:22;FS01;incoming;4624;;Direct;ANONYMOUS LOGON;NT AUTHORITY;;;MFP-3F-02;;3;;;;;;;;
 2026-09-25T18:30:00;DC01;policyblock;100;;Blocked;t0-admin;DEMO;;;PAW-01;;;;;;;;;0xC000006E;
 2026-09-25T17:59:19;DC02;kerberos;4769;;;s.wagner@DEMO.NOPCAP.NET;DEMO;;cifs/fs01.demo.nopcap.net;;;;AES256;;;;;;;
 2026-09-25T17:56:50;DC02;kerberos;4769;;;k.lorenz@DEMO.NOPCAP.NET;DEMO;;cifs/fs01.demo.nopcap.net;;;;AES256;;;;;;;
 2026-09-25T17:53:49;DC02;kerberos;4769;;;svc_web@DEMO.NOPCAP.NET;DEMO;;cifs/fs01.demo.nopcap.net;;;;AES256;;;;;;;
 2026-09-25T17:53:04;DC01;kerberos;4769;;;svc_backup@DEMO.NOPCAP.NET;DEMO;;ldap/dc02.demo.nopcap.net;;;;AES256;;;;;;;
-2026-09-25T17:52:34;FS01;incoming;4624;;Direct;ANONYMOUS LOGON;NT AUTHORITY;;;MFP-3F-02;;3;;;;;;;;
 2026-09-25T17:32:26;DC01;kerberos;4769;;;j.schulz@DEMO.NOPCAP.NET;DEMO;;ldap/dc01.demo.nopcap.net;;;;AES256;;;;;;;
 2026-09-25T17:30:00;DC01;policywarn;301;;;t1-srvadmin;DEMO;;FS01;;;;;;;;;;;
 2026-09-25T17:27:12;APP03;outgoing;8001;;;svc_web;DEMO;svchost.exe;ldap/dc01.demo.nopcap.net;;;;;;;;;;;C:\Windows\System32\svchost.exe
@@ -202,8 +202,8 @@
 2026-09-25T08:12:21;DC01;kerberos;4769;;;NB-1133$@DEMO.NOPCAP.NET;DEMO;;ldap/dc01.demo.nopcap.net;;;;AES256;;;;;;;
 2026-09-25T08:04:05;DC01;kerberos;4769;;;svc_sql@DEMO.NOPCAP.NET;DEMO;;TERMSRV/vdi-broker.demo.nopcap.net;;;;AES256;;;;;;;
 2026-09-25T08:02:07;DC02;kerberos;4769;;;svc_backup@DEMO.NOPCAP.NET;DEMO;;HOST/app03.demo.nopcap.net;;;;AES256;;;;;;;
-2026-09-25T06:52:34;FS01;incoming;4624;;Direct;ANONYMOUS LOGON;NT AUTHORITY;;;MFP-3F-02;;3;;;;;;;;
-2026-09-24T19:52:34;FS01;incoming;4624;;Direct;ANONYMOUS LOGON;NT AUTHORITY;;;MFP-3F-02;;3;;;;;;;;
+2026-09-25T07:35:22;FS01;incoming;4624;;Direct;ANONYMOUS LOGON;NT AUTHORITY;;;MFP-3F-02;;3;;;;;;;;
+2026-09-24T20:35:22;FS01;incoming;4624;;Direct;ANONYMOUS LOGON;NT AUTHORITY;;;MFP-3F-02;;3;;;;;;;;
 2026-09-24T17:56:16;DC01;kerberos;4769;;;VDI-067$@DEMO.NOPCAP.NET;DEMO;;cifs/fs01.demo.nopcap.net;;;;AES256;;;;;;;
 2026-09-24T17:48:47;DC01;kerberos;4769;;;svc_monitor@DEMO.NOPCAP.NET;DEMO;;ldap/dc02.demo.nopcap.net;;;;AES256;;;;;;;
 2026-09-24T17:40:48;DC01;kerberos;4769;;;s.wagner@DEMO.NOPCAP.NET;DEMO;;TERMSRV/vdi-broker.demo.nopcap.net;;;;AES256;;;;;;;
@@ -403,6 +403,7 @@
 2026-09-24T09:56:45;DC01;kerberos;4769;;;k.lorenz@DEMO.NOPCAP.NET;DEMO;;HTTP/portal.demo.nopcap.net;;;;AES256;;;;;;;
 2026-09-24T09:38:21;FS01;outgoing;8001;;;administrator;DEMO;Veeam.Backup.Service.exe;cifs/nas01;;;;;;;;;;;C:\Program Files\Veeam\Backup and Replication\Backup\Veeam.Backup.Service.exe
 2026-09-24T09:36:45;FS01;outgoing;8001;;;svc_monitor;DEMO;mmc.exe;cifs/10.14.22.31;;;;;;;;;;;C:\Windows\System32\mmc.exe
+2026-09-24T09:35:22;FS01;incoming;4624;;Direct;ANONYMOUS LOGON;NT AUTHORITY;;;MFP-3F-02;;3;;;;;;;;
 2026-09-24T09:29:00;DC02;kerberos;4769;;;svc_monitor@DEMO.NOPCAP.NET;DEMO;;HOST/app03.demo.nopcap.net;;;;AES256;;;;;;;
 2026-09-24T09:26:40;DC01;domain;8004;;;d.fischer;DEMO;;ARCHIVE01;NB-1131;;;;;;;;;;
 2026-09-24T09:25:09;DC02;kerberos;4769;;;k.lorenz@DEMO.NOPCAP.NET;DEMO;;HTTP/portal.demo.nopcap.net;;;;AES256;;;;;;;
@@ -419,14 +420,13 @@
 2026-09-24T09:03:20;DC01;kerberos;4769;;;svc_backup@DEMO.NOPCAP.NET;DEMO;;ldap/dc01.demo.nopcap.net;;;;AES256;;;;;;;
 2026-09-24T08:54:10;DC01;kerberos;4769;;;WKS-0371$@DEMO.NOPCAP.NET;DEMO;;TERMSRV/vdi-broker.demo.nopcap.net;;;;AES256;;;;;;;
 2026-09-24T08:54:01;DC01;kerberos;4769;;;t.hoffmann@DEMO.NOPCAP.NET;DEMO;;TERMSRV/vdi-broker.demo.nopcap.net;;;;AES256;;;;;;;
-2026-09-24T08:52:34;FS01;incoming;4624;;Direct;ANONYMOUS LOGON;NT AUTHORITY;;;MFP-3F-02;;3;;;;;;;;
 2026-09-24T08:50:59;FS01;outgoing;8001;;;s.wagner;DEMO;System;cifs/fs01.demo.nopcap.net;;;;;;;;;;;
 2026-09-24T08:45:15;DC02;kerberos;4769;;;administrator@DEMO.NOPCAP.NET;DEMO;;cifs/fs01.demo.nopcap.net;;;;AES256;;;;;;;
 2026-09-24T08:44:29;DC02;kerberos;4769;;;svc_web@DEMO.NOPCAP.NET;DEMO;;TERMSRV/vdi-broker.demo.nopcap.net;;;;AES256;;;;;;;
 2026-09-24T08:43:52;FS01;outgoing;8001;;;svc_web;DEMO;msedge.exe;HTTP/intranet;;;;;;;;;;;C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe
 2026-09-24T08:25:47;DC01;kerberos;4769;;;WKS-0232$@DEMO.NOPCAP.NET;DEMO;;HTTP/portal.demo.nopcap.net;;;;AES256;;;;;;;
 2026-09-24T08:02:08;DC02;kerberos;4769;;;s.wagner@DEMO.NOPCAP.NET;DEMO;;MSSQLSvc/sql01.demo.nopcap.net:1433;;;;AES256;;;;;;;
-2026-09-23T21:52:34;FS01;incoming;4624;;Direct;ANONYMOUS LOGON;NT AUTHORITY;;;MFP-3F-02;;3;;;;;;;;
+2026-09-23T22:35:22;FS01;incoming;4624;;Direct;ANONYMOUS LOGON;NT AUTHORITY;;;MFP-3F-02;;3;;;;;;;;
 2026-09-23T17:59:33;DC02;kerberos;4769;;;m.becker@DEMO.NOPCAP.NET;DEMO;;cifs/fs01.demo.nopcap.net;;;;AES256;;;;;;;
 2026-09-23T17:47:37;APP03;outgoing;8001;;;administrator;DEMO;explorer.exe;cifs/fs01.demo.nopcap.net;;;;;;;;;;;C:\Windows\explorer.exe
 2026-09-23T17:47:30;DC01;kerberos;4769;;;WKS-0202$@DEMO.NOPCAP.NET;DEMO;;ldap/dc02.demo.nopcap.net;;;;AES256;;;;;;;
@@ -574,6 +574,7 @@
 2026-09-23T11:54:11;DC01;kerberos;4769;;;WKS-0275$@DEMO.NOPCAP.NET;DEMO;;MSSQLSvc/sql01.demo.nopcap.net:1433;;;;AES256;;;;;;;
 2026-09-23T11:46:59;FS01;outgoing;8001;;;k.lorenz;DEMO;mmc.exe;cifs/10.14.22.31;;;;;;;;;;;C:\Windows\System32\mmc.exe
 2026-09-23T11:41:35;DC01;kerberos;4769;;;VDI-058$@DEMO.NOPCAP.NET;DEMO;;TERMSRV/vdi-broker.demo.nopcap.net;;;;AES256;;;;;;;
+2026-09-23T11:35:22;FS01;incoming;4624;;Direct;ANONYMOUS LOGON;NT AUTHORITY;;;MFP-3F-02;;3;;;;;;;;
 2026-09-23T11:35:20;DC02;kerberos;4769;;;svc_monitor@DEMO.NOPCAP.NET;DEMO;;MSSQLSvc/sql01.demo.nopcap.net:1433;;;;AES256;;;;;;;
 2026-09-23T11:34:18;DC02;kerberos;4769;;;svc_sql@DEMO.NOPCAP.NET;DEMO;;ldap/dc01.demo.nopcap.net;;;;AES256;;;;;;;
 2026-09-23T11:31:48;FS01;incoming;8003;NTLMv2;;j.schulz;DEMO;sqlservr.exe;;WKS-0370;;3;;;;;;;;
@@ -591,7 +592,6 @@
 2026-09-23T11:04:28;DC02;kerberos;4769;;;j.schulz@DEMO.NOPCAP.NET;DEMO;;HOST/app03.demo.nopcap.net;;;;AES256;;;;;;;
 2026-09-23T11:03:42;DC02;kerberos;4769;;;svc_sql@DEMO.NOPCAP.NET;DEMO;;HOST/app03.demo.nopcap.net;;;;AES256;;;;;;;
 2026-09-23T11:02:20;APP03;outgoing;8001;;;k.lorenz;DEMO;lsass.exe;cifs/nas01;;;;;;;;;;;C:\Windows\System32\lsass.exe
-2026-09-23T10:52:34;FS01;incoming;4624;;Direct;ANONYMOUS LOGON;NT AUTHORITY;;;MFP-3F-02;;3;;;;;;;;
 2026-09-23T10:50:01;DC02;kerberos;4769;;;svc_web@DEMO.NOPCAP.NET;DEMO;;MSSQLSvc/sql01.demo.nopcap.net:1433;;;;RC4;;;;;;;
 2026-09-23T10:47:59;DC01;kerberos;4769;;;VDI-086$@DEMO.NOPCAP.NET;DEMO;;TERMSRV/vdi-broker.demo.nopcap.net;;;;AES256;;;;;;;
 2026-09-23T10:47:27;DC01;kerberos;4769;;;VDI-012$@DEMO.NOPCAP.NET;DEMO;;ldap/dc01.demo.nopcap.net;;;;AES256;;;;;;;

@@ -217,15 +217,28 @@ pub fn run_cycle(cfg: &Config) -> Result<(), String> {
         forest_level: dl.1,
     };
     let status_url = format!("{}/status", cfg.collector_url.trim_end_matches('/'));
+    // The collector may answer a DC with SPNs to look up (see spn.rs).
+    let mut spn_todo: Vec<String> = Vec::new();
     match serde_json::to_string(&status) {
-        Ok(body) => {
-            if let Err(e) = post_json(&status_url, &cfg.api_key, &body) {
-                config::log(&format!("[{me}] status push failed: {e}"));
-            }
-        }
+        Ok(body) => match post_json(&status_url, &cfg.api_key, &body) {
+            Ok(answer) if dc => spn_todo = crate::spn::requested(&answer),
+            Ok(_) => {}
+            Err(e) => config::log(&format!("[{me}] status push failed: {e}")),
+        },
         Err(e) => config::log(&format!("[{me}] status JSON: {e}")),
     }
 
+    // 2) + 3) Events first: they are what the tool is for. The SPN lookup
+    // comes after, whether the push worked or not.
+    let pushed = push_events(cfg, &me, dc);
+    crate::spn::run(cfg, &me, &spn_todo);
+    pushed
+}
+
+/// Reads the event logs and pushes what is new; watermarks advance only
+/// after a successful push.
+fn push_events(cfg: &Config, me: &str, dc: bool) -> Result<(), String> {
+    let me = me.to_string();
     // 2) Collect events
     let mut state = config::load_state();
     let mut new_seen: HashMap<String, i64> = HashMap::new();
@@ -355,7 +368,7 @@ pub fn run_cycle(cfg: &Config) -> Result<(), String> {
         let mut send = |events: &[Event]| -> Result<(), PostError> {
             let body = serde_json::to_string(&IngestBody { source: &me, events })
                 .map_err(|e| PostError { code: None, msg: e.to_string() })?;
-            post_json(&ingest_url, &cfg.api_key, &body)
+            post_json(&ingest_url, &cfg.api_key, &body).map(|_| ())
         };
         skipped += send_split(&collected[from..to], &mut send)
             .map_err(|e| format!("[{me}] push failed: {e}"))?;
@@ -1368,7 +1381,7 @@ fn map_enc(code: &str) -> String {
 
 /// A failed push: the HTTP status when there was one, and what happened.
 #[derive(Debug)]
-struct PostError {
+pub(crate) struct PostError {
     code: Option<u16>,
     msg: String,
 }
@@ -1379,7 +1392,8 @@ impl std::fmt::Display for PostError {
     }
 }
 
-fn post_json(url: &str, api_key: &str, body: &str) -> Result<(), PostError> {
+/// POSTs JSON and returns the answer's body (at most 1 MB).
+pub(crate) fn post_json(url: &str, api_key: &str, body: &str) -> Result<String, PostError> {
     // Overall timeout so that a hanging collector cannot block the cycle - and
     // with it a service stop.
     // redirects(0): ureq would otherwise re-send the request - including the
@@ -1397,7 +1411,14 @@ fn post_json(url: &str, api_key: &str, body: &str) -> Result<(), PostError> {
         req = req.set("X-Api-Key", api_key);
     }
     match req.send_string(body) {
-        Ok(_) => Ok(()),
+        Ok(resp) => {
+            use std::io::Read;
+            let mut answer = String::new();
+            // An answer that is not UTF-8 or breaks off is simply no answer;
+            // the push itself succeeded.
+            let _ = resp.into_reader().take(1024 * 1024).read_to_string(&mut answer);
+            Ok(answer)
+        }
         Err(ureq::Error::Status(code, _)) => Err(PostError { code: Some(code), msg: format!("HTTP {code}") }),
         Err(e) => Err(PostError { code: None, msg: e.to_string() }),
     }
@@ -1643,7 +1664,7 @@ fn query_functional_levels() -> (Option<String>, Option<String>) {
                   $r=[ADSI]'LDAP://RootDSE';\
                   ''+$r.domainFunctionality;\
                   ''+$r.forestFunctionality";
-    let out = match run_capped(&ps, &["-NoProfile", "-NonInteractive", "-Command", script], 15) {
+    let out = match run_capped(&ps, &["-NoProfile", "-NonInteractive", "-Command", script], &[], 15) {
         Ok(s) => s,
         Err(e) => {
             config::log(&format!("functional level query failed: {e}"));
@@ -1662,13 +1683,21 @@ fn query_functional_levels() -> (Option<String>, Option<String>) {
 
 /// Run a helper and capture stdout, killing it if it outstays its welcome.
 /// `std::process` has no timeout of its own, so the read happens on a thread
-/// and the wait is bounded by a channel.
+/// and the wait is bounded by a channel. `envs` are added to the helper's
+/// environment - the way to hand it data without putting it on the command
+/// line.
 #[cfg(windows)]
-fn run_capped(exe: &std::path::Path, args: &[&str], secs: u64) -> Result<String, String> {
+pub(crate) fn run_capped(
+    exe: &std::path::Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    secs: u64,
+) -> Result<String, String> {
     use std::io::Read;
     use std::process::{Command, Stdio};
     let mut child = Command::new(exe)
         .args(args)
+        .envs(envs.iter().copied())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

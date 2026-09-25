@@ -468,7 +468,7 @@ code{font-family:var(--mono);font-size:.9em}
           the dashboard keeps working.</p>
           <div class="view__note">Status per row · <b>open, in progress, done</b></div>
         </div>
-        <figure><img src="img/02-programs.png" alt="Program list with per-row sparklines, target servers, user chips and a status dropdown" loading="lazy" width="2720" height="1866" style="--nat:1360px"></figure>
+        <figure><img src="img/02-programs.png" alt="Program list with per-row sparklines, target servers, user chips and a status dropdown" loading="lazy" width="2720" height="1856" style="--nat:1360px"></figure>
       </div>
 
       <div class="view">
@@ -480,10 +480,24 @@ code{font-family:var(--mono);font-size:.9em}
           change, not just what happened.</p>
           <div class="view__note">Every row filters the event list · <b>no guessing</b></div>
         </div>
-        <figure><img src="img/05-why.png" alt="Cause analysis panel listing each reason for NTLM fallback with a concrete remedy" loading="lazy" width="1330" height="1378" style="--nat:665px"></figure>
+        <figure><img src="img/05-why.png" alt="Cause analysis panel listing each reason for NTLM fallback with a concrete remedy" loading="lazy" width="1330" height="1376" style="--nat:665px"></figure>
       </div>
 
       <div class="view view--flip">
+        <div class="view__txt">
+          <div class="src">Read-only lookup · no extra rights</div>
+          <h3>The missing SPN, found in AD</h3>
+          <p>Most Kerberos fallbacks come down to a service name that is not
+          registered, registered twice, or registered for the real server while
+          clients use an alias. A domain controller agent looks each name up —
+          the dashboard names the problem and the <code>setspn</code> command.
+          It never changes anything itself.</p>
+          <div class="view__note">Copy the fix · <b>check again after it</b></div>
+        </div>
+        <figure><img src="img/23-spn.png" alt="SPN panel listing a missing SPN, two aliases and a duplicate, each with its setspn command" loading="lazy" width="2720" height="992" style="--nat:1360px"></figure>
+      </div>
+
+      <div class="view">
         <div class="view__txt">
           <div class="src">168 cells · one week by hour</div>
           <h3>The bright cell nobody can explain</h3>
@@ -492,10 +506,10 @@ code{font-family:var(--mono);font-size:.9em}
           knows about.</p>
           <div class="view__note">Click a cell · <b>see only those events</b></div>
         </div>
-        <figure><img src="img/04-timing.png" alt="Week-by-hour heatmap of NTLM usage with one bright cell on Sunday at 05:00" loading="lazy" width="1330" height="706" style="--nat:665px"></figure>
+        <figure><img src="img/04-timing.png" alt="Week-by-hour heatmap of NTLM usage with one bright cell on Sunday at 05:00" loading="lazy" width="1330" height="704" style="--nat:665px"></figure>
       </div>
 
-      <div class="view">
+      <div class="view view--flip">
         <div class="view__txt">
           <div class="src">Event 8004 · domain controller only</div>
           <h3>The machines that never got an agent</h3>
@@ -507,7 +521,7 @@ code{font-family:var(--mono);font-size:.9em}
         <figure><img src="img/06-domain.png" alt="Domain-wide table of accounts, source machines and target servers from the DC audit log" loading="lazy" width="2720" height="1306" style="--nat:1360px"></figure>
       </div>
 
-      <div class="view view--flip">
+      <div class="view">
         <div class="view__txt">
           <div class="src">Audit configuration · per machine</div>
           <h3>Whether you are measuring what you think</h3>
@@ -516,7 +530,7 @@ code{font-family:var(--mono);font-size:.9em}
           number on the other panels.</p>
           <div class="view__note">Badges turn green <b>once the policy has landed</b></div>
         </div>
-        <figure><img src="img/10-machines.png" alt="Machine list showing OS build, audit status badges and October 2026 readiness" loading="lazy" width="2720" height="1656" style="--nat:1360px"></figure>
+        <figure><img src="img/10-machines.png" alt="Machine list showing OS build, audit status badges and October 2026 readiness" loading="lazy" width="2720" height="1654" style="--nat:1360px"></figure>
       </div>
 
       <div class="view view--flip">
@@ -529,7 +543,7 @@ code{font-family:var(--mono);font-size:.9em}
           flagged as possible password spraying.</p>
           <div class="view__note">Click an account · <b>its machines, servers and programs</b></div>
         </div>
-        <figure><img src="img/16-accounts.png" alt="Accounts using NTLM with logons, NTLM version, machines, targets, failed attempts and Kerberos use" loading="lazy" width="2720" height="1338" style="--nat:1360px"></figure>
+        <figure><img src="img/16-accounts.png" alt="Accounts using NTLM with logons, NTLM version, machines, targets, failed attempts and Kerberos use" loading="lazy" width="2720" height="1336" style="--nat:1360px"></figure>
       </div>
 
       <div class="view">
@@ -544,7 +558,7 @@ code{font-family:var(--mono);font-size:.9em}
         <figure><img src="img/13-ready.png" alt="Ready-to-switch-off panel listing machines with their outgoing and incoming NTLM verdicts" loading="lazy" width="2720" height="1766" style="--nat:1360px"></figure>
       </div>
 
-      <div class="view view--flip view--narrow">
+      <div class="view view--narrow view--flip">
         <div class="view__txt">
           <div class="src">Print or PDF · German or English</div>
           <h3>A report for everyone else</h3>

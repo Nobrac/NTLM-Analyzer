@@ -181,6 +181,21 @@ CREATE TABLE IF NOT EXISTS ntlm_failures (
 CREATE UNIQUE INDEX IF NOT EXISTS ux_fail ON ntlm_failures(source, record_id);
 CREATE INDEX IF NOT EXISTS ix_fail_time ON ntlm_failures(event_time);
 CREATE INDEX IF NOT EXISTS ix_fail_user ON ntlm_failures(user_key, event_time);
+-- SPN check (2.4): which service names clients asked for are registered in AD,
+-- and on which account. A DC agent looks them up and reports back; see
+-- "SPN check" further down. One row per SPN, stored lower-case.
+CREATE TABLE IF NOT EXISTS spn_checks (
+    spn          TEXT PRIMARY KEY,
+    status       TEXT,             -- ok | missing | alias | duplicate | error; NULL = not checked yet
+    detail       TEXT,             -- why, in one code word (see spn_verdict)
+    account      TEXT,             -- the account the SPN belongs on, when known
+    owners       TEXT,             -- JSON list: accounts that hold the SPN now
+    canonical    TEXT,             -- DNS name the host resolves to, if it differs
+    error        TEXT,
+    dc           TEXT,             -- which DC agent checked it
+    checked_at   TEXT,
+    requested_at TEXT
+);
 """
 
 # Kerberos failure codes from failed 4769 requests: on systems without the
@@ -837,6 +852,241 @@ def compute_agentless(c, cutoff):
     return {"rows": rows, "dcs": dcs, "total": total}
 
 
+# ---- SPN check ------------------------------------------------------------
+# Most "Kerberos failed, NTLM took over" cases come down to a service name
+# (SPN) that is not registered in AD, is registered twice, or is registered
+# under the real server name while clients use an alias. The events name the
+# SPN a client asked for; whether AD knows it, only AD can say. So the
+# collector hands the SPNs it has seen to a DC agent (2.4 or later) in the
+# answer to its status report. The agent looks them up read-only (any domain
+# account may read servicePrincipalName) and posts the facts to /spn; the
+# verdict is made here. Nothing is ever changed in AD - the dashboard shows
+# the setspn command an admin can run.
+SPN_MIN_AGENT = (2, 4, 0)
+SPN_BATCH = 50               # SPNs per status answer (the agent caps at the same)
+SPN_RECHECK = timedelta(hours=24)
+SPN_RETRY = timedelta(hours=1)   # handed out but no answer: give it to the next DC
+SPN_WINDOW_DAYS = 30
+# Windows' default sPNMappings: service classes that HOST/<name> stands in for.
+# Used when the agent could not read the forest's own list.
+SPN_DEFAULT_MAPPINGS = frozenset((
+    "alerter,appmgmt,cisvc,clipsrv,browser,dhcp,dnscache,replicator,eventlog,"
+    "eventsystem,policyagent,oakley,dmserver,dns,mcsvc,fax,msiserver,ias,"
+    "messenger,netlogon,netman,netdde,netddedsm,nmagent,plugplay,"
+    "protectedstorage,rasman,rpclocator,rpc,rpcss,remoteaccess,rsvp,samss,"
+    "scardsvr,scesrv,seclogon,scm,dcom,cifs,spooler,snmp,schedule,tapisrv,"
+    "trksvr,trkwks,ups,time,wins,www,http,w3svc,iisadmin,msdtc").split(","))
+SPN_PROBLEMS = ("missing", "alias", "duplicate")
+_SPN_PART = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_IPV4 = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
+
+
+def version_tuple(v):
+    """'2.4.0' -> (2, 4, 0); anything unreadable sorts before every release."""
+    out = []
+    for part in str(v or "").split(".")[:3]:
+        m = re.match(r"\d+", part)
+        out.append(int(m.group(0)) if m else 0)
+    return tuple(out + [0] * (3 - len(out)))
+
+
+def norm_spn(target):
+    """The SPN a client asked for, in the form AD stores it - or None when
+    there is nothing to look up. Takes 'svc/host[:port][/extra][@REALM]'.
+    IP addresses are left out: Kerberos never works for them, and the Why
+    panel already names that cause."""
+    if not target or "/" not in target:
+        return None
+    t = target.strip().split("@", 1)[0]
+    svc, rest = t.split("/", 1)
+    host = rest.split("/", 1)[0]
+    port = ""
+    if ":" in host:
+        host, port = host.split(":", 1)
+    host = host.rstrip(".").lower()
+    svc = svc.lower()
+    if not _SPN_PART.match(svc) or not _SPN_PART.match(host):
+        return None
+    if svc == "krbtgt" or host in ("localhost", "127.0.0.1") or _IPV4.match(host):
+        return None
+    # SQL Server registers one SPN per port (or instance); for everything else
+    # the port is not part of what the client looks up.
+    if svc == "mssqlsvc" and port and re.match(r"^[A-Za-z0-9_$-]{1,64}$", port):
+        return f"{svc}/{host}:{port.lower()}"
+    return f"{svc}/{host}"
+
+
+def spn_candidates(c, where="1=1", params=()):
+    """{spn: {"n": NTLM count, "krb": failed Kerberos count, "last": time}}
+    for the outgoing NTLM and failed Kerberos requests matching `where`."""
+    out = {}
+    for target, kind, n, last in c.execute(
+            "SELECT target_server, kind, COUNT(*), MAX(event_time) FROM events "
+            # Failed Kerberos only with 0x7 ("server not found in Kerberos
+            # database"): clock skew or an etype mismatch says nothing about SPNs.
+            "WHERE (kind = 'outgoing' OR (kind = 'krbfail' AND failure_code = '0x7')) "
+            "AND target_server LIKE '%/%' "
+            f"AND {where} GROUP BY target_server, kind", list(params)):
+        spn = norm_spn(target)
+        if not spn:
+            continue
+        r = out.setdefault(spn, {"n": 0, "krb": 0, "last": ""})
+        r["n" if kind == "outgoing" else "krb"] += n
+        r["last"] = max(r["last"], last or "")
+    return out
+
+
+def spn_verdict(res, mappings):
+    """(status, detail, account) for one looked-up SPN.
+
+    `res` holds what the DC agent found: owners (accounts holding the SPN),
+    host_owners (holding HOST/<host>), canonical (the name DNS resolves the
+    host to), canon_owners / canon_host_owners (the same two for that name),
+    resolves, error. Account names come back without the trailing '$' of a
+    computer account - the form setspn takes."""
+    if res.get("error"):
+        return "error", "error", None
+    spn = res["spn"]
+    svc, rest = spn.split("/", 1)
+    host = rest.split(":", 1)[0]
+    acct = lambda names: names[0].rstrip("$") if names else None
+    owners = res.get("owners") or []
+    if len(owners) > 1:
+        return "duplicate", "dup", None
+    if owners:
+        return "ok", "registered", acct(owners)
+    host_owners = res.get("host_owners") or []
+    mapped = svc == "host" or svc in mappings
+    if mapped and len(host_owners) > 1:
+        return "duplicate", "dup_host", None
+    if mapped and host_owners:
+        return "ok", "via_host", acct(host_owners)
+    canon = (res.get("canonical") or "").lower().rstrip(".")
+    if canon and canon != host:
+        for names in (res.get("canon_owners") or [], res.get("canon_host_owners") or []):
+            if len(names) == 1:
+                short = "." not in host and canon.split(".", 1)[0] == host
+                return "alias", "short" if short else "cname", acct(names)
+    if host_owners:
+        return "missing", "unmapped", acct(host_owners)
+    if res.get("resolves") is False:
+        return "missing", "nores", None
+    return "missing", "noacct", None
+
+
+def spn_due(c, now=None):
+    """Up to SPN_BATCH SPNs a DC agent should look up now: seen in the last 30
+    days, not checked in the last day, not already out with another DC."""
+    now = now or utc_now()
+    cands = spn_candidates(c, "event_time >= ?",
+                           [(now - timedelta(days=SPN_WINDOW_DAYS)).strftime(_TS)])
+    if not cands:
+        return []
+    state = {r[0]: (r[1], r[2]) for r in c.execute(
+        "SELECT spn, checked_at, requested_at FROM spn_checks")}
+    fresh = (now - SPN_RECHECK).strftime(_TS)
+    retry = (now - SPN_RETRY).strftime(_TS)
+    due = []
+    # Most-used first: with hundreds of names, the ones behind the most NTLM
+    # get an answer in the first cycle.
+    for spn in sorted(cands, key=lambda s: (-(cands[s]["n"] + cands[s]["krb"]), s)):
+        checked, asked = state.get(spn, (None, None))
+        if checked and checked >= fresh:
+            continue
+        if asked and asked >= retry:
+            continue
+        due.append(spn)
+        if len(due) >= SPN_BATCH:
+            break
+    stamp = now.strftime(_TS)
+    c.executemany(
+        "INSERT INTO spn_checks (spn, requested_at) VALUES (?, ?) "
+        "ON CONFLICT(spn) DO UPDATE SET requested_at = excluded.requested_at",
+        [(s, stamp) for s in due])
+    return due
+
+
+def _names(v, limit=20):
+    """A list of account names from an agent: strings only, bounded."""
+    if not isinstance(v, list):
+        return []
+    return [str(x)[:256] for x in v if isinstance(x, str) and x.strip()][:limit]
+
+
+def spn_store(c, dc, payload, now=None):
+    """Takes a DC agent's answer. Only SPNs this collector handed out are
+    accepted, so a key holder cannot fill the panel with invented names.
+    Returns how many were stored."""
+    now = (now or utc_now()).strftime(_TS)
+    maps = payload.get("mappings")
+    mappings = frozenset(m.strip().lower() for m in maps[:1000]
+                         if isinstance(m, str) and m.strip()) if isinstance(maps, list) else frozenset()
+    mappings = mappings or SPN_DEFAULT_MAPPINGS
+    results = payload.get("results")
+    if not isinstance(results, list):
+        raise ValueError("results must be a list")
+    asked = {r[0] for r in c.execute("SELECT spn FROM spn_checks WHERE requested_at IS NOT NULL")}
+    stored = 0
+    for r in results[:500]:
+        if not isinstance(r, dict) or not isinstance(r.get("spn"), str):
+            continue
+        spn = norm_spn(r["spn"])
+        if not spn or spn not in asked:
+            continue
+        err = r.get("error")
+        res = {"spn": spn, "error": str(err)[:300] if err else None,
+               "owners": _names(r.get("owners")), "host_owners": _names(r.get("host_owners")),
+               "canonical": str(r.get("canonical") or "")[:255],
+               "canon_owners": _names(r.get("canon_owners")),
+               "canon_host_owners": _names(r.get("canon_host_owners")),
+               "resolves": r.get("resolves") if isinstance(r.get("resolves"), bool) else None}
+        status, detail, account = spn_verdict(res, mappings)
+        owners = res["owners"] or (res["host_owners"] if detail == "dup_host" else [])
+        canon = res["canonical"].lower().rstrip(".")
+        c.execute(
+            "UPDATE spn_checks SET status=?, detail=?, account=?, owners=?, canonical=?, "
+            "error=?, dc=?, checked_at=?, requested_at=NULL WHERE spn=?",
+            (status, detail, account, json.dumps(owners), canon or None,
+             res["error"], dc, now, spn))
+        stored += 1
+    return stored
+
+
+def compute_spn(c, tf, tp):
+    """The SPN panel: problems found, with the NTLM they cause in the range."""
+    now = utc_now()
+    recent = spn_candidates(c, "event_time >= ?",
+                            [(now - timedelta(days=SPN_WINDOW_DAYS)).strftime(_TS)])
+    in_range = spn_candidates(c, tf, tp)
+    capable = sum(1 for (v,) in c.execute(
+        "SELECT agent_version FROM agents WHERE is_dc = 1") if version_tuple(v) >= SPN_MIN_AGENT)
+    rows, ok, checked = [], 0, 0
+    for spn, status, detail, account, owners, canon, err, dc, at in c.execute(
+            "SELECT spn, status, detail, account, owners, canonical, error, dc, checked_at "
+            "FROM spn_checks WHERE status IS NOT NULL"):
+        if spn not in recent:
+            continue                    # no longer asked for - nothing to fix
+        checked += 1
+        if status == "ok":
+            ok += 1
+            continue
+        if status not in SPN_PROBLEMS:
+            continue
+        try:
+            owners = json.loads(owners or "[]")
+        except ValueError:
+            owners = []
+        hit = in_range.get(spn, {"n": 0, "krb": 0, "last": None})
+        rows.append({"spn": spn, "status": status, "detail": detail, "account": account,
+                     "owners": [o.rstrip("$") for o in owners], "canonical": canon,
+                     "n": hit["n"], "krb": hit["krb"], "last": hit["last"] or None,
+                     "dc": dc, "checked_at": at})
+    errors = c.execute("SELECT COUNT(*) FROM spn_checks WHERE status = 'error'").fetchone()[0]
+    rows.sort(key=lambda x: (-(x["n"] + x["krb"]), x["spn"]))
+    return {"rows": rows[:PANEL_LIMIT], "total": len(rows), "checked": checked, "ok": ok,
+            "errors": errors, "pending": max(0, len(recent) - checked), "capable": capable}
+
+
 def init_db(path):
     conn = sqlite3.connect(path, check_same_thread=False)
     conn.executescript(SCHEMA)
@@ -1022,6 +1272,7 @@ REPORT_TEXT = {
         "n_top": "<b>Größter offener Posten:</b> {proc} → {tgt} mit {n} Anmeldungen im Zeitraum.",
         "n_fail": "<b>Fehlversuche klären:</b> {user} von {src} – {why}.",
         "n_spray": "<b>Password Spraying prüfen:</b> {c} ist mit {a} Konten gescheitert.",
+        "n_spn": "<b>Dienstnamen (SPN) in Ordnung bringen:</b> {n} fehlen oder sind falsch registriert, zuerst {top} – dahinter {c} NTLM-Verbindungen. Die setspn-Befehle stehen im Dashboard.",
         "n_vis": "<b>Sichtbarkeit herstellen:</b> Auditing auf {gaps} einschalten{noagent}.",
         "n_vis_noagent": "; Agent auf {names} installieren",
         "n_vis_only_noagent": "<b>Sichtbarkeit herstellen:</b> Agent auf {names} installieren.",
@@ -1107,6 +1358,7 @@ REPORT_TEXT = {
         "n_top": "<b>Largest open item:</b> {proc} → {tgt} with {n} logons in the period.",
         "n_fail": "<b>Clear up failed logons:</b> {user} from {src} - {why}.",
         "n_spray": "<b>Check for password spraying:</b> {c} failed with {a} accounts.",
+        "n_spn": "<b>Fix service names (SPN):</b> {n} are missing or registered wrongly, first {top} - {c} NTLM connections behind them. The setspn commands are in the dashboard.",
         "n_vis": "<b>Restore visibility:</b> switch auditing on for {gaps}{noagent}.",
         "n_vis_noagent": "; install the agent on {names}",
         "n_vis_only_noagent": "<b>Restore visibility:</b> install the agent on {names}.",
@@ -1621,6 +1873,10 @@ def render_report(ctx):
     if fl.get("spray"):
         c0 = fl["spray"][0]
         steps.append(T["n_spray"].format(c=_h(c0[0]), a=num(c0[1])))
+    spn_rows = (data.get("spn") or {}).get("rows") or []
+    if spn_rows:
+        steps.append(T["n_spn"].format(n=num(len(spn_rows)), top=_r_list([r["spn"] for r in spn_rows], lang, 3),
+                                       c=num(sum(r["n"] for r in spn_rows))))
     reasons = [r for r in data.get("reasons") or [] if r.get("cat") not in ("unclear", "cloud", "acct")]
     if reasons:
         r0 = reasons[0]
@@ -1949,7 +2205,39 @@ class Handler(BaseHTTPRequestHandler):
                 self.server.conn.commit()
             self._send(200, {"ok": True})
             return
-        if u.path not in ("/ingest", "/status"):
+        if u.path == "/spn-recheck":    # browser action, like /item-status
+            if self._cross_site() or not self._json_body():
+                self._send(403, {"error": "cross-site request"})
+                return
+            if self._login_required():
+                self._send(401, {"error": "login required"})
+                return
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                if length < 0 or length > 8 * 1024:
+                    raise ValueError("bad length")
+                p = json.loads(self.rfile.read(length) or b"{}")
+                if not isinstance(p, dict):
+                    raise ValueError("not an object")
+            except Exception:
+                self._send(400, {"error": "bad request"})
+                return
+            # After a setspn the admin wants to see it confirmed, not wait a
+            # day: clearing the check time hands the SPN to the next DC report.
+            with DB_LOCK:
+                if p.get("all") is True:
+                    cur = self.server.conn.execute(
+                        "UPDATE spn_checks SET checked_at = NULL, requested_at = NULL "
+                        "WHERE status IS NOT NULL AND status != 'ok'")
+                else:
+                    spn = norm_spn(str(p.get("spn") or "")[:400])
+                    cur = self.server.conn.execute(
+                        "UPDATE spn_checks SET checked_at = NULL, requested_at = NULL "
+                        "WHERE spn = ?", (spn,))
+                self.server.conn.commit()
+            self._send(200, {"ok": True, "queued": cur.rowcount})
+            return
+        if u.path not in ("/ingest", "/status", "/spn"):
             self._send(404, {"error": "not found"})
             return
         # Without an API key these endpoints are open by design - but only to
@@ -1992,7 +2280,24 @@ class Handler(BaseHTTPRequestHandler):
             except (TypeError, ValueError) as exc:
                 self._send(400, {"error": f"bad status shape: {exc}"})
                 return
-            self._send(200, {"ok": ok})
+            answer = {"ok": ok}
+            # A DC agent that can look SPNs up gets the next ones to check.
+            if payload.get("is_dc") is True and \
+                    version_tuple(payload.get("agent_version")) >= SPN_MIN_AGENT:
+                with DB_LOCK:
+                    answer["spn_check"] = spn_due(self.server.conn)
+                    self.server.conn.commit()
+            self._send(200, answer)
+            return
+        if u.path == "/spn":
+            try:
+                with DB_LOCK:
+                    n = spn_store(self.server.conn, source, payload)
+                    self.server.conn.commit()
+            except (TypeError, ValueError) as exc:
+                self._send(400, {"error": f"bad spn shape: {exc}"})
+                return
+            self._send(200, {"stored": n})
             return
         events = payload.get("events") or []
         if isinstance(events, dict):      # single-event push -> wrap in a list
@@ -2828,12 +3133,13 @@ class Handler(BaseHTTPRequestHandler):
             # Which machines would log a failed logon at all ("Audit Logon: Failure").
             failures["blind"] = c.execute(
                 "SELECT COUNT(*) FROM agents WHERE logon_audit IN ('success', 'none')").fetchone()[0]
+            spn = compute_spn(c, tf, tp)
             readiness = cached("ready", lambda: compute_readiness(c))
             kpi = cached(("kpi", tzoff, src or ""), lambda: compute_kpi(c, tzoff, src))
             agentless = cached(("noagent", rng), lambda: compute_agentless(c, cutoff))
 
         return {"readiness": readiness, "agentless": agentless, "kpi": kpi,
-                "failures": failures, "accounts": accounts,
+                "failures": failures, "accounts": accounts, "spn": spn,
                 "stats": stats, "v1sso": v1sso, "incoming": incoming, "reasons": reasons, "trend": trend, "trend_bucket": ("hour" if rng == "24h" else "day"), "heat": heat, "spark": spark,
                 "top_proc": top_proc, "v1_users": v1_users,
                 "blockers": blockers, "domain": domain, "kerberos": kerberos,
@@ -3361,6 +3667,13 @@ tbody tr.on{background:rgba(var(--gold-rgb),.10);box-shadow:inset 3px 0 0 var(--
 .sel-st{background:rgba(var(--hi-rgb),.04);border:1px solid var(--edge);color:var(--dim);border-radius:7px;
   padding:3px 8px;font-family:var(--mono);font-size:13px}
 .done td{opacity:.42}
+.cmd{display:inline-block;font-family:var(--mono);font-size:12.5px;background:var(--code);border:1px solid var(--edge);
+  border-radius:6px;padding:3px 7px;white-space:nowrap;user-select:all}
+.cmdb{margin-top:6px;display:flex;gap:6px}
+.cpy{background:rgba(var(--hi-rgb),.04);border:1px solid var(--edge);color:var(--dim);border-radius:7px;
+  padding:2px 9px;font-family:var(--text);font-size:12px;cursor:pointer}
+.cpy:hover:not(:disabled){color:var(--ink);border-color:var(--edge2)}
+.cpy:disabled{cursor:default;opacity:.7}
 .empty{padding:34px 20px;text-align:center;color:var(--faint);font-size:15.5px}
 .empty b{display:block;color:var(--dim);font-size:15.5px;margin-bottom:5px;font-weight:500}
 
@@ -3909,6 +4222,24 @@ de: {
   pal_none:'Nichts gefunden für „{q}".', pal_machine:'Maschine', pal_noagent:'Rechner', pal_prog:'Programm',
   pal_acct:'Konto', pal_target:'Ziel', pal_panel:'Panel', pal_panel_sub:'springen',
   pal_noagent_sub:'ohne Agent · {n}× NTLM', pal_dom_sub:'Domänensicht · {n}×', pal_target_sub:'{n}× NTLM',
+  nav_spn:'SPN', spn_h:'Kerberos-Konfiguration (SPN)', spn_badge:'{n} Befunde', spn_ok_badge:'sauber registriert',
+  spn_meta:'{c} geprüft · {o} in Ordnung', spn_th:'Dienstname (SPN)', spn_th_find:'Befund', spn_th_fix:'Behebung',
+  spn_st_missing:'fehlt', spn_st_alias:'Alias', spn_st_duplicate:'doppelt',
+  spn_d_noacct:'Kein Konto im Forest trägt diesen Namen – Kerberos kann kein Ticket ausstellen. Geräte ohne Domänenkonto (NAS, Appliance) bleiben bei NTLM, bis sie in die Domäne kommen oder ein Konto mit diesem SPN bekommen.',
+  spn_d_nores:'Der Name löst im DNS nicht auf und ist nirgends registriert. Veralteter Name in einer Freigabe, einem Skript oder einer Verknüpfung?',
+  spn_d_unmapped:'HOST/{h} ist auf {a} registriert, deckt diesen Dienst aber nicht ab. Läuft der Dienst unter einem eigenen Konto, gehört der SPN dorthin.',
+  spn_d_cname:'Der Name ist ein Alias für {c}. Dort ist der SPN registriert, unter dem Alias nicht – wer den Alias verwendet, fällt auf NTLM zurück.',
+  spn_d_short:'Registriert ist nur der volle Name {c}, die Clients verwenden den Kurznamen.',
+  spn_d_dup:'Mehrere Konten tragen diesen SPN: {o}. Der KDC verweigert dann das Ticket. Bei allen Konten entfernen (setspn -D) außer dem, unter dem der Dienst läuft.',
+  spn_d_dup_host:'HOST/{h} ist auf mehreren Konten registriert: {o}. Nur das Computerkonto des Servers darf ihn tragen.',
+  spn_acct_ph:'<Dienstkonto>', spn_copy:'Kopieren', spn_copied:'kopiert', spn_recheck:'Neu prüfen', spn_queued:'vorgemerkt',
+  spn_recheck_t:'Beim nächsten Durchlauf eines DC-Agents erneut nachschlagen – etwa nachdem der Befehl ausgeführt wurde.',
+  spn_krb_t:'{n} fehlgeschlagene Kerberos-Anfragen für diesen Namen (4769)',
+  spn_nodc:'Noch kein Domänencontroller mit Agent 2.4 oder neuer – der schlägt die Namen im AD nach. Den Agent auf mindestens einem DC aktualisieren.',
+  spn_pending:'{n} Namen warten noch auf die Prüfung – ein DC-Agent schlägt pro Durchlauf bis zu 50 nach.',
+  spn_errors:'{n} Namen konnten nicht geprüft werden – das Protokoll des DC-Agents nennt den Grund.',
+  spn_empty:'Alle {n} geprüften Dienstnamen sind im AD sauber registriert.', spn_none:'Noch keine Dienstnamen geprüft.',
+  help_spn:'Für jeden Dienstnamen (SPN), bei dem Clients auf NTLM ausgewichen sind oder Kerberos mit „SPN nicht gefunden" scheiterte, schlägt ein DC-Agent im Active Directory nach, ob und bei wem er registriert ist – nur lesend, das darf jedes Domänenkonto. Das Tool ändert nichts im AD; die Spalte „Behebung" zeigt den setspn-Befehl, den ein Admin ausführt. setspn -S prüft vor dem Anlegen auf Duplikate. In Forests mit mehreren Domänen setspn in der Domäne des Kontos ausführen. Ziele in fremden Forests lassen sich nicht prüfen und erscheinen als „fehlt".',
   nav_fail:'Fehlversuche', nav_acc:'Konten', pal_failed:'{n}× fehlgeschlagen',
   fail_h:'Fehlgeschlagene NTLM-Versuche', fail_badge_spray:'Spraying?',
   fail_meta:'{n} Versuche · {a} Konten',
@@ -4242,6 +4573,24 @@ en: {
   pal_none:'Nothing found for "{q}".', pal_machine:'Machine', pal_noagent:'Computer', pal_prog:'Program',
   pal_acct:'Account', pal_target:'Target', pal_panel:'Panel', pal_panel_sub:'jump',
   pal_noagent_sub:'no agent · {n}× NTLM', pal_dom_sub:'domain view · {n}×', pal_target_sub:'{n}× NTLM',
+  nav_spn:'SPN', spn_h:'Kerberos configuration (SPN)', spn_badge:'{n} findings', spn_ok_badge:'all registered',
+  spn_meta:'{c} checked · {o} fine', spn_th:'Service name (SPN)', spn_th_find:'Finding', spn_th_fix:'Fix',
+  spn_st_missing:'missing', spn_st_alias:'alias', spn_st_duplicate:'duplicate',
+  spn_d_noacct:'No account in the forest holds this name - Kerberos cannot issue a ticket. Devices without a domain account (NAS, appliances) stay on NTLM until they join the domain or get an account with this SPN.',
+  spn_d_nores:'The name does not resolve in DNS and is registered nowhere. A stale name in a share, a script or a shortcut?',
+  spn_d_unmapped:'HOST/{h} is registered on {a} but does not cover this service. If the service runs under its own account, the SPN belongs there.',
+  spn_d_cname:'The name is an alias for {c}. The SPN is registered there but not under the alias - clients using the alias fall back to NTLM.',
+  spn_d_short:'Only the full name {c} is registered; clients use the short name.',
+  spn_d_dup:'Several accounts hold this SPN: {o}. The KDC then refuses the ticket. Remove it (setspn -D) from all but the account the service runs as.',
+  spn_d_dup_host:'HOST/{h} is registered on several accounts: {o}. Only the server\'s computer account may hold it.',
+  spn_acct_ph:'<service account>', spn_copy:'Copy', spn_copied:'copied', spn_recheck:'Check again', spn_queued:'queued',
+  spn_recheck_t:'Look it up again in the next cycle of a DC agent - for instance after running the command.',
+  spn_krb_t:'{n} failed Kerberos requests for this name (4769)',
+  spn_nodc:'No domain controller runs agent 2.4 or later yet - it is what looks the names up in AD. Update the agent on at least one DC.',
+  spn_pending:'{n} names are still waiting to be checked - a DC agent looks up to 50 per cycle.',
+  spn_errors:'{n} names could not be checked - the DC agent\'s log says why.',
+  spn_empty:'All {n} service names checked are registered correctly in AD.', spn_none:'No service names checked yet.',
+  help_spn:'For every service name (SPN) where clients fell back to NTLM, or Kerberos failed with "SPN not found", a DC agent looks up in Active Directory whether and where it is registered - read-only, which any domain account may do. The tool changes nothing in AD; the Fix column shows the setspn command for an admin to run. setspn -S checks for duplicates before adding. In multi-domain forests run setspn in the account\'s domain. Targets in other forests cannot be checked and show as missing.',
   nav_fail:'Failed attempts', nav_acc:'Accounts', pal_failed:'{n}× failed',
   fail_h:'Failed NTLM attempts', fail_badge_spray:'Spraying?',
   fail_meta:'{n} attempts · {a} accounts',
@@ -5392,6 +5741,41 @@ function secFailed(){
   return CARD('sec-failed', t('fail_h'), (F.spray || []).length ? [t('fail_badge_spray'), 'due'] : null,
     F.total ? t('fail_meta', {n: fmt(F.n), a: fmt(F.accounts)}) : '', body, 'c2');
 }
+// ---- Kerberos configuration (SPN) ------------------------------------------
+// Service names clients asked for, looked up in AD by a DC agent. The fix is
+// built here rather than on the server so its placeholder is in the viewer's
+// language; the collector never runs it, it only shows it.
+const spnHost = spn => spn.split('/')[1].split(':')[0];
+function spnFix(x){
+  if(x.status === 'duplicate') return 'setspn -Q ' + (x.detail === 'dup_host' ? 'HOST/' + spnHost(x.spn) : x.spn);
+  return 'setspn -S ' + x.spn + ' ' + (x.account || t('spn_acct_ph'));
+}
+function secSpn(){
+  const P = DATA.spn || {rows: []}, rows = P.rows || [];
+  const fmt = n => Number(n || 0).toLocaleString(LOCALE());
+  const cls = {missing: 'v1', duplicate: 'v1', alias: 'v2'};
+  let notes = '';
+  if(!P.capable) notes += '<div class="v1blind" style="cursor:default">' + esc(t('spn_nodc')) + '</div>';
+  if(P.errors) notes += '<div class="v1blind" style="cursor:default">' + esc(t('spn_errors', {n: fmt(P.errors)})) + '</div>';
+  if(P.capable && P.pending) notes += '<div class="cnote">' + esc(t('spn_pending', {n: fmt(P.pending)})) + '</div>';
+  const body = rows.length
+    ? notes + tbl([[t('spn_th')], [t('spn_th_find')], [t('th_account')], [t('th_count'), 'r'], [t('spn_th_fix')]],
+        rows.map(x => { const cmd = spnFix(x);
+          return '<tr><td class="mn">' + esc(x.spn) + '</td>' +
+          '<td>' + tag(cls[x.status] || 'n', t('spn_st_' + x.status)) +
+          '<div class="rdd">' + esc(t('spn_d_' + x.detail, {h: spnHost(x.spn), a: x.account || '', c: x.canonical || '',
+            o: (x.owners || []).join(', ')})) + '</div></td>' +
+          '<td class="mn dm">' + esc(x.account || (x.owners || []).join(', ') || '–') + '</td>' +
+          '<td class="r">' + fmt(x.n) + (x.krb ? ' ' + tag('v2', 'krb ' + fmt(x.krb), t('spn_krb_t', {n: x.krb})) : '') + '</td>' +
+          '<td><code class="cmd">' + esc(cmd) + '</code><div class="cmdb">' +
+          '<button type="button" class="cpy" data-copy="' + esc(cmd) + '">' + esc(t('spn_copy')) + '</button>' +
+          '<button type="button" class="cpy" data-recheck="' + esc(x.spn) + '" title="' + esc(t('spn_recheck_t')) + '">' +
+          esc(t('spn_recheck')) + '</button></div></td></tr>'; }).join(''))
+    : notes + emptyBox(P.checked ? t('spn_empty', {n: fmt(P.checked)}) : t('spn_none'), '');
+  const flag = rows.length ? [t('spn_badge', {n: fmt(P.total || rows.length)}), 'due']
+    : P.checked ? [t('spn_ok_badge'), 'ok'] : null;
+  return CARD('sec-spn', t('spn_h'), flag, P.checked ? t('spn_meta', {c: fmt(P.checked), o: fmt(P.ok)}) : '', body, 'c2');
+}
 // ---- Accounts using NTLM ------------------------------------------------
 function secAccounts(){
   const A = DATA.accounts || {rows: []}, rows = A.rows || [];
@@ -5508,6 +5892,7 @@ function renderJump(){
     ['act', [['sec-ready', 'nav_rdy', (R.rows || []).filter(x => x.out.st === 'ready' || x['in'].st === 'ready').length],
       ['sec-v1', 'nav_v1', cap((DATA.v1_users || []).length)], ['sec-v1sso', 'nav_v1sso', (DATA.v1sso || []).length],
       ['sec-failed', 'nav_fail', (DATA.failures || {}).total || 0],
+      ['sec-spn', 'nav_spn', (DATA.spn || {}).total || 0],
       ['sec-noagent', 'nav_na', A.total || 0], ['sec-incoming', 'nav_inc', cap((DATA.incoming || []).length)]]],
     ['det', [['sec-accounts', 'nav_acc', (DATA.accounts || {}).total || 0],
       ['sec-domain', 'nav_dom', cap((DATA.domain || []).length)], ['sec-top', 'nav_top', null],
@@ -5755,7 +6140,7 @@ function render(){
   // Three blocks in the order the work goes: what the situation is, what can be
   // done now, and the detail to look things up in.
   $('#grid').innerHTML = [blk('lage'), secTrend(), secPrograms(), secWhy(), secHeat(),
-    blk('act'), secReady(), secV1(), secSso(), secFailed(), secAgentless(), secIncoming(),
+    blk('act'), secReady(), secV1(), secSso(), secFailed(), secSpn(), secAgentless(), secIncoming(),
     blk('det'), secAccounts(), secDomain(), secTargets(), secKrb(), secKrbAcc(), secAgents(), secEvents()].join('');
   fillHeat(); renderEvents(); renderJump(); clipTables(); spy();
   const qi = $('#q'); if(qi) qi.value = S.q;
@@ -5781,6 +6166,21 @@ document.addEventListener('click', function(ev){
   if(el.id === 'scrim' || el.id === 'dclose'){ closeDrawer(); return; }
   if(el.id === 'excbtn'){ openExceptions(); return; }
   if(el.id === 'more'){ S.shown += 50; renderEvents(); return; }
+  const cp = el.closest('[data-copy]');
+  if(cp){ const done = () => { cp.textContent = t('spn_copied'); setTimeout(() => { cp.textContent = t('spn_copy'); }, 1600); };
+    // The clipboard API needs a secure context; over plain http the command
+    // is selected instead, so Ctrl+C still works.
+    if(navigator.clipboard && window.isSecureContext) navigator.clipboard.writeText(cp.dataset.copy).then(done, function(){});
+    else { const c = cp.closest('td').querySelector('code'); const r = document.createRange(); r.selectNodeContents(c);
+      const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r); }
+    return; }
+  const rc = el.closest('[data-recheck]');
+  if(rc){ rc.disabled = true;
+    fetch('/spn-recheck', {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({spn: rc.dataset.recheck})})
+      .then(function(r){ if(r.ok) rc.textContent = t('spn_queued'); else rc.disabled = false; })
+      .catch(function(){ rc.disabled = false; });
+    return; }
   if(el.id === 'report'){
     // The report knows 7, 30 and 90 days; 24 hours is too short for a trend
     // and "all" too long to compare against, so both open the 30-day report.

@@ -83,6 +83,7 @@ Watermarks are tracked per source and purpose, so only new events are transferre
 - **Trend chart**: NTLM activity per day (per hour in the 24 h view), stacked by v1 / v2 / unversioned — the curve that has to reach zero.
 - **Status report** (*Report* in the header, `/report?range=30d&lang=de`): a printable page for management — NTLM share and its change against the period before, weekly trend, work-list progress, machines ready to switch off, risks rated act/watch/fine, next steps derived from the data, and the largest remaining programs and accounts. 7, 30 or 90 days, German or English; the browser saves it as PDF.
 - **Accounts using NTLM** and an **account detail** view: per account its NTLM logons with v1/v2, from which machines, to which servers, with which programs, its failed attempts and whether it already uses Kerberos. The same logon is often seen by the client (8001), the server (8003) and the DC (8004) — per account and server the side that saw the most counts, never the sum. **Anonymous logons** (null sessions) are listed as such; Windows labels them "NTLM V1", which is ignored because they carry no credential.
+- **Kerberos configuration (SPN)**: every service name clients fell back to NTLM for, or that failed Kerberos with `0x7`, is looked up in AD by a DC agent (2.4 or later) and classified as **missing** (no account holds it), **alias** (the SPN exists for the real server name, not for the CNAME or short name clients use) or **duplicate** (several accounts hold it, so the KDC refuses the ticket). `HOST/` registrations count for the service classes in the forest's `sPNMappings`, so `cifs/` or `http/` on a computer account is fine. Each finding comes with its NTLM count and the `setspn` command to fix it (copy button, *Check again* after the fix). Names are re-checked daily. The lookup is read-only; the tool never changes AD.
 - **Failed NTLM attempts**: 4625 from the servers and failed 4776 from the DCs, merged per account and source machine. The reason is spelled out (wrong password, no such account, locked out, expired, …); **password spraying** is flagged when one machine fails with five or more accounts. The panel also says on how many machines *Audit Logon: Failure* is off.
 - **Auditing gaps are named**: a machine with outgoing, incoming or (on a DC) domain NTLM auditing off gets a red or amber badge in the machine list, and the panel says how many are affected — an empty list there is never read as "no NTLM".
 - **Complete lists**: panels receive up to 500 rows and fold to ten with *show all*; the jump bar says "500+" when that cap is reached.
@@ -217,6 +218,7 @@ The enhanced 40xx auditing (Windows 11 24H2 / Server 2025) is **enabled by defau
 | `configure ...` | Same options as `install`; writes the configuration only (what the MSI uses). Without a key option the stored key is kept; `--clear-api-key` removes it. |
 | `uninstall` | Stops and removes the service |
 | `run` | One-off collect/push cycle in the console (for testing) |
+| `spn-check <service/host[:port]>...` | Looks SPNs up in AD and prints who holds them, who holds `HOST/<name>` and what DNS resolves the name to - the same lookup DC agents run for the collector. Any domain account, any domain-joined machine; read-only. |
 | `service` | Internal — invoked by the service control manager |
 
 Configuration, watermarks and log live under `C:\ProgramData\NtlmAgent\` (`config.json`, `state.json`, `agent.log`).
@@ -236,6 +238,12 @@ Outgoing NTLM auditing is not active on that machine, so Windows writes no 8001 
 
 **Almost everything shows up as "unversioned".**
 Expected: only event 4624 carries `LmPackageName`, i.e. the NTLMv1/v2 information. Events 8001 and 8004 never contain a version by design and therefore appear gray. To populate the *insecure* / *outdated* metrics you need an agent on a **domain controller** with **Audit Logon** enabled. A large gray share remains normal even then — the same logon can appear as 8004 (gray) *and* as 4624 (red/amber), since these are separate events from separate logs.
+
+**The SPN panel says no domain controller runs agent 2.4.**
+The lookup runs on DCs only. Update the agent on at least one DC; the next cycle picks up to 50 names. If names stay unchecked, look for `SPN check:` lines in that DC's `agent.log` - most often PowerShell is blocked by an application-control policy (the agent runs `powershell.exe -EncodedCommand` with a fixed script).
+
+**An SPN is reported as missing, but it is registered.**
+Run `ntlm-agent.exe spn-check <spn>` on a DC and compare with `setspn -Q <spn>`. SPNs of another forest cannot be seen from the global catalog of this one and always show as missing.
 
 **No Kerberos data.**
 4769 is collected on domain controllers only, and only when the agent was not installed with `--skip-kerberos`. Check `skip_kerberos` in `config.json` and that *Audit Kerberos Service Ticket Operations* is enabled.

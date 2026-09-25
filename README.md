@@ -48,7 +48,7 @@ per-event detail view all work.
 ![Program list with per-row sparklines and the exception-list button](screenshots/02-programs.png)
 
 <details>
-<summary><b>More screenshots</b> — accounts, failed attempts, ready to switch off, machine and account detail, status report, timing, causes, Kerberos side …</summary>
+<summary><b>More screenshots</b> — SPN check, accounts, failed attempts, ready to switch off, machine and account detail, status report, timing, causes, Kerberos side …</summary>
 <br>
 
 **Most-used targets**
@@ -89,6 +89,9 @@ per-event detail view all work.
 
 **Failed NTLM attempts** — reason in plain words, locked accounts, spraying
 ![Failed NTLM attempts](screenshots/15-failed.png)
+
+**Kerberos configuration (SPN)** — service names missing, registered twice or only under the real server name, with the `setspn` command
+![SPN check](screenshots/23-spn.png)
 
 **Accounts using NTLM** — per account: version, machines, servers, failures, Kerberos
 ![Accounts using NTLM](screenshots/16-accounts.png)
@@ -176,6 +179,11 @@ every agent with a green heartbeat.
 - **Enhanced 40xx events** (process names for NTLM) exist on Windows 11 24H2 /
   Server 2025 only; older systems still deliver everything else, and the
   dashboard says so instead of showing empty panels.
+- **SPN check:** a domain controller running agent 2.4 or later looks up in
+  AD every service name clients fell back to NTLM for — read-only, no extra
+  rights. The dashboard names what is missing, duplicated or registered only
+  for the real server name behind an alias, with the `setspn` command to fix
+  it. The tool itself never changes AD.
 - **Status report:** the *Report* button turns the current state into a
   printable page (PDF from the browser) for everyone who does not open the
   dashboard — trend, progress, risks and next steps, in German or English.

@@ -612,5 +612,154 @@ class Pages(CollectorTest):
         self.assertIn(b"alice", raw)
 
 
+# ---------------------------------------------------------------------------
+class SpnNames(unittest.TestCase):
+    def test_normalised_like_ad_stores_them(self):
+        n = col.norm_spn
+        self.assertEqual(n("cifs/FS01.corp.local"), "cifs/fs01.corp.local")
+        self.assertEqual(n("HTTP/intranet"), "http/intranet")
+        self.assertEqual(n("ldap/dc1.corp.local/corp.local@CORP.LOCAL"), "ldap/dc1.corp.local")
+        self.assertEqual(n("HTTP/web01.corp.local:8080"), "http/web01.corp.local")
+        self.assertEqual(n("MSSQLSvc/SQL01.corp.local:1433"), "mssqlsvc/sql01.corp.local:1433")
+        self.assertEqual(n("MSSQLSvc/sql01.corp.local:INST2"), "mssqlsvc/sql01.corp.local:inst2")
+
+    def test_nothing_to_look_up(self):
+        for t in ("", None, "FS01", "cifs/10.1.2.3", "cifs/localhost", "krbtgt/CORP.LOCAL",
+                  "cifs/", "cifs/fs 01", "cifs/fs01*", "cifs/(x)", "ci\\fs/x"):
+            self.assertIsNone(col.norm_spn(t), t)
+
+    def test_version_order(self):
+        v = col.version_tuple
+        self.assertTrue(v("2.4.0") >= col.SPN_MIN_AGENT)
+        self.assertTrue(v("2.10.1") >= col.SPN_MIN_AGENT)
+        self.assertFalse(v("2.3.2") >= col.SPN_MIN_AGENT)
+        self.assertFalse(v(None) >= col.SPN_MIN_AGENT)
+
+
+class SpnVerdict(unittest.TestCase):
+    M = col.SPN_DEFAULT_MAPPINGS
+
+    def v(self, spn, **kw):
+        kw["spn"] = spn
+        return col.spn_verdict(kw, self.M)
+
+    def test_registered_once_is_fine(self):
+        self.assertEqual(self.v("http/web01", owners=["svc_web"]), ("ok", "registered", "svc_web"))
+
+    def test_host_covers_mapped_services(self):
+        self.assertEqual(self.v("cifs/fs01", host_owners=["FS01$"]), ("ok", "via_host", "FS01"))
+        # MSSQLSvc is not in sPNMappings: HOST/ does not stand in for it.
+        self.assertEqual(self.v("mssqlsvc/sql01:1433", host_owners=["SQL01$"]),
+                         ("missing", "unmapped", "SQL01"))
+
+    def test_twice_is_a_duplicate(self):
+        self.assertEqual(self.v("http/erp", owners=["svc_web", "ERP$"])[:2], ("duplicate", "dup"))
+        self.assertEqual(self.v("cifs/fs01", host_owners=["FS01$", "FS02$"])[:2], ("duplicate", "dup_host"))
+
+    def test_alias_names_the_real_server(self):
+        self.assertEqual(self.v("cifs/archive01", canonical="fs01.corp.local",
+                                canon_host_owners=["FS01$"]), ("alias", "cname", "FS01"))
+        self.assertEqual(self.v("http/intranet", canonical="web01.corp.local.",
+                                canon_owners=["svc_web"]), ("alias", "cname", "svc_web"))
+        # Only the FQDN is registered and the client used the short name.
+        self.assertEqual(self.v("http/app", canonical="app.corp.local",
+                                canon_owners=["svc_app"]), ("alias", "short", "svc_app"))
+
+    def test_nobody_has_it(self):
+        self.assertEqual(self.v("cifs/nas01", canonical="nas01.corp.local", resolves=True),
+                         ("missing", "noacct", None))
+        self.assertEqual(self.v("cifs/gone", resolves=False), ("missing", "nores", None))
+        self.assertEqual(self.v("cifs/x", error="LDAP down"), ("error", "error", None))
+
+
+class SpnCheck(CollectorTest):
+    def setUp(self):
+        super().setUp()
+        self.c.agent("WKS1")
+        self.c.push("WKS1",
+                    *[ev(8001, "outgoing", ts(i + 1), user="alice", process="msedge.exe",
+                         target_server="HTTP/intranet") for i in range(3)],
+                    ev(8001, "outgoing", ts(5), user="bob", process="mmc.exe", target_server="cifs/10.1.2.3"),
+                    ev(8001, "outgoing", ts(6), user="bob", process="explorer.exe",
+                       target_server="cifs/FS01.corp.local"))
+        self.c.agent("DC1", is_dc=True)
+        self.c.push("DC1", ev(4769, "krbfail", ts(7), user="alice@CORP.LOCAL",
+                              target_server="cifs/nas01", failure_code="0x7"))
+
+    def dc_status(self, version="2.4.0", source="DC1"):
+        code, r = self.c.post("/status", {"source": source, "is_dc": True, "agent_version": version})
+        self.assertEqual(code, 200, r)
+        return r
+
+    def test_only_new_dc_agents_are_asked(self):
+        self.assertNotIn("spn_check", self.dc_status("2.3.2"))
+        code, r = self.c.post("/status", {"source": "WKS1", "is_dc": False, "agent_version": "2.4.0"})
+        self.assertNotIn("spn_check", r)
+        todo = self.dc_status()["spn_check"]
+        # Most used first; the IP target is never asked about.
+        self.assertEqual(todo[0], "http/intranet")
+        self.assertEqual(sorted(todo), ["cifs/fs01.corp.local", "cifs/nas01", "http/intranet"])
+        # Handed out once: a second DC in the same hour gets nothing twice.
+        self.assertEqual(self.dc_status(source="DC2")["spn_check"], [])
+
+    def test_answers_become_findings(self):
+        self.dc_status()
+        code, r = self.c.post("/spn", {"source": "DC1", "mappings": ["cifs", "http"], "results": [
+            {"spn": "HTTP/intranet", "canonical": "web01.corp.local", "resolves": True,
+             "owners": [], "host_owners": [], "canon_owners": [], "canon_host_owners": ["WEB01$"]},
+            {"spn": "cifs/fs01.corp.local", "owners": [], "host_owners": ["FS01$"]},
+            {"spn": "cifs/nas01", "canonical": "nas01.corp.local", "resolves": True},
+            {"spn": "cifs/invented", "owners": ["x", "y"]},
+        ]})
+        self.assertEqual((code, r), (200, {"stored": 3}))
+        s = self.c.data()["spn"]
+        self.assertEqual((s["checked"], s["ok"], s["total"], s["capable"]), (3, 1, 2, 1))
+        rows = {x["spn"]: x for x in s["rows"]}
+        self.assertEqual(rows["http/intranet"]["status"], "alias")
+        self.assertEqual(rows["http/intranet"]["account"], "WEB01")
+        self.assertEqual(rows["http/intranet"]["n"], 3)
+        self.assertEqual(rows["cifs/nas01"]["status"], "missing")
+        self.assertEqual(rows["cifs/nas01"]["krb"], 1)
+        # Checked today: nothing to hand out again.
+        self.assertEqual(self.dc_status()["spn_check"], [])
+
+    def test_report_names_the_fix(self):
+        self.dc_status()
+        self.c.post("/spn", {"source": "DC1", "results": [{"spn": "cifs/nas01", "resolves": True}]})
+        code, raw = self.c.get("/report", range="30d", lang="en")
+        self.assertEqual(code, 200)
+        self.assertIn("Fix service names (SPN)", raw.decode("utf-8"))
+        self.assertIn("cifs/nas01", raw.decode("utf-8"))
+
+    def test_recheck_from_the_dashboard(self):
+        self.dc_status()
+        self.c.post("/spn", {"source": "DC1", "results": [{"spn": "cifs/nas01"}]})
+        self.assertEqual(self.dc_status()["spn_check"], [])
+        code, _ = self.c.request("POST", "/spn-recheck", {"spn": "cifs/nas01"},
+                                 {"Sec-Fetch-Site": "cross-site"})
+        self.assertEqual(code, 403)
+        code, r = self.c.post("/spn-recheck", {"spn": "CIFS/nas01"})
+        self.assertEqual((code, r["queued"]), (200, 1))
+        self.assertEqual(self.dc_status()["spn_check"], ["cifs/nas01"])
+
+    def test_bad_answers_are_refused(self):
+        self.dc_status()
+        self.assertEqual(self.c.post("/spn", {"source": "DC1", "results": "x"})[0], 400)
+        code, _ = self.c.request("POST", "/spn", {"source": "DC1", "results": []},
+                                 {"Content-Type": "text/plain"})
+        self.assertEqual(code, 415)
+        code, r = self.c.post("/spn", {"source": "DC1", "results": [
+            "junk", {"spn": 5}, {"spn": "cifs/nas01", "owners": [{"a": 1}, "ok$"] }]})
+        self.assertEqual((code, r["stored"]), (200, 1))
+
+
+class SpnKey(CollectorTest):
+    key = "k3y"
+
+    def test_spn_needs_the_api_key(self):
+        code, _ = self.c.request("POST", "/spn", {"source": "DC1", "results": []}, {"X-Api-Key": "no"})
+        self.assertEqual(code, 401)
+
+
 if __name__ == "__main__":
     unittest.main()

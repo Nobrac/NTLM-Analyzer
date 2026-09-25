@@ -4,51 +4,66 @@ Every release with its full notes, installers and downloads is on the
 [Releases page](https://github.com/Nobrac/NTLM-Analyzer/releases). This file
 carries the latest release in full and a one-line summary of each earlier one.
 
-## v2.3.2 — Security fixes for the collector and dashboard
+## v2.4.0 — The SPN check
 
-After the agent in 2.3.1, the collector and its dashboard went through the
-same review. **Update the collector**; the agent is unchanged apart from its
-version number, so agents on 2.3.1 need nothing.
+Most "Kerberos failed, NTLM took over" cases have a boring cause: the service
+name (SPN) the client asked for is not registered in Active Directory, is
+registered on two accounts, or is registered for the real server name while
+clients use an alias. The events already name the SPN; now the tool also asks
+AD about it.
 
-The review included an attack test: every field of every event,
-machine and account filled with script code, then every panel, detail view,
-hover card, search, report and link state opened in a browser. Nothing ran -
-the escaping held everywhere. Found and fixed:
+- **New panel "Kerberos configuration (SPN)"** in the Act block. Every SPN
+  clients fell back to NTLM for, or that failed Kerberos with 0x7 ("server not
+  found in Kerberos database"), is looked up in AD. The panel lists what is
+  wrong, how much NTLM it causes, and the `setspn` command that fixes it, with
+  a copy button and "Check again" for after the fix:
+  - **missing** — no account holds the name (for instance a NAS that never
+    joined the domain, or a stale name in a script)
+  - **alias** — the name is a DNS alias (CNAME) or a short name; the SPN is
+    registered for the real server, and the command registers it for the alias
+  - **duplicate** — several accounts hold it, so the KDC refuses the ticket
+  `HOST/` registrations are taken into account through the forest's
+  sPNMappings, so `cifs/` or `http/` on a computer account is not reported.
+- **Who looks it up:** a domain controller running **agent 2.4.0**. The
+  collector hands it up to 50 names in the answer to its status report; the
+  agent queries the global catalog through ADSI and reports what it found.
+  Read-only - any domain account may read `servicePrincipalName`, so no extra
+  rights are needed. The tool never changes anything in AD; the command is
+  for an admin to run. Each name is checked again after a day.
+- **`ntlm-agent.exe spn-check <service/host>...`** runs the same lookup by
+  hand and prints the result, on any domain-joined machine.
+- **Status report:** SPN problems become a next step.
 
-- **Other web pages could use an admin's browser against the collector
-  (medium).** Without a dashboard password and API key - the defaults - a page
-  the admin merely visited could mark work items as done, inject fake events
-  and invent machines, all through the admin's own browser. Browser requests
-  from other sites are now refused, and the agent endpoints only accept real
-  JSON, which a foreign page cannot send without the browser asking first.
-  With a password and an API key this was already blocked.
-- **"limit=-1" meant no limit (low).** A negative or malformed number in the
-  query returned the whole database or dropped the connection. Numbers are
-  now bounded.
-- **Scripts need a per-page key (hardening).** Each dashboard, login and report
-  page gives its own scripts a random nonce, and the browser runs no other
-  script - so even a value that slipped past the escaping could not execute.
-  HTTPS responses also send HSTS.
+### Security notes
 
-Still recommended, as before: run the collector with `--password` and
-`--key` (the Linux installer sets both). Without a password, anyone who can
-reach the collector can read the dashboard.
+The lookup runs a fixed PowerShell script (`-EncodedCommand`); the names reach
+it through an environment variable, never the command line, and each is
+checked against a strict `service/host[:port]` pattern first - no character
+with a meaning in LDAP filters or PowerShell gets through. Results are only
+accepted for names the collector actually handed out, and `/spn` needs the
+API key like `/ingest`. "Check again" is a dashboard action with the same
+cross-site protection as the work status.
 
 ### Tests
 
-- Four more collector tests, 53 in all: foreign pages cannot post, the
-  dashboard itself still can, query numbers stay bounded, and every page runs
-  only its own scripts.
+- Collector: 14 more tests (67 in all) - SPN normalisation, every verdict,
+  handing out and accepting only asked names, re-check, the report step.
+- Agent: 6 more tests (34 in all) - input validation, output parsing, the
+  encoding of the script.
 
 ### Upgrading
 
 1. **Collector:** replace `ntlm-collector.py`, restart, hard-refresh.
-   Own scripts that post to `/ingest` or `/status` must send
-   `Content-Type: application/json` - the agent always does.
-2. **Agents:** nothing to do if they run 2.3.1. Older ones: see 2.3.1.
+2. **Agent 2.4.0 on at least one domain controller** - that is where the
+   lookup runs. Other machines gain nothing new; updating them is optional.
+
+The AD lookup could only be tested against a simulated directory before
+release. If a name shows up wrongly, `ntlm-agent.exe spn-check <spn>` on a DC
+shows exactly what AD answered - please open an issue with its output.
 
 ## Earlier releases
 
+- **[v2.3.2](https://github.com/Nobrac/NTLM-Analyzer/releases/tag/v2.3.2)** — Security fixes for the collector and dashboard
 - **[v2.3.1](https://github.com/Nobrac/NTLM-Analyzer/releases/tag/v2.3.1)** — Security fixes for the agent
 - **[v2.3.0](https://github.com/Nobrac/NTLM-Analyzer/releases/tag/v2.3.0)** — Every account, every attempt, and a report for everyone else
 - **[v2.2.0](https://github.com/Nobrac/NTLM-Analyzer/releases/tag/v2.2.0)** — Numbers you can trust

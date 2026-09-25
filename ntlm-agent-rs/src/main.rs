@@ -24,6 +24,7 @@
 //!   install    write the configuration, then create and start the service
 //!   uninstall  stop and remove the service
 //!   run        one-off cycle in the console (for testing)
+//!   spn-check  look SPNs up in AD by hand (what DC agents do for the collector)
 //!   service    invoked by the service control manager (not manually)
 
 mod agent;
@@ -31,6 +32,7 @@ mod config;
 mod eventlog;
 mod secure_dir;
 mod service;
+mod spn;
 
 use std::process::exit;
 
@@ -162,6 +164,7 @@ fn main() {
                 }
             }
         }
+        "spn-check" => exit(spn::cli(rest)),
         _ => print_usage(),
     }
 }
@@ -189,6 +192,10 @@ Usage:
   ntlm-agent.exe configure ...  Same options as install, writes the configuration only.
   ntlm-agent.exe uninstall      Stop and remove the service.
   ntlm-agent.exe run [args]     One-off cycle in the console (for testing).
+  ntlm-agent.exe spn-check <service/host>...
+                                Look SPNs up in Active Directory (read-only) and
+                                print who holds them - the check DC agents run
+                                for the collector. Any domain account will do.
   ntlm-agent.exe service        Invoked by the service control manager.
 
 Afterwards control it via services.msc or:

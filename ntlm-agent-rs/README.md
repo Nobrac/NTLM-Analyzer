@@ -38,6 +38,13 @@ machine and pushes them to the central collector (`/ingest` + `/status`).
   type 3 logon to the DC) and requests from a **trusted domain** (8006). Same
   field layout as 8004; collected through the same query.
 - **/status**: heartbeat + auditing state (registry) + agent version.
+- **SPN check** (DC, 2.4 and later): the collector's answer to the status
+  report can name service names (SPNs) to look up. The agent queries the
+  global catalog through ADSI - who holds the SPN, who holds `HOST/<name>`,
+  what DNS name the host resolves to - and posts the facts to `/spn`.
+  Read-only; any domain account may read `servicePrincipalName`. At most 50
+  names per cycle and 75 seconds. The names reach the fixed PowerShell script
+  through an environment variable, never the command line.
 
 **Enhanced auditing** (Windows 11 24H2 / Windows Server 2025, KB5064479) — these
 queries simply return nothing on older systems, so the same binary works everywhere:
@@ -174,6 +181,17 @@ ntlm-agent.exe run --collector-url https://collector.example.local:8443
 Reading the Security log (4624 on every machine, 4769 on DCs) requires elevated rights — as a
 service the agent runs as `LocalSystem` and has them automatically.
 
+## Checking SPNs by hand
+
+```cmd
+ntlm-agent.exe spn-check cifs/fs01 HTTP/intranet.example.local MSSQLSvc/sql01.example.local:1433
+```
+
+The same lookup the DC agent runs for the collector, printed instead of sent:
+which account holds each SPN, which holds `HOST/<name>`, and, when neither
+does, what DNS says the name really is. Works on any domain-joined machine
+under any domain account; nothing is changed in AD.
+
 ## Project structure
 
 | File | Contents |
@@ -184,6 +202,7 @@ service the agent runs as `LocalSystem` and has them automatically.
 | `src/eventlog.rs` | Reading event logs via `wevtutil` + XML parsing |
 | `src/agent.rs` | One collect/push cycle (4624/4769/8004/8001 + status) |
 | `src/service.rs` | Windows service: dispatcher, control handler, install/uninstall |
+| `src/spn.rs` | SPN lookup in AD for the collector, and `spn-check` |
 | `src/secure_dir.rs` | Makes the data folder safe before use (owner, links, ACL) |
 
 ## Running under a service account or gMSA (least privilege)

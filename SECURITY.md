@@ -29,6 +29,10 @@ one.
 
 - All agents share one API key. Anyone with administrator rights on a machine
   running the agent can read that key and send data in the name of any machine.
-  That is a known limit of the design, not a vulnerability.
+  That is a known limit of the design, not a vulnerability. The same key
+  also lets a sender report SPN lookup results, but the collector only
+  accepts them for names it handed out itself.
+- The SPN check reads Active Directory and never writes to it. The `setspn`
+  commands in the dashboard are suggestions for an admin; nothing runs them.
 - The collector's dashboard is meant for an internal network behind TLS and a
   password (`--cert`, `--tlskey`, `--password`).
