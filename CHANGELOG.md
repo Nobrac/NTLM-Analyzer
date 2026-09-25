@@ -14,6 +14,8 @@ carries the latest release in full and a one-line summary of each earlier one.
   agent, the report, login and API key. They run on every push on Python 3.7
   and 3.13, together with a syntax check of the dashboard's JavaScript; the
   agent's unit tests now run in its build and stop it when they fail.
+- **Status report in dark.** On screen the report now follows a dark system
+  theme; printed or saved as PDF it stays on white paper.
 - The collector's module description was still partly German; it is English
   now, and a test keeps it that way.
 

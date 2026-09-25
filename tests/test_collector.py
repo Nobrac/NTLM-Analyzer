@@ -532,6 +532,13 @@ class Report(CollectorTest):
         code, raw = self.c.get("/report", lang="en", range="30d")
         self.assertIn("Not enough data yet to compare", raw.decode("utf-8"))
 
+    def test_dark_theme_is_for_the_screen_only(self):
+        # Printed or saved as PDF the report must stay on white paper.
+        code, raw = self.c.get("/report", lang="en")
+        html = raw.decode("utf-8")
+        self.assertIn("@media screen and (prefers-color-scheme:dark)", html)
+        self.assertNotIn("@media (prefers-color-scheme:dark)", html)
+
     def test_static_links_point_to_files(self):
         code, raw = self.c.get("/report", lang="en", range="7d", static="1")
         html = raw.decode("utf-8")

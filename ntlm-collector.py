@@ -1310,6 +1310,7 @@ section.flow{break-inside:auto}
 .bar{display:flex;height:14px;border-radius:999px;overflow:hidden;background:#eef2f6;margin:8px 0 10px}
 .bar i{display:block;height:100%}
 .bar .d{background:var(--ok)}.bar .p{background:var(--gold2)}.bar .o{background:#cbd5e1}
+.legend i.lo{background:#cbd5e1}
 .legend{display:flex;flex-wrap:wrap;gap:4px 16px;font-size:12px;color:var(--dim)}
 .legend b{font-family:var(--disp);font-size:18px;color:var(--ink);margin-right:5px}
 .legend i{display:inline-block;width:9px;height:9px;border-radius:3px;margin-right:5px;vertical-align:1px}
@@ -1355,6 +1356,32 @@ ol.steps li:first-child::before{background:var(--gold2);color:var(--ink)}
 .method b{color:var(--ink)}
 .foot{margin-top:14px;display:flex;justify-content:space-between;font-family:var(--mono);font-size:9.5px;color:var(--faint);
   border-top:1px solid var(--line);padding-top:8px}
+/* On screen the report follows a dark system theme; printed or saved as PDF
+   it is always the light paper version - print media never matches this. */
+@media screen and (prefers-color-scheme:dark){
+  :root{--ink:#e6ebf3;--dim:#aab4c3;--faint:#8591a3;--line:#253041;--soft:#151c28;
+    --gold:#d9b84a;--v1:#ff6b6b;--amb:#f0b429;--ok:#3ddc97}
+  body{background:#070b12}
+  .sheet{background:#0f141d;box-shadow:0 10px 40px rgba(0,0,0,.55)}
+  .kpi{background:linear-gradient(180deg,#141b27,#0f141d)}
+  .chip.good,.tag.st-done,.risk.ok .lv{background:rgba(61,220,151,.14)}
+  .chip.bad,.tag.v1,.risk.bad .lv{background:rgba(255,107,107,.14)}
+  .chip.flat,.tag.st-open{background:#1b2331}
+  .tag.st-in_progress{background:rgba(217,184,74,.15);color:#d9b84a}
+  .risk.warn .lv{background:rgba(240,180,41,.14)}
+  .risk{border-color:var(--line)}
+  .arrow.flat{background:#3a4556}
+  .chart .g,.chart .v1z{stroke:#1e2736;fill:#1e2736}
+  .chart .g{fill:none}
+  .chart .ax{fill:#7d889a}
+  .chart .dot{fill:#0f141d}
+  .chart .end{stroke:#0f141d}
+  .bar{background:#1b2331}
+  .bar .o,.legend i.lo{background:#3a4556}
+  td,.ar,ol.steps li{border-bottom-color:#1b2331}
+  ol.steps li::before{background:#e6ebf3;color:#0f141d}
+  ol.steps li:first-child::before{background:var(--gold2);color:#0f141d}
+}
 @page{size:A4;margin:13mm 13mm 14mm}
 @media print{
   body{background:#fff;font-size:12.5px}
@@ -1464,7 +1491,7 @@ def render_report(ctx):
                 f'<i class="o" style="width:{pc(n_open)}"></i></div>'
                 f'<div class="legend"><span><i style="background:var(--ok)"></i><b>{num(n_done)}</b>{_h(T["st_done"])}</span>'
                 f'<span><i style="background:var(--gold2)"></i><b>{num(n_prog)}</b>{_h(T["st_prog"])}</span>'
-                f'<span><i style="background:#cbd5e1"></i><b>{num(n_open)}</b>{_h(T["st_open"])}</span></div>'
+                f'<span><i class="lo"></i><b>{num(n_open)}</b>{_h(T["st_open"])}</span></div>'
                 + (f'<div class="note">{_h(T["done_period"].format(n=num(ctx["done_period"])))}</div>' if ctx["done_period"] else "")
                 + (f'<div class="note warn">{_h(T["reopened"].format(n=num(reopened)))}</div>' if reopened else ""))
         areas = [(T["a_" + k], sum(1 for r in data.get(k) or [] if r.get("st") != "done"))

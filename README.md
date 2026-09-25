@@ -102,8 +102,11 @@ per-event detail view all work.
 **Search** — Ctrl+K over machines, accounts, programs, targets and panels
 ![Search](screenshots/20-search.png)
 
-**Status report** — to print or save as PDF
-![Status report](screenshots/21-report.png)
+**Status report** — to print or save as PDF; on screen it follows the dark theme
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/21-report-dark.png">
+  <img alt="Status report" src="screenshots/21-report.png">
+</picture>
 
 **Light theme**
 ![Light theme](screenshots/22-light.png)
