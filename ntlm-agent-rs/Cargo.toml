@@ -18,7 +18,7 @@ roxmltree = "0.20"
 # Windows-specific crates (Windows target only)
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.7"
-winreg = "0.52"
+winreg = "0.56"
 
 # Embeds the icon and a version resource into the EXE. Build-time only - it does
 # not end up in the shipped binary, and non-Windows builds skip it.
