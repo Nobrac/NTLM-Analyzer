@@ -246,6 +246,59 @@ class Ingest(CollectorTest):
         self.assertEqual(d["events"][0]["process"], "p17.exe")
 
 
+class WebHardening(CollectorTest):
+    """No password, no API key - the default. Other web pages must still not
+    be able to use the admin's browser against the collector."""
+
+    def post_raw(self, path, body, headers):
+        code, _ = self.c.request("POST", path, body, headers)
+        return code
+
+    def test_foreign_pages_cannot_post(self):
+        body = {"key": "proc|a.exe|cifs/x", "status": "done"}
+        self.assertEqual(self.post_raw("/item-status", body, {"Sec-Fetch-Site": "cross-site"}), 403)
+        self.assertEqual(self.post_raw("/item-status", body, {"Sec-Fetch-Site": "same-site"}), 403)
+        self.assertEqual(self.post_raw("/item-status", body, {"Origin": "http://evil.example"}), 403)
+        self.assertEqual(self.post_raw("/item-status", body, {"Content-Type": "text/plain"}), 403)
+        self.assertEqual(self.post_raw("/ingest", {"source": "X", "events": []}, {"Content-Type": "text/plain"}), 415)
+        self.assertEqual(self.post_raw("/status", {"source": "X"}, {"Sec-Fetch-Site": "cross-site"}), 403)
+        self.assertEqual(self.c.conn.execute("SELECT COUNT(*) FROM item_status").fetchone()[0], 0)
+
+    def test_the_dashboard_itself_still_can(self):
+        body = {"key": "proc|a.exe|cifs/x", "status": "done"}
+        self.assertEqual(self.post_raw("/item-status", body, {"Sec-Fetch-Site": "same-origin"}), 200)
+        host = self.c.url.split("//")[1]
+        self.assertEqual(self.post_raw("/item-status", body, {"Origin": "http://" + host}), 200)
+        self.assertEqual(self.post_raw("/ingest", {"source": "X", "events": []}, {}), 200)
+
+    def test_numbers_in_the_query_are_bounded(self):
+        self.c.agent("WKS1")
+        self.c.push("WKS1", *[ev(8001, "outgoing", ts(i + 1), user="u", target_server="cifs/x") for i in range(5)])
+        for bad in ("-1", "abc", "99999999999999999999"):
+            code, raw = self.c.get("/api/data", limit=bad, range="30d")
+            self.assertEqual(code, 200, bad)
+            self.assertLessEqual(len(json.loads(raw)["events"]), 5)
+        code, raw = self.c.get("/api/data", limit="-1", range="30d")
+        self.assertEqual(len(json.loads(raw)["events"]), 1)
+        self.assertEqual(self.c.get("/api/export.csv", limit="abc")[0], 200)
+
+    def test_pages_run_only_their_own_scripts(self):
+        for path in ("/", "/login", "/report"):
+            req = urllib.request.Request(self.c.url + path)
+            with urllib.request.urlopen(req) as r:
+                csp = r.headers["Content-Security-Policy"]
+                html = r.read().decode("utf-8")
+            m = re.search(r"'nonce-([^']+)'", csp)
+            if path == "/login" and not m:
+                continue                         # login disabled: redirected to /
+            self.assertIsNotNone(m, path)
+            scripts = re.findall(r"<script[^>]*>", html)
+            self.assertTrue(scripts, path)
+            for tag in scripts:
+                self.assertIn('nonce="%s"' % m.group(1), tag, path)
+            self.assertNotRegex(html, r"\son(click|error|load)=", path)
+
+
 class Security(CollectorTest):
     key = "k3y"
     password = "secret"

@@ -2009,7 +2009,7 @@ function encTags(v){
   return all.slice(0, 3).map(e => tag(/RC4|DES/i.test(e) ? 'v2' : 'krb', e)).join(' ') +
     (all.length > 3 ? '<span class="restn">+' + (all.length - 3) + '</span>' : '');
 }
-const stSel = (key, st) => '<select class="sel-st st-' + esc(st || 'open') + '" data-key="' + esc(key) + '" aria-label="' + esc(t('th_status')) + '" onclick="event.stopPropagation()">' +
+const stSel = (key, st) => '<select class="sel-st st-' + esc(st || 'open') + '" data-key="' + esc(key) + '" aria-label="' + esc(t('th_status')) + '">' +
   ['open','in_progress','done'].map(v => '<option value="' + v + '"' +
     ((st || 'open') === v ? ' selected' : '') + '>' + esc(t('st_' + v)) + '</option>').join('') + '</select>';
 function spark(series){
@@ -3078,6 +3078,9 @@ function render(){
 // ---- Events --------------------------------------------------------------
 document.addEventListener('click', function(ev){
   const el = ev.target;
+  // The status dropdown sits inside a clickable row: choosing a status must
+  // not also drill into the row.
+  if(el.closest && el.closest('select.sel-st')) return;
   if(el.id === 'scrim' || el.id === 'dclose'){ closeDrawer(); return; }
   if(el.id === 'excbtn'){ openExceptions(); return; }
   if(el.id === 'more'){ S.shown += 50; renderEvents(); return; }

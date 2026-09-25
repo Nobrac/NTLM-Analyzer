@@ -67,6 +67,16 @@ SESSION_TTL = 12 * 60 * 60          # 12 hours
 SESSIONS_LOCK = threading.Lock()
 
 
+def int_param(value, default, lo, hi):
+    """A number from the query string, never an exception and never outside
+    lo..hi. "limit=-1" would otherwise mean "no limit at all" to SQLite."""
+    try:
+        n = int(str(value).strip()) if value not in (None, "") else default
+    except (TypeError, ValueError):
+        n = default
+    return max(lo, min(hi, n))
+
+
 def utc_now():
     """Wall-clock UTC without tzinfo.
 
@@ -1420,7 +1430,8 @@ def render_report(ctx):
                     for r, d in REPORT_RANGES.items()) +
           '</span><span class="grp">'
           + "".join(f'<a href="{link(lg, rng)}" class="{"on" if lg == lang else ""}">{lg.upper()}</a>' for lg in ("de", "en")) +
-          f'</span><button type="button" class="print" onclick="window.print()">{_h(T["tb_print"])}</button></nav>')
+          f'</span><button type="button" class="print" id="print">{_h(T["tb_print"])}</button></nav>'
+          '<script>document.getElementById("print").addEventListener("click",function(){window.print()});</script>')
 
     # Head and the one sentence that matters
     agents = data.get("agents") or []
@@ -1668,7 +1679,7 @@ class Handler(BaseHTTPRequestHandler):
     sys_version = ""   # keep the Python version out of every response header
 
     # ---- Helpers ----------------------------------------------------------
-    def _send(self, code, body, ctype="application/json"):
+    def _send(self, code, body, ctype="application/json", nonce=None):
         if isinstance(body, (dict, list)):
             body = json.dumps(body).encode("utf-8")
         elif isinstance(body, str):
@@ -1676,11 +1687,19 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        self._security_headers()
+        self._security_headers(nonce)
         self.end_headers()
         self.wfile.write(body)
 
-    def _security_headers(self):
+    def _send_page(self, html):
+        """An HTML page whose own scripts carry a fresh nonce. The CSP then only
+        runs scripts with that nonce: should a value ever slip through the
+        escaping into the page, an injected <script> or onerror= would not run."""
+        nonce = secrets.token_urlsafe(16)
+        html = re.sub(r"<script(?=[\s>])", '<script nonce="%s"' % nonce, html)
+        self._send(200, html, "text/html; charset=utf-8", nonce=nonce)
+
+    def _security_headers(self, nonce=None):
         """Defence in depth. Nothing here is currently exploitable - there are no
         third-party contents and every value is escaped - but these are free."""
         self.send_header("X-Content-Type-Options", "nosniff")
@@ -1689,10 +1708,15 @@ class Handler(BaseHTTPRequestHandler):
         # The dashboard is one self-contained file: inline script and style, no
         # external resources at all. Everything else is denied, so an injected
         # tag could neither load nor exfiltrate anything.
+        # Scripts only with this response's nonce. 'unsafe-inline' is ignored
+        # by every browser that understands nonces and only kept for the rest.
+        scripts = ("'nonce-%s' 'unsafe-inline'" % nonce) if nonce else "'none'"
+        if getattr(self.server, "tls", False):
+            self.send_header("Strict-Transport-Security", "max-age=31536000")
         self.send_header(
             "Content-Security-Policy",
             "default-src 'none'; "
-            "script-src 'unsafe-inline'; "
+            "script-src " + scripts + "; "
             "style-src 'unsafe-inline'; "
             "img-src 'self' data:; "
             "connect-src 'self'; "
@@ -1814,7 +1838,7 @@ class Handler(BaseHTTPRequestHandler):
             if not self.server.pw_hash or self._valid_session():
                 self._redirect("/")
             else:
-                self._send(200, LOGIN_HTML, "text/html; charset=utf-8")
+                self._send_page(LOGIN_HTML)
         elif u.path == "/logout":
             self._end_session()
             self._redirect("/login", clear_cookie=True)
@@ -1827,12 +1851,12 @@ class Handler(BaseHTTPRequestHandler):
                 page = DASHBOARD_HTML
                 if self.server.pw_hash:   # only show logout when there is a login
                     page = page.replace('id="logout" hidden', 'id="logout"', 1)
-                self._send(200, page, "text/html; charset=utf-8")
+                self._send_page(page)
         elif u.path == "/report":
             if self._login_required():
                 self._redirect("/login")
             else:
-                self._send(200, self._report(parse_qs(u.query)), "text/html; charset=utf-8")
+                self._send_page(self._report(parse_qs(u.query)))
         elif u.path == "/api/export.csv":
             if self._login_required():
                 self._send(401, {"error": "login required"})
@@ -1856,12 +1880,41 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send(404, {"error": "not found"})
 
+    def _cross_site(self):
+        """True for a request another web page made the browser send.
+        Browsers say so themselves (Sec-Fetch-Site); older ones at least send
+        an Origin, which must then be this collector."""
+        # Every current browser sends Sec-Fetch-Site, and it survives a reverse
+        # proxy that rewrites the Host header - so it decides when present.
+        site = (self.headers.get("Sec-Fetch-Site") or "").lower()
+        if site:
+            return site not in ("same-origin", "none")
+        origin = self.headers.get("Origin")
+        if origin is None:
+            return False                   # agents, scripts, curl
+        if origin == "null":
+            return True
+        hosts = {(self.headers.get(h) or "").lower() for h in ("Host", "X-Forwarded-Host")}
+        return urlparse(origin).netloc.lower() not in hosts
+
+    def _json_body(self):
+        """Agents and the dashboard send JSON as such. A web page cannot send
+        that cross-site without the browser asking first (CORS preflight),
+        which this server never answers - so a foreign page cannot post here."""
+        return (self.headers.get("Content-Type") or "").split(";")[0].strip().lower() == "application/json"
+
     def do_POST(self):
         u = urlparse(self.path)
         if u.path == "/login":          # browser login, uses NO API key
+            if self._cross_site():
+                self._send(403, {"error": "cross-site request"})
+                return
             self._handle_login()
             return
         if u.path == "/item-status":    # browser action -> session, not API key
+            if self._cross_site() or not self._json_body():
+                self._send(403, {"error": "cross-site request"})
+                return
             if self._login_required():
                 self._send(401, {"error": "login required"})
                 return
@@ -1898,6 +1951,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         if u.path not in ("/ingest", "/status"):
             self._send(404, {"error": "not found"})
+            return
+        # Without an API key these endpoints are open by design - but only to
+        # agents and scripts, never to a web page an admin happens to visit.
+        if self._cross_site() or not self._json_body():
+            self._send(415 if not self._json_body() else 403,
+                       {"error": "send JSON with Content-Type: application/json"})
             return
         if self.server.api_key and not hmac.compare_digest(
                 str(self.headers.get("X-Api-Key") or ""), str(self.server.api_key)):
@@ -2192,7 +2251,7 @@ class Handler(BaseHTTPRequestHandler):
     def _send_csv(self, qs):
         """Filtered event list as CSV (Excel-friendly: BOM + semicolon)."""
         one, _rng, _cutoff, where, params = self._event_filters(qs)
-        limit = min(int(one("limit", "50000") or 50000), 200000)
+        limit = int_param(one("limit"), 50000, 1, 200000)
         clause = (" WHERE " + " AND ".join(where)) if where else ""
         cols = ["event_time", "source", "kind", "event_id", "ntlm_version",
                 "auth_method", "user", "domain", "process", "target_server",
@@ -2456,7 +2515,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _query_data(self, qs):
         one, rng, cutoff, where, params = self._event_filters(qs)
-        limit = min(int(one("limit", "300") or 300), 2000)
+        limit = int_param(one("limit"), 300, 1, 2000)
         # tf/tp are the shared filter of ALL aggregates. Besides the time range
         # the machine selection applies here too - so it filters globally, not
         # only the event list. The clause stays a fixed string; user input only
@@ -4647,7 +4706,7 @@ function encTags(v){
   return all.slice(0, 3).map(e => tag(/RC4|DES/i.test(e) ? 'v2' : 'krb', e)).join(' ') +
     (all.length > 3 ? '<span class="restn">+' + (all.length - 3) + '</span>' : '');
 }
-const stSel = (key, st) => '<select class="sel-st st-' + esc(st || 'open') + '" data-key="' + esc(key) + '" aria-label="' + esc(t('th_status')) + '" onclick="event.stopPropagation()">' +
+const stSel = (key, st) => '<select class="sel-st st-' + esc(st || 'open') + '" data-key="' + esc(key) + '" aria-label="' + esc(t('th_status')) + '">' +
   ['open','in_progress','done'].map(v => '<option value="' + v + '"' +
     ((st || 'open') === v ? ' selected' : '') + '>' + esc(t('st_' + v)) + '</option>').join('') + '</select>';
 function spark(series){
@@ -5716,6 +5775,9 @@ function render(){
 // ---- Events --------------------------------------------------------------
 document.addEventListener('click', function(ev){
   const el = ev.target;
+  // The status dropdown sits inside a clickable row: choosing a status must
+  // not also drill into the row.
+  if(el.closest && el.closest('select.sel-st')) return;
   if(el.id === 'scrim' || el.id === 'dclose'){ closeDrawer(); return; }
   if(el.id === 'excbtn'){ openExceptions(); return; }
   if(el.id === 'more'){ S.shown += 50; renderEvents(); return; }
@@ -6165,6 +6227,7 @@ def main():
     httpd.sessions = {}
     # Over HTTPS the Secure flag is always correct -> set it automatically.
     httpd.cookie_secure = args.secure_cookie or scheme == "https"
+    httpd.tls = scheme == "https"
     httpd.pw_hash = hash_password(args.password) if args.password else None
 
     if args.retention_days > 0:
