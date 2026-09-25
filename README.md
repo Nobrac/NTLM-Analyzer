@@ -46,11 +46,11 @@ per-event detail view all work.
 ![Program list with per-row sparklines and the exception-list button](screenshots/02-programs.png)
 
 <details>
-<summary><b>More screenshots</b> — timing heatmap, cause analysis, Kerberos side, machine readiness, event detail …</summary>
+<summary><b>More screenshots</b> — accounts, failed attempts, ready to switch off, machine and account detail, status report, timing, causes, Kerberos side …</summary>
 <br>
 
-**Most-used targets and insecure logons by account**
-![Most-used targets and insecure logons](screenshots/03-targets-users.png)
+**Most-used targets**
+![Most-used targets](screenshots/03-targets-users.png)
 
 **When NTLM happens** — the bright cell on Sunday 05:00 is the backup job nobody remembers
 ![Timing heatmap](screenshots/04-timing.png)
@@ -78,6 +78,33 @@ per-event detail view all work.
 
 **Event detail** — every raw field, with an explanation of the event ID
 ![Event detail drawer](screenshots/12-event-detail.png)
+
+**Ready to switch off** — per machine and direction, with what would break
+![Ready to switch off](screenshots/13-ready.png)
+
+**Insecure logons by user** — NTLMv1, and where it cannot be seen
+![NTLMv1 by account](screenshots/14-ntlmv1.png)
+
+**Failed NTLM attempts** — reason in plain words, locked accounts, spraying
+![Failed NTLM attempts](screenshots/15-failed.png)
+
+**Accounts using NTLM** — per account: version, machines, servers, failures, Kerberos
+![Accounts using NTLM](screenshots/16-accounts.png)
+
+**Account detail** and **machine detail** — everything about one account or machine
+![Account detail](screenshots/17-account-detail.png) ![Machine detail](screenshots/18-machine-detail.png)
+
+**Machines without an agent** — seen only through the domain controllers
+![Machines without an agent](screenshots/19-no-agent.png)
+
+**Search** — Ctrl+K over machines, accounts, programs, targets and panels
+![Search](screenshots/20-search.png)
+
+**Status report** — to print or save as PDF
+![Status report](screenshots/21-report.png)
+
+**Light theme**
+![Light theme](screenshots/22-light.png)
 
 </details>
 
