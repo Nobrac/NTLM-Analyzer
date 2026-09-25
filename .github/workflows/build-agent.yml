@@ -60,6 +60,11 @@ jobs:
       - name: Build
         run: cargo build --release
 
+      # Parsers for the audit policy and the logon events. Blocking: a wrong
+      # mapping here silently puts wrong data into every dashboard.
+      - name: Unit tests
+        run: cargo test --release
+
       # winresource needs rc.exe from the Windows SDK. If it is missing, build.rs
       # only prints a warning and the EXE ships without icon or version info -
       # which is exactly what happened, silently. Assert it instead.

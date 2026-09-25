@@ -22,6 +22,8 @@ self-installing EXE.
 ![Platform: Windows + Linux](https://img.shields.io/badge/platform-Windows%20%2B%20Linux-0078D6)
 &nbsp;
 [![License: GPL v3](https://img.shields.io/badge/license-GPLv3-blue.svg)](LICENSE)
+&nbsp;
+[![Tests](https://github.com/Nobrac/NTLM-Analyzer/actions/workflows/tests.yml/badge.svg)](https://github.com/Nobrac/NTLM-Analyzer/actions/workflows/tests.yml)
 
 **[▶ Live demo](https://nobrac.github.io/NTLM-Analyzer/demo/)** — the real
 dashboard on synthetic lab data. Charts, drill-downs, search, filters and the

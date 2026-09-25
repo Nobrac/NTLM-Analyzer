@@ -1,0 +1,42 @@
+name: Tests
+
+# The counting rules of the collector - duplicates, twins, the NTLM version
+# travelling across one logon, failed logons, readiness - each have a test in
+# tests/test_collector.py. They run against a real collector on a throwaway
+# database, on the oldest Python the collector supports and on a current one.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  collector:
+    name: Collector (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    # Official Python images instead of a setup action: 3.7 is no longer
+    # offered for current runners, and the image pins exactly what is tested.
+    container: python:${{ matrix.python }}-slim
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.7", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+
+  dashboard-js:
+    name: Dashboard JavaScript syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse every embedded script with Node
+        run: python3 tests/check_dashboard_js.py

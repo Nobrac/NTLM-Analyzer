@@ -18,18 +18,18 @@
 """
 NTLM-Analyzer - central collection point + web dashboard for NTLM usage.
 
-Die Windows-Agents (ntlm-agent.exe) pushen ihre Events per HTTP POST /ingest
+The Windows agents (ntlm-agent.exe) push their events via HTTP POST /ingest
 as JSON. They are stored in a SQLite database; the dashboard at / shows them
-in Echtzeit (auto-refresh).
+live (auto-refresh).
 
 Python standard library only - no dependencies, no pip required.
 
 Start:
-    python3 ntlm-collector.py --port 8080 --key GEHEIM123
+    python3 ntlm-collector.py --port 8080 --key SECRET123
 
-Aufruf vom Agent:
+Called by the agent:
     POST http://<server>:8080/ingest
-    Header: X-Api-Key: GEHEIM123
+    Header: X-Api-Key: SECRET123
     Body:   {"source":"DC01","events":[ {...}, ... ]}
 """
 import argparse
@@ -929,7 +929,7 @@ def ui_text(lang, key, default=""):
         i = src.find("const I18N = {")
         de_at = src.find("\nde: {", i)
         en_at = src.find("\nen: {", de_at)
-        end = src.find("\n};", en_at)
+        end = src.find("\n}};", en_at)      # the English table closes the object
         pair = re.compile(r"(\w+):'((?:[^'\\]|\\.)*)'")
         for code, block in (("de", src[de_at:en_at]), ("en", src[en_at:end])):
             _UI_TEXT[code] = {k: v.replace("\\'", "'") for k, v in pair.findall(block)}

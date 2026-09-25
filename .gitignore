@@ -5,6 +5,10 @@ target/
 # Note: Cargo.lock IS committed on purpose — this is a binary crate, so a pinned
 # dependency set means reproducible builds.
 
+# --- Python bytecode (from running the tests) ---
+__pycache__/
+*.pyc
+
 # --- Local runtime data (never commit) ---
 *.db
 *.db-journal

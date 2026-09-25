@@ -4,6 +4,19 @@ Every release with its full notes, installers and downloads is on the
 [Releases page](https://github.com/Nobrac/NTLM-Analyzer/releases). This file
 carries the latest release in full and a one-line summary of each earlier one.
 
+## Unreleased
+
+- **Automated tests.** Every counting rule of the collector has a test that
+  runs against a real collector on a throwaway database: 8001/4020 duplicates,
+  unconfirmed and phantom 8001s, 4624 twins and the NTLM version travelling
+  across one logon, failed logons counted once, spraying, anonymous logons,
+  one logon seen three times per account, readiness, machines without an
+  agent, the report, login and API key. They run on every push on Python 3.7
+  and 3.13, together with a syntax check of the dashboard's JavaScript; the
+  agent's unit tests now run in its build and stop it when they fail.
+- The collector's module description was still partly German; it is English
+  now, and a test keeps it that way.
+
 ## v2.3.0 — Every account, every attempt, and a report for everyone else
 
 The biggest release so far. 2.2 made the numbers right; 2.3 makes them

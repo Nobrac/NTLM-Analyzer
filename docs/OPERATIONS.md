@@ -344,14 +344,19 @@ correctly, each in their own local time — and "peak on Sunday at 03:00" means
 README.md                     the short front page
 LICENSE                       GPL-3.0
 .gitignore                    keeps databases, logs, certificates and build output out of git
-.github/workflows/            CI: build-agent.yml (EXE) and build-msi.yml (installer);
-                              both attach their output to the release on tagged versions
+.github/workflows/            CI: build-agent.yml (EXE, with the agent's unit tests) and
+                              build-msi.yml (installer) attach their output to the
+                              release on tagged versions; tests.yml runs the collector
+                              tests on Python 3.7 and 3.13 and checks the dashboard's
+                              JavaScript on every push
 assets/                       application icon and the MSI installer artwork, plus
                               make-icon.py which generates all of them
 docs/                         the live demo for GitHub Pages (index.html + data/)
                               and this operations guide
 installer/                    WiX definition (Package.wxs) for ntlm-agent.msi
 screenshots/                  images used in the README
+tests/                        collector tests (standard library only) and the
+                              JavaScript syntax check for the embedded pages
 install.sh                    interactive Linux installer (systemd service, Debian & RHEL families)
 ntlm-collector.py             the collector (server + dashboard, single file)
 ntlm-agent-rs/                the Windows agent (Rust)
@@ -359,6 +364,14 @@ ntlm-agent-rs/                the Windows agent (Rust)
 ├── build.rs                  embeds the icon and version resource into the EXE
 ├── Cargo.toml
 └── src/                      main, config, eventlog, agent, service
+```
+
+Running the tests locally, from the repository root:
+
+```
+python3 -m unittest discover -s tests -v     # collector: every counting rule
+python3 tests/check_dashboard_js.py          # dashboard scripts (needs Node.js)
+cd ntlm-agent-rs && cargo test               # agent parsers
 ```
 
 Prebuilt binaries: every tagged release carries `ntlm-agent.exe` and
