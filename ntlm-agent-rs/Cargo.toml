@@ -13,7 +13,7 @@ path = "src/main.rs"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "2", features = ["native-certs"] } # Windows certificate store for HTTPS (internal CA / AD CS)
-roxmltree = "0.20"
+roxmltree = "0.21"
 
 # Windows-specific crates (Windows target only)
 [target.'cfg(windows)'.dependencies]
